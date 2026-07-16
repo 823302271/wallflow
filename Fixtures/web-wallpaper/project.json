@@ -1,0 +1,20 @@
+{
+  "file": "index.html",
+  "type": "web",
+  "title": "Wallflow Web Compatibility Fixture",
+  "preview": "preview.png",
+  "general": {
+    "properties": {
+      "accent": {
+        "type": "color",
+        "value": "0.08 0.78 0.67"
+      },
+      "speed": {
+        "type": "slider",
+        "value": 1.0,
+        "min": 0.2,
+        "max": 2.0
+      }
+    }
+  }
+}

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wallflow Web Compatibility Fixture</title>
+  <style>
+    html, body, canvas {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      display: block;
+      overflow: hidden;
+      background: #071014;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="wallpaper"></canvas>
+  <script>
+    const canvas = document.getElementById('wallpaper');
+    const context = canvas.getContext('2d', { alpha: false });
+    const pointer = { x: 0.5, y: 0.5, targetX: 0.5, targetY: 0.5 };
+    let accent = [20, 199, 171];
+    let speed = 1;
+    let fps = 30;
+    let paused = false;
+    let previousFrame = 0;
+
+    function resize() {
+      const scale = Math.min(window.devicePixelRatio || 1, 1.5);
+      canvas.width = Math.round(innerWidth * scale);
+      canvas.height = Math.round(innerHeight * scale);
+    }
+
+    function updatePointer(event) {
+      pointer.targetX = event.clientX / innerWidth;
+      pointer.targetY = event.clientY / innerHeight;
+    }
+
+    window.addEventListener('resize', resize);
+    window.addEventListener('mousemove', updatePointer);
+    document.addEventListener('mousemove', updatePointer);
+    resize();
+
+    window.wallpaperPropertyListener = {
+      applyUserProperties(properties) {
+        if (properties.accent) {
+          accent = properties.accent.value
+            .split(' ')
+            .map(value => Math.round(Number(value) * 255));
+        }
+        if (properties.speed) speed = Number(properties.speed.value);
+      },
+      applyGeneralProperties(properties) {
+        if (properties.fps) fps = Math.max(1, Number(properties.fps));
+      },
+      setPaused(value) {
+        paused = value;
+      }
+    };
+
+    function draw(time) {
+      requestAnimationFrame(draw);
+      if (paused || time - previousFrame < 1000 / fps) return;
+      previousFrame = time;
+
+      pointer.x += (pointer.targetX - pointer.x) * 0.09;
+      pointer.y += (pointer.targetY - pointer.y) * 0.09;
+
+      const width = canvas.width;
+      const height = canvas.height;
+      const gradient = context.createLinearGradient(0, 0, width, height);
+      gradient.addColorStop(0, '#071014');
+      gradient.addColorStop(1, '#10262a');
+      context.fillStyle = gradient;
+      context.fillRect(0, 0, width, height);
+
+      context.lineWidth = Math.max(1, width / 1400);
+      for (let layer = 0; layer < 8; layer += 1) {
+        const warm = layer % 3 === 2;
+        context.strokeStyle = warm
+          ? `rgba(240, 91, 55, ${0.22 + layer * 0.025})`
+          : `rgba(${accent[0]}, ${accent[1]}, ${accent[2]}, ${0.3 + layer * 0.025})`;
+        context.beginPath();
+        for (let x = -20; x <= width + 20; x += 12) {
+          const normalizedX = x / width;
+          const pointerDistance = Math.abs(normalizedX - pointer.x);
+          const bend = Math.exp(-pointerDistance * 8)
+            * (pointer.y - 0.5)
+            * height
+            * 0.16;
+          const y = height * (0.15 + layer * 0.1)
+            + Math.sin(normalizedX * 8 + time * 0.00045 * speed + layer) * height * 0.035
+            + bend;
+          if (x === -20) context.moveTo(x, y);
+          else context.lineTo(x, y);
+        }
+        context.stroke();
+      }
+    }
+
+    requestAnimationFrame(draw);
+  </script>
+</body>
+</html>

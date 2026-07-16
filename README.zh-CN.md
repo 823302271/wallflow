@@ -1,0 +1,128 @@
+# Wallflow
+
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+Wallflow 是一个处于早期开发阶段的 macOS 原生交互式壁纸渲染器。目前的原型重点是以较低的 CPU 和内存开销运行原生动画，并逐步兼容 Wallpaper Engine 的网页和场景壁纸。
+
+> [!IMPORTANT]
+> Wallflow 仍在持续开发，尚未完整兼容 Wallpaper Engine。导入项目前，请先查看下方的兼容性说明。
+
+## 环境要求
+
+- macOS 13 Ventura 或更高版本
+- Swift 5.10 或更高版本（Xcode 或 Apple Command Line Tools）
+- 支持 Metal 的 Apple 芯片或 Intel Mac
+
+## 当前原型功能
+
+- 为每台显示器创建 AppKit 桌面层级窗口
+- 使用 Metal 渲染动画，不在 CPU 侧进行粒子模拟
+- 全局跟踪鼠标，同时不拦截桌面点击
+- 平滑的鼠标视差、弯曲线条和交互波纹
+- 交互时自适应为 60 FPS，空闲时降低为 24 FPS
+- 使用 75% 逻辑渲染比例，降低 Retina 显示器的像素填充开销
+- 使用双缓冲 Metal 交换链，减少默认三缓冲带来的内存占用
+- 前台窗口完全覆盖某台显示器时暂停该显示器的渲染
+- 系统睡眠或登录会话非活动时自动暂停
+- 菜单栏暂停和继续控制
+- 可从目录、`project.json`、`index.html` 或 `scene.pkg` 导入项目
+
+## Wallpaper Engine 网页壁纸兼容性
+
+已实现：
+
+- 通过 WebKit 加载本地 HTML、CSS、JavaScript、媒体和项目相对路径资源
+- `window.wallpaperPropertyListener.applyUserProperties`
+- 通过 `applyGeneralProperties` 传递宿主目标帧率
+- `setPaused`，渲染暂停时保留最后一帧
+- 合成 DOM 鼠标移动、指针移动、左键和右键点击事件
+- 媒体自动播放和远程网页内容访问
+- 音频与媒体监听器注册兼容层
+- 原生属性编辑器，支持复选框、滑块、颜色、选项、文本、文件和目录
+- 增量属性回调，并按项目持久化属性值
+- 全局 HTML 媒体静音，且只允许主显示器播放声音
+
+尚未实现：
+
+- 实时音频频谱数据
+- macOS 媒体播放器元数据转发
+- 随机文件目录回调目前返回空路径
+- Web Audio API 节点尚未接入全局媒体静音控制
+
+## Wallpaper Engine 场景壁纸兼容性
+
+已实现：
+
+- 原生且带边界检查的 `PKGVxxxx` 包文件表解析
+- 无需解压整个归档即可随机读取包内文件
+- 解析 `scene.json` 常规设置和对象分类
+- 解析图片描述文件和材质 JSON
+- 静态图片图层的原点、缩放、旋转、透明度和全屏布局
+- 相机视差和逐图层视差深度
+- 解码 `.tex` 中的 RGBA8888、R8、RG88、DXT1、DXT3 和 DXT5
+- 解码 LZ4 压缩的纹理数据
+- 通过 ImageIO 加载内嵌 PNG、JPEG、GIF、BMP、TIFF 和 WebP
+- 解析 `TEXS0001` 至 `TEXS0003` 精灵帧表，并通过系统合成器播放
+- 暂停和继续精灵动画时不从头播放
+- 使用 AVFoundation 播放包内受支持格式的声音对象
+- 支持循环、随机和单次声音播放，以及暂停和全局静音
+- 场景图层无法渲染时回退显示项目预览图
+
+尚未实现：
+
+- Wallpaper Engine 着色器转换和多通道特效
+- 粒子系统、SceneScript、骨骼网格和灯光
+- 视频纹理和由脚本触发的声音控制
+- 未包含在 `scene.pkg` 中的 Wallpaper Engine 内置资源包
+
+## 运行
+
+```sh
+git clone git@github.com:823302271/wallflow.git
+cd wallflow
+swift run -c release
+```
+
+使用菜单栏中的波形图标暂停或退出 Wallflow。
+
+通过菜单栏的 **Open Wallpaper...** 选择 Wallpaper Engine 项目。仓库在 `Fixtures/web-wallpaper` 中提供了一个网页兼容性测试项目。
+
+生成可以双击运行的 app：
+
+```sh
+./scripts/package-app.sh
+open dist/Wallflow.app
+```
+
+生成的 app 使用临时签名，仅用于本机运行。Wallflow 是菜单栏应用，因此不会显示 Dock 图标。
+
+## 性能设计
+
+Wallflow 默认使用原生渲染路径，避免持续进行 CPU 侧模拟。程序会在空闲时降低帧率、以低于 Retina 原生分辨率的比例渲染、使用双缓冲交换链，并暂停被窗口完全覆盖的显示器。只有选择网页壁纸时才启动 WebKit，因为网页进程的基础内存开销高于原生渲染器。
+
+## 架构方向
+
+原生 Metal 渲染器仍是低 CPU 和内存占用的默认方案。视频支持将使用 AVFoundation。网页壁纸运行在可选且隔离的 WebKit 渲染器中。场景包会被解码为原生场景对象；当前支持的图片图层使用 Core Animation，着色器特效和粒子系统将在对应转换器实现后迁移到共享 Metal 渲染器。
+
+## 验证
+
+项目包含不依赖第三方测试框架的自测，因此仅安装 Apple Command Line Tools 也可以运行：
+
+```sh
+swift run Wallflow --self-test
+swift run Wallflow --web-self-test
+```
+
+第一条命令验证项目加载、包边界检查、场景解析、LZ4、内嵌图片、DXT 和场景图层构建。第二条命令会启动真实的 WKWebView，验证 Wallpaper Engine 属性和鼠标 API。
+
+## 项目结构
+
+- `Sources/Wallflow`：AppKit、Metal、WebKit、场景解码和音频代码
+- `Fixtures/web-wallpaper`：本地 HTML 兼容性测试项目
+- `scripts/package-app.sh`：Release app 打包脚本
+- `AppBundle/Info.plist`：macOS 应用元数据
+- `THIRD_PARTY_NOTICES.md`：第三方格式和实现说明
+
+## 参与贡献
+
+提交问题时，请附上 macOS 版本、Mac 型号、壁纸类型，并在授权允许的情况下提供最小可复现项目。请勿上传未经再分发许可的付费或受版权保护的 Workshop 资源。

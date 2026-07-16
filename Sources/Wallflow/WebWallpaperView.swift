@@ -1,0 +1,382 @@
+import AppKit
+import QuartzCore
+import WebKit
+
+final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
+    private let webView: WKWebView
+    private let frozenImageView: NSImageView
+    private let desktopFrame: CGRect
+    private let project: WallpaperProject
+    private let playsAudio: Bool
+    private var mouseTimer: Timer?
+    private var globalMouseMonitor: Any?
+    private var lastMouseLocation = CGPoint(x: -.greatestFiniteMagnitude, y: 0)
+    private var isRuntimeReady = false
+    private var isRenderingEnabled = true
+    private var mouseDispatchPending = false
+    private var inputPollingFPS = 0
+    private var lastMouseMovementTime = CACurrentMediaTime()
+    private var isAudioMuted = false
+    private var userProperties: JSONValue
+    var runtimeReadyHandler: (() -> Void)?
+
+    var contentView: NSView { self }
+
+    init(
+        frame: CGRect,
+        desktopFrame: CGRect,
+        project: WallpaperProject,
+        playsAudio: Bool
+    ) {
+        self.desktopFrame = desktopFrame
+        self.project = project
+        self.playsAudio = playsAudio
+        userProperties = project.userProperties
+
+        let userContentController = WKUserContentController()
+        userContentController.addUserScript(
+            WKUserScript(
+                source: Self.compatibilityBootstrap,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true
+            )
+        )
+        userContentController.addUserScript(
+            WKUserScript(
+                source: Self.pageStyleBootstrap,
+                injectionTime: .atDocumentEnd,
+                forMainFrameOnly: true
+            )
+        )
+
+        let configuration = WKWebViewConfiguration()
+        configuration.userContentController = userContentController
+        configuration.mediaTypesRequiringUserActionForPlayback = []
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+
+        webView = WKWebView(frame: frame, configuration: configuration)
+        frozenImageView = NSImageView(frame: frame)
+        super.init(frame: frame)
+
+        autoresizingMask = [.width, .height]
+        webView.autoresizingMask = [.width, .height]
+        webView.navigationDelegate = self
+        webView.allowsMagnification = false
+        webView.underPageBackgroundColor = .black
+
+        frozenImageView.autoresizingMask = [.width, .height]
+        frozenImageView.imageScaling = .scaleAxesIndependently
+        frozenImageView.isHidden = true
+
+        addSubview(webView)
+        addSubview(frozenImageView)
+        loadWallpaper()
+        startInputBridge()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        stopInputBridge()
+    }
+
+    func setRenderingEnabled(_ enabled: Bool) {
+        guard enabled != isRenderingEnabled else { return }
+        isRenderingEnabled = enabled
+
+        if enabled {
+            frozenImageView.isHidden = true
+            webView.isHidden = false
+            webView.setAllMediaPlaybackSuspended(false, completionHandler: nil)
+            callPropertyListener("setPaused", argument: "false")
+            startInputBridge()
+        } else {
+            stopInputBridge()
+            callPropertyListener("setPaused", argument: "true")
+            webView.setAllMediaPlaybackSuspended(true, completionHandler: nil)
+            freezeCurrentFrame()
+        }
+    }
+
+    func setAudioMuted(_ muted: Bool) {
+        isAudioMuted = muted
+        applyAudioMuteState()
+    }
+
+    func applyUserProperties(_ properties: JSONValue) {
+        guard let changed = properties.objectValue else { return }
+        var allProperties = userProperties.objectValue ?? [:]
+        for (key, value) in changed {
+            allProperties[key] = value
+        }
+        userProperties = .object(allProperties)
+        guard isRuntimeReady else { return }
+        callPropertyListener(
+            "applyUserProperties",
+            argument: Self.javascriptJSON(properties.foundationObject)
+        )
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        isRuntimeReady = true
+        dispatchInitialProperties()
+        runtimeReadyHandler?()
+    }
+
+    func evaluateJavaScriptForTesting(
+        _ script: String,
+        completion: @escaping (Any?, Error?) -> Void
+    ) {
+        webView.evaluateJavaScript(script, completionHandler: completion)
+    }
+
+    private func loadWallpaper() {
+        guard let entryURL = project.entryURL,
+              let rootURL = project.rootURL else {
+            return
+        }
+        webView.loadFileURL(entryURL, allowingReadAccessTo: rootURL)
+    }
+
+    private func dispatchInitialProperties() {
+        guard isRuntimeReady else { return }
+        let propertiesJSON = Self.javascriptJSON(userProperties.foundationObject)
+        callPropertyListener("applyUserProperties", argument: propertiesJSON)
+        callPropertyListener("applyGeneralProperties", argument: "{fps: 30}")
+        callPropertyListener("setPaused", argument: isRenderingEnabled ? "false" : "true")
+        applyAudioMuteState()
+    }
+
+    private func callPropertyListener(_ function: String, argument: String) {
+        guard isRuntimeReady else { return }
+        let script = """
+        (() => {
+          const listener = window.wallpaperPropertyListener;
+          if (listener && typeof listener.\(function) === 'function') {
+            listener.\(function)(\(argument));
+          }
+        })();
+        """
+        webView.evaluateJavaScript(script, completionHandler: nil)
+    }
+
+    private func applyAudioMuteState() {
+        guard isRuntimeReady else { return }
+        let effectiveMuted = isAudioMuted || !playsAudio
+        webView.evaluateJavaScript(
+            "window.__wallflowSetMuted(\(effectiveMuted ? "true" : "false"));",
+            completionHandler: nil
+        )
+    }
+
+    private func startInputBridge() {
+        guard isRenderingEnabled else { return }
+        lastMouseMovementTime = CACurrentMediaTime()
+        if mouseTimer == nil {
+            scheduleMouseTimer(fps: 60)
+        }
+
+        if globalMouseMonitor == nil {
+            let eventMask: NSEvent.EventTypeMask = [
+                .leftMouseDown,
+                .leftMouseUp,
+                .rightMouseDown,
+                .rightMouseUp
+            ]
+            globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: eventMask) {
+                [weak self] event in
+                DispatchQueue.main.async {
+                    self?.dispatchMouseButton(event)
+                }
+            }
+        }
+    }
+
+    private func stopInputBridge() {
+        mouseTimer?.invalidate()
+        mouseTimer = nil
+        inputPollingFPS = 0
+        if let globalMouseMonitor {
+            NSEvent.removeMonitor(globalMouseMonitor)
+            self.globalMouseMonitor = nil
+        }
+    }
+
+    private func pollMouseLocation() {
+        guard isRuntimeReady, !mouseDispatchPending else { return }
+        let now = CACurrentMediaTime()
+        let global = NSEvent.mouseLocation
+        guard desktopFrame.contains(global) else {
+            if now - lastMouseMovementTime > 1.5, inputPollingFPS != 10 {
+                scheduleMouseTimer(fps: 10)
+            }
+            return
+        }
+        let moved = hypot(
+            global.x - lastMouseLocation.x,
+            global.y - lastMouseLocation.y
+        ) >= 0.25
+        guard moved else {
+            if now - lastMouseMovementTime > 1.5, inputPollingFPS != 10 {
+                scheduleMouseTimer(fps: 10)
+            }
+            return
+        }
+
+        lastMouseMovementTime = now
+        if inputPollingFPS != 60 {
+            scheduleMouseTimer(fps: 60)
+        }
+        lastMouseLocation = global
+        dispatchMouseEvent(type: "mousemove", globalLocation: global, button: 0, buttons: 0)
+    }
+
+    private func dispatchMouseButton(_ event: NSEvent) {
+        let global = NSEvent.mouseLocation
+        guard desktopFrame.contains(global) else { return }
+        lastMouseMovementTime = CACurrentMediaTime()
+        if inputPollingFPS != 60 {
+            scheduleMouseTimer(fps: 60)
+        }
+
+        let type: String
+        let button: Int
+        let buttons: Int
+        switch event.type {
+        case .leftMouseDown:
+            type = "mousedown"
+            button = 0
+            buttons = 1
+        case .leftMouseUp:
+            type = "mouseup"
+            button = 0
+            buttons = 0
+        case .rightMouseDown:
+            type = "mousedown"
+            button = 2
+            buttons = 2
+        case .rightMouseUp:
+            type = "mouseup"
+            button = 2
+            buttons = 0
+        default:
+            return
+        }
+        dispatchMouseEvent(
+            type: type,
+            globalLocation: global,
+            button: button,
+            buttons: buttons
+        )
+    }
+
+    private func dispatchMouseEvent(
+        type: String,
+        globalLocation: CGPoint,
+        button: Int,
+        buttons: Int
+    ) {
+        let x = globalLocation.x - desktopFrame.minX
+        let y = desktopFrame.maxY - globalLocation.y
+        mouseDispatchPending = true
+        let script = "window.__wallflowDispatchMouse('\(type)', \(x), \(y), \(button), \(buttons));"
+        webView.evaluateJavaScript(script) { [weak self] _, _ in
+            self?.mouseDispatchPending = false
+        }
+    }
+
+    private func freezeCurrentFrame() {
+        webView.takeSnapshot(with: nil) { [weak self] image, _ in
+            guard let self, !self.isRenderingEnabled, let image else { return }
+            self.frozenImageView.image = image
+            self.frozenImageView.isHidden = false
+            self.webView.isHidden = true
+        }
+    }
+
+    private func scheduleMouseTimer(fps: Int) {
+        mouseTimer?.invalidate()
+        inputPollingFPS = fps
+        let interval = 1.0 / Double(fps)
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            self?.pollMouseLocation()
+        }
+        timer.tolerance = interval * 0.25
+        RunLoop.main.add(timer, forMode: .common)
+        mouseTimer = timer
+    }
+
+    private static func javascriptJSON(_ value: Any) -> String {
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value),
+              let result = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return result
+    }
+
+    private static let compatibilityBootstrap = #"""
+    (() => {
+      window.wallpaperEngineVersion = '2.5.0-wallflow';
+      window.wallpaperRegisterAudioListener = function(listener) {
+        window.__wallflowAudioListener = listener;
+      };
+      window.wallpaperRegisterMediaPropertiesListener = function(listener) {
+        window.__wallflowMediaPropertiesListener = listener;
+      };
+      window.wallpaperRegisterMediaPlaybackListener = function(listener) {
+        window.__wallflowMediaPlaybackListener = listener;
+      };
+      window.wallpaperRequestRandomFileForProperty = function(propertyName, callback) {
+        if (typeof callback === 'function') callback(propertyName, '');
+      };
+      window.__wallflowDispatchMouse = function(type, x, y, button, buttons) {
+        const options = {
+          bubbles: true,
+          cancelable: true,
+          clientX: x,
+          clientY: y,
+          screenX: x,
+          screenY: y,
+          button: button,
+          buttons: buttons,
+          view: window
+        };
+        const target = document.elementFromPoint(x, y) || document;
+        target.dispatchEvent(new MouseEvent(type, options));
+        if (type === 'mousemove' && typeof PointerEvent !== 'undefined') {
+          target.dispatchEvent(new PointerEvent('pointermove', options));
+        }
+      };
+      window.__wallflowMuted = false;
+      window.__wallflowSetMuted = function(muted) {
+        window.__wallflowMuted = Boolean(muted);
+        document.querySelectorAll('audio, video').forEach(element => {
+          element.muted = window.__wallflowMuted;
+        });
+      };
+      document.addEventListener('DOMContentLoaded', () => {
+        window.__wallflowSetMuted(window.__wallflowMuted);
+        new MutationObserver(() => {
+          window.__wallflowSetMuted(window.__wallflowMuted);
+        }).observe(document.documentElement, { childList: true, subtree: true });
+      });
+    })();
+    """#
+
+    private static let pageStyleBootstrap = #"""
+    (() => {
+      const style = document.createElement('style');
+      style.textContent = `
+        html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+        * { -webkit-user-select: none; user-select: none; }
+      `;
+      document.head.appendChild(style);
+      document.addEventListener('dragstart', event => event.preventDefault());
+    })();
+    """#
+}
