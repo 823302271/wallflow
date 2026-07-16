@@ -5,7 +5,6 @@ import WebKit
 final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
     private static let hostFPS = 24
     private let webView: WKWebView
-    private let frozenImageView: NSImageView
     private var desktopFrame: CGRect
     private let project: WallpaperProject
     private var playsAudio: Bool
@@ -62,7 +61,6 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
 
         webView = WKWebView(frame: frame, configuration: configuration)
-        frozenImageView = NSImageView(frame: frame)
         super.init(frame: frame)
 
         autoresizingMask = [.width, .height]
@@ -71,12 +69,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         webView.allowsMagnification = false
         webView.underPageBackgroundColor = .black
 
-        frozenImageView.autoresizingMask = [.width, .height]
-        frozenImageView.imageScaling = .scaleAxesIndependently
-        frozenImageView.isHidden = true
-
         addSubview(webView)
-        addSubview(frozenImageView)
         loadWallpaper()
         startInputBridge()
     }
@@ -97,30 +90,35 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         let generation = presentationGeneration
 
         if enabled {
-            webView.isHidden = false
-            preparePausedFrameForResume(generation: generation, attempt: 0)
+            setHostAnimationPaused(false) { [weak self] in
+                guard let self,
+                      self.isRenderingEnabled,
+                      self.presentationGeneration == generation else {
+                    return
+                }
+                self.webView.setAllMediaPlaybackSuspended(false) { [weak self] in
+                    guard let self,
+                          self.isRenderingEnabled,
+                          self.presentationGeneration == generation else {
+                        return
+                    }
+                    self.callPropertyListener("setPaused", argument: "false")
+                    self.startInputBridge()
+                }
+            }
         } else {
             stopInputBridge()
             callPropertyListener("setPaused", argument: "true")
             webView.setAllMediaPlaybackSuspended(true, completionHandler: nil)
-            setHostAnimationPaused(true) { [weak self] in
-                self?.freezeCurrentFrame()
-            }
+            setHostAnimationPaused(true)
         }
     }
 
     func prepareForPresentation() {
         displayIfNeeded()
-        if !isRenderingEnabled, frozenImageView.image == nil {
-            freezeCurrentFrame()
-        }
     }
 
     func captureFrame(completion: @escaping (NSImage?) -> Void) {
-        if !frozenImageView.isHidden, let frozenImage = frozenImageView.image {
-            completion(frozenImage)
-            return
-        }
         webView.takeSnapshot(with: nil) { image, _ in
             completion(image.flatMap(WallpaperSnapshot.preparedImage))
         }
@@ -389,71 +387,6 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         let script = "window.__wallflowDispatchMouse('\(type)', \(x), \(y), \(button), \(buttons));"
         webView.evaluateJavaScript(script) { [weak self] _, _ in
             self?.mouseDispatchPending = false
-        }
-    }
-
-    private func freezeCurrentFrame() {
-        webView.takeSnapshot(with: nil) { [weak self] image, _ in
-            guard let self,
-                  !self.isRenderingEnabled,
-                  let image,
-                  let snapshot = WallpaperSnapshot.preparedImage(from: image) else {
-                return
-            }
-            self.frozenImageView.image = snapshot
-            self.frozenImageView.isHidden = false
-            self.webView.isHidden = true
-        }
-    }
-
-    private func preparePausedFrameForResume(generation: Int, attempt: Int) {
-        guard isRenderingEnabled, presentationGeneration == generation else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
-            guard let self,
-                  self.isRenderingEnabled,
-                  self.presentationGeneration == generation else {
-                return
-            }
-            self.webView.takeSnapshot(with: nil) { [weak self] image, _ in
-                guard let self,
-                      self.isRenderingEnabled,
-                      self.presentationGeneration == generation else {
-                    return
-                }
-                if image != nil {
-                    self.frozenImageView.isHidden = true
-                    DispatchQueue.main.async {
-                        self.resumeRuntime(generation: generation)
-                    }
-                } else if attempt < 12 {
-                    self.preparePausedFrameForResume(
-                        generation: generation,
-                        attempt: attempt + 1
-                    )
-                } else {
-                    self.resumeRuntime(generation: generation)
-                }
-            }
-        }
-    }
-
-    private func resumeRuntime(generation: Int) {
-        guard isRenderingEnabled, presentationGeneration == generation else { return }
-        setHostAnimationPaused(false) { [weak self] in
-            guard let self,
-                  self.isRenderingEnabled,
-                  self.presentationGeneration == generation else {
-                return
-            }
-            self.webView.setAllMediaPlaybackSuspended(false) { [weak self] in
-                guard let self,
-                      self.isRenderingEnabled,
-                      self.presentationGeneration == generation else {
-                    return
-                }
-                self.callPropertyListener("setPaused", argument: "false")
-                self.startInputBridge()
-            }
         }
     }
 

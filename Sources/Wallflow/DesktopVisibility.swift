@@ -32,7 +32,7 @@ enum DesktopVisibility {
     static func isDisplayHidden(
         _ screenBounds: CGRect,
         by windowBounds: [CGRect],
-        coverageThreshold: CGFloat = 0.97
+        coverageThreshold: CGFloat = 0.999
     ) -> Bool {
         let screenArea = screenBounds.width * screenBounds.height
         guard screenArea > 0 else { return false }

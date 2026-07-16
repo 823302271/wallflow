@@ -20,8 +20,9 @@ final class DesktopFallbackManager {
         )
     }
 
-    func update(image: NSImage, for screen: NSScreen, displayID: CGDirectDisplayID) {
-        guard let pngData = WallpaperSnapshot.pngData(from: image) else { return }
+    @discardableResult
+    func update(image: NSImage, for screen: NSScreen, displayID: CGDirectDisplayID) -> Bool {
+        guard let pngData = WallpaperSnapshot.pngData(from: image) else { return false }
         let fallbackURL = directory.appendingPathComponent(
             "display-\(displayID).png"
         )
@@ -33,11 +34,13 @@ final class DesktopFallbackManager {
                 for: screen,
                 options: workspace.desktopImageOptions(for: screen) ?? [:]
             )
+            return true
         } catch {
             NSLog(
                 "Wallflow could not set the desktop fallback image: %@",
                 error.localizedDescription
             )
+            return false
         }
     }
 }

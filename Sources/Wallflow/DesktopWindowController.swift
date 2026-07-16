@@ -10,9 +10,6 @@ final class DesktopWindowController {
     private static let wallpaperLevel = NSWindow.Level(
         rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) - 1
     )
-    private static let hiddenDesktopLevel = NSWindow.Level(
-        rawValue: NSWindow.Level.normal.rawValue - 1
-    )
     private let window: DesktopWindow
     private let wallpaperRenderer: WallpaperRenderer
     private var requestedRenderingEnabled = true
@@ -20,6 +17,7 @@ final class DesktopWindowController {
     private(set) var screen: NSScreen
     let displayID: CGDirectDisplayID
     private(set) var displayBounds: CGRect
+    private(set) var desktopVisibilityBounds: CGRect
 
     init(screen: NSScreen, project: WallpaperProject, playsAudio: Bool) {
         let window = DesktopWindow(
@@ -35,13 +33,16 @@ final class DesktopWindowController {
             desktopFrame: screen.frame,
             playsAudio: playsAudio
         )
-
         let displayID = Self.displayID(for: screen)
         self.window = window
         self.wallpaperRenderer = wallpaperRenderer
         self.screen = screen
         self.displayID = displayID
         displayBounds = displayID == 0 ? screen.frame : CGDisplayBounds(displayID)
+        desktopVisibilityBounds = Self.desktopVisibilityBounds(
+            for: screen,
+            displayBounds: displayBounds
+        )
 
         window.title = "Wallflow Renderer"
         window.contentView = wallpaperRenderer.contentView
@@ -76,6 +77,19 @@ final class DesktopWindowController {
         return CGDirectDisplayID(number?.uint32Value ?? 0)
     }
 
+    private static func desktopVisibilityBounds(
+        for screen: NSScreen,
+        displayBounds: CGRect
+    ) -> CGRect {
+        let visibleFrame = screen.visibleFrame
+        return CGRect(
+            x: displayBounds.minX + visibleFrame.minX - screen.frame.minX,
+            y: displayBounds.minY + screen.frame.maxY - visibleFrame.maxY,
+            width: visibleFrame.width,
+            height: visibleFrame.height
+        )
+    }
+
     func setRenderingEnabled(_ enabled: Bool) {
         requestedRenderingEnabled = enabled
         applyRenderingState()
@@ -85,15 +99,7 @@ final class DesktopWindowController {
     func setDesktopHidden(_ hidden: Bool) -> Bool {
         guard hidden != isDesktopHidden else { return false }
         isDesktopHidden = hidden
-        if hidden {
-            applyRenderingState()
-            window.level = Self.hiddenDesktopLevel
-            window.orderFrontRegardless()
-        } else {
-            window.level = Self.wallpaperLevel
-            window.orderFrontRegardless()
-            applyRenderingState()
-        }
+        applyRenderingState()
         return true
     }
 
@@ -104,6 +110,10 @@ final class DesktopWindowController {
     func update(screen: NSScreen, playsAudio: Bool) {
         self.screen = screen
         displayBounds = displayID == 0 ? screen.frame : CGDisplayBounds(displayID)
+        desktopVisibilityBounds = Self.desktopVisibilityBounds(
+            for: screen,
+            displayBounds: displayBounds
+        )
         wallpaperRenderer.setPlaysAudio(playsAudio)
         wallpaperRenderer.updateDesktopFrame(screen.frame)
         wallpaperRenderer.contentView.frame = CGRect(

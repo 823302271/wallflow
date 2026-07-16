@@ -63,7 +63,7 @@ enum WallflowSelfTest {
         try expect(
             DesktopVisibility.isDisplayHidden(
                 screen,
-                by: [CGRect(x: 0, y: 0, width: 1000, height: 980)]
+                by: [CGRect(x: 0, y: 0, width: 1000, height: 1000)]
             ),
             "A full-screen window did not hide the desktop"
         )
@@ -81,7 +81,7 @@ enum WallflowSelfTest {
             DesktopVisibility.isDisplayHidden(
                 screen,
                 by: [
-                    CGRect(x: 0, y: 30, width: 1000, height: 70),
+                    CGRect(x: 0, y: 0, width: 1000, height: 100),
                     CGRect(x: 0, y: 100, width: 1000, height: 900)
                 ]
             ),

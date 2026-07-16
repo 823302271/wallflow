@@ -19,7 +19,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentUserProperties: JSONValue = .object([:])
     private var displayConfigurationSignature = ""
     private var coverageEvaluationGeneration = 0
-    private var desktopResumeNotBefore = 0.0
     private var fallbackRefreshGeneration = 0
     private var didFinishLaunching = false
     private var pendingOpenURLs: [URL] = []
@@ -227,21 +226,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func activeSpaceChanged(_ notification: Notification) {
-        desktopResumeNotBefore = ProcessInfo.processInfo.systemUptime + 0.55
         evaluateForegroundCoverage()
-        scheduleForegroundCoverageEvaluation(after: 0.55)
+        scheduleForegroundCoverageEvaluation(after: 0.25)
         scheduleFallbackRefresh(delay: 0.8)
     }
 
     private func scheduleForegroundCoverageEvaluation(after delay: TimeInterval = 0.35) {
         coverageEvaluationGeneration += 1
         let generation = coverageEvaluationGeneration
-        let resumeDelay = max(
-            0,
-            desktopResumeNotBefore - ProcessInfo.processInfo.systemUptime
-        )
-        let effectiveDelay = max(delay, resumeDelay + 0.05)
-        DispatchQueue.main.asyncAfter(deadline: .now() + effectiveDelay) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, generation == self.coverageEvaluationGeneration else { return }
             self.evaluateForegroundCoverage()
         }
@@ -534,25 +527,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let windowBounds = DesktopVisibility.visibleApplicationWindowBounds()
-        let canResume = ProcessInfo.processInfo.systemUptime >= desktopResumeNotBefore
         for controller in wallpaperControllers {
-            let screenBounds = controller.displayBounds
+            let screenBounds = controller.desktopVisibilityBounds
             let isDesktopHidden = DesktopVisibility.isDisplayHidden(
                 screenBounds,
                 by: windowBounds
             )
-            if isDesktopHidden || canResume || !controller.isDesktopHidden {
-                let changed = controller.setDesktopHidden(isDesktopHidden)
-                if changed, isDesktopHidden {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                        [weak self, weak controller] in
-                        guard let self, let controller, controller.isDesktopHidden else {
-                            return
-                        }
-                        self.refreshFallback(for: controller, allowHidden: true)
-                    }
-                }
-            }
+            controller.setDesktopHidden(isDesktopHidden)
         }
     }
 
@@ -782,15 +763,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func refreshFallback(
-        for controller: DesktopWindowController,
-        allowHidden: Bool = false
-    ) {
-        guard allowHidden || !controller.isDesktopHidden else { return }
+    private func refreshFallback(for controller: DesktopWindowController) {
+        guard !controller.isDesktopHidden else { return }
         controller.captureFrame { [weak self, weak controller] image in
             guard let self,
                   let controller,
-                  allowHidden || !controller.isDesktopHidden,
+                  !controller.isDesktopHidden,
                   let image,
                   let snapshot = WallpaperSnapshot.preparedImage(from: image) else {
                 return
