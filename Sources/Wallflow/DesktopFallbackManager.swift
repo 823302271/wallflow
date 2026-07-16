@@ -1,6 +1,5 @@
 import AppKit
 import CoreGraphics
-import CryptoKit
 
 final class DesktopFallbackManager {
     private let workspace = NSWorkspace.shared
@@ -23,19 +22,12 @@ final class DesktopFallbackManager {
 
     func update(image: NSImage, for screen: NSScreen, displayID: CGDirectDisplayID) {
         guard let pngData = WallpaperSnapshot.pngData(from: image) else { return }
-        let digest = SHA256.hash(data: pngData)
-            .map { String(format: "%02x", $0) }
-            .joined()
         let fallbackURL = directory.appendingPathComponent(
-            "display-\(displayID)-\(digest).png"
+            "display-\(displayID).png"
         )
 
         do {
-            if !FileManager.default.fileExists(atPath: fallbackURL.path) {
-                try pngData.write(to: fallbackURL, options: .atomic)
-            }
-            let currentURL = workspace.desktopImageURL(for: screen)?.standardizedFileURL
-            guard currentURL != fallbackURL.standardizedFileURL else { return }
+            try pngData.write(to: fallbackURL, options: .atomic)
             try workspace.setDesktopImageURL(
                 fallbackURL,
                 for: screen,

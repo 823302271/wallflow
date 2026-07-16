@@ -542,7 +542,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 by: windowBounds
             )
             if isDesktopHidden || canResume || !controller.isDesktopHidden {
-                controller.setDesktopHidden(isDesktopHidden)
+                let changed = controller.setDesktopHidden(isDesktopHidden)
+                if changed, isDesktopHidden {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                        [weak self, weak controller] in
+                        guard let self, let controller, controller.isDesktopHidden else {
+                            return
+                        }
+                        self.refreshFallback(for: controller, allowHidden: true)
+                    }
+                }
             }
         }
     }
@@ -773,12 +782,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func refreshFallback(for controller: DesktopWindowController) {
-        guard !controller.isDesktopHidden else { return }
+    private func refreshFallback(
+        for controller: DesktopWindowController,
+        allowHidden: Bool = false
+    ) {
+        guard allowHidden || !controller.isDesktopHidden else { return }
         controller.captureFrame { [weak self, weak controller] image in
             guard let self,
                   let controller,
-                  !controller.isDesktopHidden,
+                  allowHidden || !controller.isDesktopHidden,
                   let image,
                   let snapshot = WallpaperSnapshot.preparedImage(from: image) else {
                 return

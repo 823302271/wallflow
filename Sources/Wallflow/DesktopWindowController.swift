@@ -81,8 +81,9 @@ final class DesktopWindowController {
         applyRenderingState()
     }
 
-    func setDesktopHidden(_ hidden: Bool) {
-        guard hidden != isDesktopHidden else { return }
+    @discardableResult
+    func setDesktopHidden(_ hidden: Bool) -> Bool {
+        guard hidden != isDesktopHidden else { return false }
         isDesktopHidden = hidden
         if hidden {
             applyRenderingState()
@@ -93,6 +94,7 @@ final class DesktopWindowController {
             window.orderFrontRegardless()
             applyRenderingState()
         }
+        return true
     }
 
     func setAudioMuted(_ muted: Bool) {

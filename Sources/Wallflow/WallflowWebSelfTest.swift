@@ -172,7 +172,9 @@ final class WallflowWebSelfTest {
     private func verifyMouseBridge() {
         let script = """
         window.__wallflowDispatchMouse('mousemove', 41, 73, 0, 0);
-        JSON.stringify(window.__wallflowProbe.mouse);
+        window.__wallflowDispatchMouse('mousedown', 41, 73, 0, 1);
+        window.__wallflowDispatchMouse('mouseup', 41, 73, 0, 0);
+        JSON.stringify({ mouse: window.__wallflowProbe.mouse, clicks: window.__wallflowProbe.clicks });
         """
         wallpaperView?.evaluateJavaScriptForTesting(script) { [weak self] value, error in
             guard let self else { return }
@@ -182,9 +184,11 @@ final class WallflowWebSelfTest {
             }
             guard let string = value as? String,
                   let data = string.data(using: .utf8),
-                  let mouse = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let mouse = result["mouse"] as? [String: Any],
                   (mouse["x"] as? NSNumber)?.intValue == 41,
-                  (mouse["y"] as? NSNumber)?.intValue == 73 else {
+                  (mouse["y"] as? NSNumber)?.intValue == 73,
+                  (result["clicks"] as? NSNumber)?.intValue == 1 else {
                 self.finish(
                     .failure(WallflowSelfTestError.failed("Web mouse event bridge did not fire"))
                 )
@@ -243,7 +247,8 @@ final class WallflowWebSelfTest {
             properties: null,
             general: null,
             paused: null,
-            mouse: null
+            mouse: null,
+            clicks: 0
           };
           window.wallpaperPropertyListener = {
             applyUserProperties(value) { window.__wallflowProbe.properties = value; },
@@ -252,6 +257,9 @@ final class WallflowWebSelfTest {
           };
           window.addEventListener('mousemove', event => {
             window.__wallflowProbe.mouse = { x: event.clientX, y: event.clientY };
+          });
+          window.addEventListener('click', () => {
+            window.__wallflowProbe.clicks += 1;
           });
         </script>
         </body>

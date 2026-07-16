@@ -16,6 +16,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
     private var isRenderingEnabled = true
     private var mouseDispatchPending = false
     private var inputPollingFPS = 0
+    private var lastPressedMouseButtons = NSEvent.pressedMouseButtons
     private var lastMouseMovementTime = CACurrentMediaTime()
     private var isAudioMuted = false
     private var presentationGeneration = 0
@@ -97,18 +98,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
 
         if enabled {
             webView.isHidden = false
-            setHostAnimationPaused(false) { [weak self] in
-                guard let self,
-                      self.isRenderingEnabled,
-                      self.presentationGeneration == generation else {
-                    return
-                }
-                self.webView.setAllMediaPlaybackSuspended(false) { [weak self] in
-                    self?.waitForLiveFrame(generation: generation, attempt: 0)
-                }
-            }
-            callPropertyListener("setPaused", argument: "false")
-            startInputBridge()
+            preparePausedFrameForResume(generation: generation, attempt: 0)
         } else {
             stopInputBridge()
             callPropertyListener("setPaused", argument: "true")
@@ -246,6 +236,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
     private func startInputBridge() {
         guard isRenderingEnabled else { return }
         lastMouseMovementTime = CACurrentMediaTime()
+        lastPressedMouseButtons = NSEvent.pressedMouseButtons
         if mouseTimer == nil {
             scheduleMouseTimer(fps: 60)
         }
@@ -260,7 +251,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
             globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: eventMask) {
                 [weak self] event in
                 DispatchQueue.main.async {
-                    self?.dispatchMouseButton(event)
+                    self?.handleMonitoredMouseButton(event)
                 }
             }
         }
@@ -280,9 +271,10 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         guard isRuntimeReady, !mouseDispatchPending else { return }
         let now = CACurrentMediaTime()
         let global = NSEvent.mouseLocation
+        pollMouseButtons(globalLocation: global)
         guard desktopFrame.contains(global) else {
-            if now - lastMouseMovementTime > 1.5, inputPollingFPS != 10 {
-                scheduleMouseTimer(fps: 10)
+            if now - lastMouseMovementTime > 1.5, inputPollingFPS != 30 {
+                scheduleMouseTimer(fps: 30)
             }
             return
         }
@@ -291,8 +283,8 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
             global.y - lastMouseLocation.y
         ) >= 0.25
         guard moved else {
-            if now - lastMouseMovementTime > 1.5, inputPollingFPS != 10 {
-                scheduleMouseTimer(fps: 10)
+            if now - lastMouseMovementTime > 1.5, inputPollingFPS != 30 {
+                scheduleMouseTimer(fps: 30)
             }
             return
         }
@@ -305,46 +297,83 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         dispatchMouseEvent(type: "mousemove", globalLocation: global, button: 0, buttons: 0)
     }
 
-    private func dispatchMouseButton(_ event: NSEvent) {
+    private func handleMonitoredMouseButton(_ event: NSEvent) {
+        let button: Int
+        let isDown: Bool
+        switch event.type {
+        case .leftMouseDown:
+            button = 0
+            isDown = true
+        case .leftMouseUp:
+            button = 0
+            isDown = false
+        case .rightMouseDown:
+            button = 2
+            isDown = true
+        case .rightMouseUp:
+            button = 2
+            isDown = false
+        default:
+            return
+        }
+        let mask = button == 0 ? 1 : 2
+        let stateAlreadyHandled = (lastPressedMouseButtons & mask != 0) == isDown
+        if isDown {
+            lastPressedMouseButtons |= mask
+        } else {
+            lastPressedMouseButtons &= ~mask
+        }
+        guard !stateAlreadyHandled else { return }
+
         let global = NSEvent.mouseLocation
         guard desktopFrame.contains(global),
               let quartzPoint = event.cgEvent?.location ?? CGEvent(source: nil)?.location,
               DesktopVisibility.isDesktopExposed(at: quartzPoint) else {
             return
         }
+        dispatchMouseButtonChange(button: button, isDown: isDown, globalLocation: global)
+    }
+
+    private func pollMouseButtons(globalLocation: CGPoint) {
+        let current = NSEvent.pressedMouseButtons
+        let changed = current ^ lastPressedMouseButtons
+        lastPressedMouseButtons = current
+        guard changed != 0,
+              desktopFrame.contains(globalLocation),
+              let quartzPoint = CGEvent(source: nil)?.location,
+              DesktopVisibility.isDesktopExposed(at: quartzPoint) else {
+            return
+        }
+        if changed & 1 != 0 {
+            dispatchMouseButtonChange(
+                button: 0,
+                isDown: current & 1 != 0,
+                globalLocation: globalLocation
+            )
+        }
+        if changed & 2 != 0 {
+            dispatchMouseButtonChange(
+                button: 2,
+                isDown: current & 2 != 0,
+                globalLocation: globalLocation
+            )
+        }
+    }
+
+    private func dispatchMouseButtonChange(
+        button: Int,
+        isDown: Bool,
+        globalLocation: CGPoint
+    ) {
         lastMouseMovementTime = CACurrentMediaTime()
         if inputPollingFPS != 60 {
             scheduleMouseTimer(fps: 60)
         }
-
-        let type: String
-        let button: Int
-        let buttons: Int
-        switch event.type {
-        case .leftMouseDown:
-            type = "mousedown"
-            button = 0
-            buttons = 1
-        case .leftMouseUp:
-            type = "mouseup"
-            button = 0
-            buttons = 0
-        case .rightMouseDown:
-            type = "mousedown"
-            button = 2
-            buttons = 2
-        case .rightMouseUp:
-            type = "mouseup"
-            button = 2
-            buttons = 0
-        default:
-            return
-        }
         dispatchMouseEvent(
-            type: type,
-            globalLocation: global,
+            type: isDown ? "mousedown" : "mouseup",
+            globalLocation: globalLocation,
             button: button,
-            buttons: buttons
+            buttons: isDown ? (button == 0 ? 1 : 2) : 0
         )
     }
 
@@ -377,7 +406,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         }
     }
 
-    private func waitForLiveFrame(generation: Int, attempt: Int) {
+    private func preparePausedFrameForResume(generation: Int, attempt: Int) {
         guard isRenderingEnabled, presentationGeneration == generation else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
             guard let self,
@@ -393,9 +422,37 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
                 }
                 if image != nil {
                     self.frozenImageView.isHidden = true
+                    DispatchQueue.main.async {
+                        self.resumeRuntime(generation: generation)
+                    }
                 } else if attempt < 12 {
-                    self.waitForLiveFrame(generation: generation, attempt: attempt + 1)
+                    self.preparePausedFrameForResume(
+                        generation: generation,
+                        attempt: attempt + 1
+                    )
+                } else {
+                    self.resumeRuntime(generation: generation)
                 }
+            }
+        }
+    }
+
+    private func resumeRuntime(generation: Int) {
+        guard isRenderingEnabled, presentationGeneration == generation else { return }
+        setHostAnimationPaused(false) { [weak self] in
+            guard let self,
+                  self.isRenderingEnabled,
+                  self.presentationGeneration == generation else {
+                return
+            }
+            self.webView.setAllMediaPlaybackSuspended(false) { [weak self] in
+                guard let self,
+                      self.isRenderingEnabled,
+                      self.presentationGeneration == generation else {
+                    return
+                }
+                self.callPropertyListener("setPaused", argument: "false")
+                self.startInputBridge()
             }
         }
     }
