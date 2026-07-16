@@ -7,6 +7,7 @@ final class WallflowCanvasMetalSelfTest {
     private var timeout: Timer?
     private var completion: ((Result<Void, Error>) -> Void)?
     private var pausedTime = 0.0
+    private var pausedSubmissionCount = 0
 
     func run(
         projectURL: URL,
@@ -106,6 +107,7 @@ final class WallflowCanvasMetalSelfTest {
             }
             view.setRenderingEnabled(false)
             pausedTime = view.virtualTimeForTesting
+            pausedSubmissionCount = view.renderSubmissionCountForTesting
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
                 self?.verifyPausedState()
             }
@@ -117,9 +119,14 @@ final class WallflowCanvasMetalSelfTest {
     private func verifyPausedState() {
         guard let view = wallpaperView,
               !view.schedulerActiveForTesting,
-              view.virtualTimeForTesting == pausedTime else {
+              view.virtualTimeForTesting == pausedTime,
+              view.renderSubmissionCountForTesting == pausedSubmissionCount else {
             finish(
-                .failure(WallflowSelfTestError.failed("Canvas Metal pause did not freeze time"))
+                .failure(
+                    WallflowSelfTestError.failed(
+                        "Canvas Metal pause did not stop time and GPU submissions"
+                    )
+                )
             )
             return
         }

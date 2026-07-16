@@ -43,6 +43,7 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
     private var shapeBuffers: [MTLBuffer] = []
     private var shapeBufferCapacity = 0
     private var shapeBufferIndex = 0
+    private var renderSubmissionCount = 0
 
     var contentView: NSView { self }
     var commandCountForTesting: Int {
@@ -50,6 +51,7 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
     }
     var virtualTimeForTesting: Double { virtualTimeMilliseconds }
     var schedulerActiveForTesting: Bool { frameTimer != nil }
+    var renderSubmissionCountForTesting: Int { renderSubmissionCount }
 
     static func makeIfSupported(
         frame: CGRect,
@@ -358,6 +360,7 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
         encoder.endEncoding()
         commandBuffer.present(drawable)
         commandBuffer.commit()
+        renderSubmissionCount += 1
     }
 
     private func makeInstances(

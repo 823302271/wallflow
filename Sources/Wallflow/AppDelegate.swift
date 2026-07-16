@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentUserProperties: JSONValue = .object([:])
     private var displayConfigurationSignature = ""
     private var coverageEvaluationGeneration = 0
+    private var coverageWatchdog: Timer?
     private var fallbackRefreshGeneration = 0
     private var didFinishLaunching = false
     private var pendingOpenURLs: [URL] = []
@@ -40,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configureStatusItem()
         rebuildWallpaperWindows()
         registerForSystemEvents()
+        startCoverageWatchdog()
         didFinishLaunching = true
         if let sourceURL = pendingOpenURLs.first {
             pendingOpenURLs.removeAll()
@@ -57,6 +59,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        coverageWatchdog?.invalidate()
+        coverageWatchdog = nil
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         NotificationCenter.default.removeObserver(self)
     }
@@ -239,6 +243,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, generation == self.coverageEvaluationGeneration else { return }
             self.evaluateForegroundCoverage()
         }
+    }
+
+    private func startCoverageWatchdog() {
+        guard coverageWatchdog == nil else { return }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            self?.evaluateForegroundCoverage()
+        }
+        timer.tolerance = 0.2
+        RunLoop.main.add(timer, forMode: .common)
+        coverageWatchdog = timer
     }
 
     @objc private func systemWillSuspend(_ notification: Notification) {
