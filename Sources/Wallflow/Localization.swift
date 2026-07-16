@@ -57,12 +57,13 @@ enum L10n {
     enum Key: String {
         case openWallpaper = "menu.open_wallpaper"
         case openWallpaperURL = "menu.open_wallpaper_url"
+        case wallpaperLibrary = "menu.wallpaper_library"
         case reloadWallpaper = "menu.reload_wallpaper"
         case wallpaperProperties = "menu.wallpaper_properties"
         case useNativeDemo = "menu.use_native_demo"
         case pauseAnimation = "menu.pause_animation"
         case resumeAnimation = "menu.resume_animation"
-        case pauseWhenOtherAppActive = "menu.pause_when_other_app_active"
+        case pauseWhenDesktopHidden = "menu.pause_when_desktop_hidden"
         case muteAudio = "menu.mute_audio"
         case unmuteAudio = "menu.unmute_audio"
         case language = "menu.language"
@@ -77,6 +78,24 @@ enum L10n {
         case importAction = "action.import"
         case cancel = "action.cancel"
         case importing = "status.importing"
+        case libraryWindowTitle = "library.window_title"
+        case libraryColumnName = "library.column.name"
+        case libraryColumnType = "library.column.type"
+        case libraryColumnSource = "library.column.source"
+        case libraryUse = "library.use"
+        case libraryRemove = "library.remove"
+        case libraryReveal = "library.reveal"
+        case libraryImport = "library.import"
+        case libraryCurrent = "library.current"
+        case libraryUnavailable = "library.unavailable"
+        case libraryBuiltInSource = "library.built_in_source"
+        case libraryTypeBuiltIn = "library.type.built_in"
+        case libraryTypeWeb = "library.type.web"
+        case libraryTypeScene = "library.type.scene"
+        case libraryTypeVideo = "library.type.video"
+        case libraryRemoveTitle = "library.remove_title"
+        case libraryRemoveManagedMessage = "library.remove_managed_message"
+        case libraryRemoveReferenceMessage = "library.remove_reference_message"
         case nativeScene = "project.native_scene"
         case resetDefaults = "properties.reset_defaults"
         case none = "properties.none"
@@ -126,6 +145,10 @@ enum L10n {
 
     static func propertiesWindowTitle(_ projectTitle: String) -> String {
         format(.propertiesWindowTitle, projectTitle)
+    }
+
+    static func libraryRemoveTitle(_ projectTitle: String) -> String {
+        format(.libraryRemoveTitle, projectTitle)
     }
 
     static func projectTitle(for project: WallpaperProject) -> String {

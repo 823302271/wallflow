@@ -14,6 +14,22 @@ if CommandLine.arguments.contains("--self-test") {
         fputs("Wallflow self-test failed: \(error)\n", stderr)
         exit(EXIT_FAILURE)
     }
+} else if CommandLine.arguments.contains("--library-self-test") {
+    let application = NSApplication.shared
+    let runner = WallflowLibrarySelfTest()
+    application.setActivationPolicy(.accessory)
+    runner.run { result in
+        switch result {
+        case .success(let outputURL):
+            print("Wallflow library self-test passed: \(outputURL.path)")
+            exit(EXIT_SUCCESS)
+        case .failure(let error):
+            fputs("Wallflow library self-test failed: \(error)\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    }
+    application.run()
+    withExtendedLifetime(runner) {}
 } else if let testIndex = CommandLine.arguments.firstIndex(of: "--video-self-test"),
           CommandLine.arguments.indices.contains(testIndex + 1) {
     let application = NSApplication.shared

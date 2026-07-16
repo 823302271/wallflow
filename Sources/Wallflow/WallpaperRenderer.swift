@@ -8,7 +8,6 @@ protocol WallpaperRenderer: AnyObject {
     func updateDesktopFrame(_ frame: CGRect)
     func applyUserProperties(_ properties: JSONValue)
     func prepareForPresentation()
-    func captureFrame(completion: @escaping (NSImage?) -> Void)
 }
 
 extension WallpaperRenderer {
@@ -18,19 +17,6 @@ extension WallpaperRenderer {
     func applyUserProperties(_ properties: JSONValue) {}
     func prepareForPresentation() {
         contentView.displayIfNeeded()
-    }
-    func captureFrame(completion: @escaping (NSImage?) -> Void) {
-        let bounds = contentView.bounds
-        guard bounds.width > 0,
-              bounds.height > 0,
-              let representation = contentView.bitmapImageRepForCachingDisplay(in: bounds) else {
-            completion(nil)
-            return
-        }
-        contentView.cacheDisplay(in: bounds, to: representation)
-        let image = NSImage(size: bounds.size)
-        image.addRepresentation(representation)
-        completion(image)
     }
 }
 

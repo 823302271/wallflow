@@ -26,12 +26,13 @@ Wallpaper Engine web and scene compatibility.
 - Adaptive 60 FPS while interacting and 24 FPS while idle
 - 75% logical render scale to reduce fill-rate cost on Retina displays
 - Two-buffer Metal swap chain instead of the default three-buffer allocation
-- Rendering suspension when a foreground window covers an entire display
+- Rendering suspension when visible app windows collectively hide a display's desktop
 - Automatic suspension during sleep and inactive login sessions
 - Incremental display reconciliation without restarting retained-screen renderers
-- Static Wallflow fallback frames during full-screen and Space transitions
+- A paused last frame retained by the same renderer during Space transitions
 - Menu bar pause and resume controls
-- Default-on pause when another application has a visible window
+- Default-on pause only when a display's desktop is fully hidden
+- Persistent wallpaper library with switching, reveal, and uninstall actions
 - Runtime language switching between English and Simplified Chinese
 - Native MP4, M4V, and MOV playback through AVFoundation
 - Project import from a video, directory, `project.json`, `index.html`, or `scene.pkg`
@@ -117,6 +118,10 @@ project. A web compatibility fixture is included at `Fixtures/web-wallpaper`.
   or a complete ZIP project URL.
 - A supported file or ZIP can be opened with Wallflow from Finder, including by
   dragging the file onto `Wallflow.app`.
+- Successful imports are added to **Wallpaper Library...** automatically. The
+  library also discovers existing projects under Wallflow's managed import folder.
+- Removing a managed ZIP import deletes Wallflow's installed copy after
+  confirmation. Removing an external file or URL only removes its library record.
 - ZIP imports are checked for path traversal, symbolic links, excessive file
   count, and excessive extracted size before they are loaded.
 
@@ -172,17 +177,20 @@ suspends covered displays. HTML wallpapers are capped at 24 FPS and a device
 pixel ratio of 1, and run in WebKit only when a web project is selected. Native
 video uses AVFoundation with short buffering and a 1080p decode cap.
 
-The default **Pause When Another App Is Active** option immediately stops
-rendering, media, audio, and global wallpaper input while another application
-has a visible window in the active Space. Disable it only when animation should
-continue in desktop areas visible around normal windows.
+The default **Pause When Desktop Is Hidden** option stops rendering, media,
+audio, and wallpaper input only when the union of visible application windows
+hides an entire display's desktop. This also handles browsers that compose full
+screen from several windows. Normal application windows do not pause Wallflow
+while any desktop area remains exposed. Clicks over application windows are
+filtered out; only clicks on exposed desktop areas reach a wallpaper.
 
-When WindowServer temporarily exposes the system desktop during a full-screen or
-Space transition, Wallflow keeps a resident last-frame window behind the live
-renderer and also sets the system desktop to that captured frame. The original
-desktop is restored when Wallflow exits normally. Separately,
-incremental display reconciliation reuses every retained display renderer when a
-different display is connected or disconnected.
+During a full-screen or Space transition, Wallflow pauses the existing renderer,
+keeps that same window on its last frame through the transition, and resumes it
+after the desktop is visible. It does not create a second player or reload the
+wallpaper. Wallflow also does not modify the system wallpaper, because macOS
+stores desktop images per Space. Incremental display reconciliation separately
+reuses every retained display renderer when another display is connected or
+disconnected.
 
 ## Architecture direction
 
@@ -201,12 +209,15 @@ Line Tools alone:
 swift run Wallflow --self-test
 swift run Wallflow --web-self-test
 swift run Wallflow --video-self-test /path/to/video.mp4
+swift run Wallflow --library-self-test
 ```
 
-The first command validates project loading, package bounds checks, scene
-resolution, LZ4, embedded images, DXT, and scene layer construction. The second
+The first command validates project loading, the wallpaper library, desktop
+visibility rules, package bounds checks, scene resolution, LZ4, embedded images,
+DXT, and scene layer construction. The second
 starts a real WKWebView and verifies Wallpaper Engine property and mouse APIs.
 The third opens a real video and verifies playback, pause/resume, and frame capture.
+The fourth renders the bilingual wallpaper management window to a PNG fixture.
 
 ## Project layout
 

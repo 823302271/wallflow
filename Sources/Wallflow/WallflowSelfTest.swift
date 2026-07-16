@@ -15,6 +15,8 @@ enum WallflowSelfTestError: Error, CustomStringConvertible {
 enum WallflowSelfTest {
     static func run() throws {
         try testLocalizationResources()
+        try testDesktopVisibilityRules()
+        try testWallpaperLibrary()
         try testWebManifest()
         try testRemoteWebProject()
         try testVideoProjects()
@@ -41,10 +43,10 @@ enum WallflowSelfTest {
         )
         try expect(
             L10n.text(
-                .pauseWhenOtherAppActive,
+                .pauseWhenDesktopHidden,
                 language: .simplifiedChinese
-            ) == "其他应用在前台时暂停",
-            "Background pause localization resource was not loaded"
+            ) == "桌面不可见时暂停",
+            "Desktop visibility localization resource was not loaded"
         )
         try expect(
             L10n.format(
@@ -53,6 +55,114 @@ enum WallflowSelfTest {
                 "Koi Pond"
             ) == "Koi Pond 属性",
             "Localized format string was not resolved"
+        )
+    }
+
+    private static func testDesktopVisibilityRules() throws {
+        let screen = CGRect(x: 0, y: 0, width: 1000, height: 1000)
+        try expect(
+            DesktopVisibility.isDisplayHidden(
+                screen,
+                by: [CGRect(x: 0, y: 0, width: 1000, height: 980)]
+            ),
+            "A full-screen window did not hide the desktop"
+        )
+        try expect(
+            !DesktopVisibility.isDisplayHidden(
+                screen,
+                by: [
+                    CGRect(x: 0, y: 0, width: 600, height: 900),
+                    CGRect(x: 620, y: 100, width: 380, height: 800)
+                ]
+            ),
+            "Normal application windows incorrectly hid the desktop"
+        )
+        try expect(
+            DesktopVisibility.isDisplayHidden(
+                screen,
+                by: [
+                    CGRect(x: 0, y: 30, width: 1000, height: 70),
+                    CGRect(x: 0, y: 100, width: 1000, height: 900)
+                ]
+            ),
+            "Fragmented full-screen application windows did not hide the desktop"
+        )
+        try expect(
+            !DesktopVisibility.isDisplayHidden(
+                screen,
+                by: [
+                    CGRect(x: 0, y: 0, width: 1000, height: 600),
+                    CGRect(x: 0, y: 0, width: 1000, height: 600)
+                ]
+            ),
+            "Overlapping windows were counted more than once"
+        )
+        let applicationWindow = CGRect(x: 100, y: 100, width: 500, height: 500)
+        try expect(
+            !DesktopVisibility.isDesktopExposed(
+                at: CGPoint(x: 200, y: 200),
+                coveredBy: [applicationWindow]
+            ),
+            "A click over an application window reached the desktop"
+        )
+        try expect(
+            DesktopVisibility.isDesktopExposed(
+                at: CGPoint(x: 800, y: 800),
+                coveredBy: [applicationWindow]
+            ),
+            "A click on exposed desktop was incorrectly blocked"
+        )
+    }
+
+    private static func testWallpaperLibrary() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let importedRoot = directory.appendingPathComponent("Imported", isDirectory: true)
+        let installRoot = importedRoot.appendingPathComponent("fixture", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: installRoot,
+            withIntermediateDirectories: true
+        )
+        try "<!doctype html>".write(
+            to: installRoot.appendingPathComponent("index.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try """
+        { "file": "index.html", "type": "web", "title": "Library Fixture" }
+        """.write(
+            to: installRoot.appendingPathComponent("project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let suiteName = "WallflowTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            throw WallflowSelfTestError.failed("Could not create library test defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let library = WallpaperLibrary(
+            defaults: defaults,
+            importedRootURL: importedRoot
+        )
+        try expect(library.entries.count == 1, "Managed wallpaper was not discovered")
+        let entry = try expectValue(
+            library.entries.first,
+            "Managed wallpaper library entry was missing"
+        )
+        try expect(entry.title == "Library Fixture", "Wallpaper title was not persisted")
+        try expect(library.isManaged(entry), "Managed wallpaper was classified as external")
+
+        let reloaded = WallpaperLibrary(
+            defaults: defaults,
+            importedRootURL: importedRoot
+        )
+        try expect(reloaded.entries.count == 1, "Wallpaper library entry was duplicated")
+        try reloaded.remove(entry, deleteManagedFiles: true)
+        try expect(
+            !FileManager.default.fileExists(atPath: installRoot.path),
+            "Managed wallpaper files were not removed"
         )
     }
 

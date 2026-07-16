@@ -240,7 +240,7 @@ final class WallpaperImportService {
         }
     }
 
-    private func locateProject(in rootURL: URL) throws -> URL {
+    func locateProject(in rootURL: URL) throws -> URL {
         let entryFileNames = ["project.json", "index.html", "scene.pkg"]
         let videoExtensions = ["mp4", "m4v", "mov"]
         for name in entryFileNames {

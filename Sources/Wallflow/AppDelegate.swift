@@ -5,38 +5,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var wallpaperControllers: [DesktopWindowController] = []
     private var statusItem: NSStatusItem?
     private var pauseMenuItem: NSMenuItem?
-    private var backgroundPauseMenuItem: NSMenuItem?
+    private var desktopHiddenPauseMenuItem: NSMenuItem?
     private var muteMenuItem: NSMenuItem?
     private var projectTitleMenuItem: NSMenuItem?
     private var propertiesMenuItem: NSMenuItem?
     private var propertiesWindowController: WallpaperPropertiesWindowController?
+    private var libraryWindowController: WallpaperLibraryWindowController?
     private var isManuallyPaused = false
     private var isSystemSuspended = false
     private var isAudioMuted = false
-    private var pauseWhenOtherApplicationActive = true
-    private var isOtherApplicationActive = false
+    private var pauseWhenDesktopHidden = true
     private var currentProject = WallpaperProject.builtIn
     private var currentUserProperties: JSONValue = .object([:])
     private var displayConfigurationSignature = ""
     private var coverageEvaluationGeneration = 0
-    private var spaceTransitionGeneration = 0
+    private var desktopResumeNotBefore = 0.0
     private var didFinishLaunching = false
     private var pendingOpenURLs: [URL] = []
     private let importService = WallpaperImportService()
-    private let desktopFallbackManager = DesktopFallbackManager()
-    private var fallbackRefreshGeneration = 0
+    private let wallpaperLibrary = WallpaperLibrary()
     private let automaticallyPauseCoveredDisplays = !CommandLine.arguments.contains(
         "--no-auto-pause"
     )
 
     private static let savedProjectPathKey = "Wallflow.selectedProjectPath"
-    private static let pauseWhenOtherApplicationActiveKey =
-        "Wallflow.pauseWhenOtherApplicationActive"
+    private static let pauseWhenDesktopHiddenKey = "Wallflow.pauseWhenDesktopHidden"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         loadInitialProject()
-        restoreBackgroundPausePreference()
-        updateForegroundApplicationState()
+        restoreDesktopVisibilityPreference()
+        registerCurrentProjectInLibrary()
         currentUserProperties = restoredUserProperties(for: currentProject)
         configureStatusItem()
         rebuildWallpaperWindows()
@@ -58,7 +56,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        desktopFallbackManager.restoreOriginalDesktops()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         NotificationCenter.default.removeObserver(self)
     }
@@ -73,13 +70,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyAudioState()
     }
 
-    @objc private func toggleBackgroundPause() {
-        pauseWhenOtherApplicationActive.toggle()
+    @objc private func toggleDesktopHiddenPause() {
+        pauseWhenDesktopHidden.toggle()
         UserDefaults.standard.set(
-            pauseWhenOtherApplicationActive,
-            forKey: Self.pauseWhenOtherApplicationActiveKey
+            pauseWhenDesktopHidden,
+            forKey: Self.pauseWhenDesktopHiddenKey
         )
-        applyRenderingState()
+        evaluateForegroundCoverage()
     }
 
     @objc private func quit() {
@@ -122,6 +119,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         importWallpaper(from: sourceURL, persist: true)
+    }
+
+    @objc private func showWallpaperLibrary() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        if libraryWindowController == nil {
+            libraryWindowController = WallpaperLibraryWindowController(
+                entries: wallpaperLibrary.entries,
+                currentEntryID: currentLibraryEntryID,
+                isBuiltInCurrent: currentProject.kind == .builtIn,
+                onUse: { [weak self] entry in
+                    self?.activateLibraryEntry(entry)
+                },
+                onRemove: { [weak self] entry in
+                    self?.confirmLibraryRemoval(entry)
+                },
+                onReveal: { entry in
+                    NSWorkspace.shared.activateFileViewerSelecting([entry.sourceURL])
+                },
+                onImportFile: { [weak self] in
+                    self?.openWallpaper()
+                },
+                onImportURL: { [weak self] in
+                    self?.importWallpaperURL()
+                }
+            )
+        }
+        refreshLibraryWindow()
+        libraryWindowController?.window?.center()
+        libraryWindowController?.showWindow(nil)
+        libraryWindowController?.window?.makeKeyAndOrderFront(nil)
     }
 
     @objc private func reloadWallpaper() {
@@ -178,10 +205,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppLanguage.current = language
         propertiesWindowController?.close()
         propertiesWindowController = nil
+        libraryWindowController?.close()
+        libraryWindowController = nil
         rebuildStatusMenu()
     }
 
-    @objc private func screenConfigurationChanged() {
+    @objc private func screenConfigurationChanged(_ notification: Notification) {
         let signature = Self.currentDisplayConfigurationSignature()
         guard signature != displayConfigurationSignature else {
             prepareWallpaperWindowsForPresentation()
@@ -190,38 +219,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         reconcileWallpaperWindows()
     }
 
-    @objc private func foregroundLayoutChanged() {
-        updateForegroundApplicationState()
+    @objc private func foregroundLayoutChanged(_ notification: Notification) {
+        evaluateForegroundCoverage()
         scheduleForegroundCoverageEvaluation()
     }
 
-    @objc private func activeSpaceChanged() {
-        spaceTransitionGeneration += 1
-        let generation = spaceTransitionGeneration
-        wallpaperControllers.forEach { $0.beginSpaceTransition() }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
-            guard let self, generation == self.spaceTransitionGeneration else { return }
-            self.wallpaperControllers.forEach { $0.finishSpaceTransition() }
-        }
-        scheduleForegroundCoverageEvaluation()
+    @objc private func activeSpaceChanged(_ notification: Notification) {
+        desktopResumeNotBefore = ProcessInfo.processInfo.systemUptime + 0.55
+        evaluateForegroundCoverage()
+        scheduleForegroundCoverageEvaluation(after: 0.55)
     }
 
-    private func scheduleForegroundCoverageEvaluation() {
+    private func scheduleForegroundCoverageEvaluation(after delay: TimeInterval = 0.35) {
         coverageEvaluationGeneration += 1
         let generation = coverageEvaluationGeneration
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+        let resumeDelay = max(
+            0,
+            desktopResumeNotBefore - ProcessInfo.processInfo.systemUptime
+        )
+        let effectiveDelay = max(delay, resumeDelay + 0.05)
+        DispatchQueue.main.asyncAfter(deadline: .now() + effectiveDelay) { [weak self] in
             guard let self, generation == self.coverageEvaluationGeneration else { return }
-            self.updateForegroundApplicationState()
             self.evaluateForegroundCoverage()
         }
     }
 
-    @objc private func systemWillSuspend() {
+    @objc private func systemWillSuspend(_ notification: Notification) {
         isSystemSuspended = true
         applyRenderingState()
     }
 
-    @objc private func systemDidResume() {
+    @objc private func systemDidResume(_ notification: Notification) {
         isSystemSuspended = false
         prepareWallpaperWindowsForPresentation()
         applyRenderingState()
@@ -266,6 +294,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openURLItem.target = self
         menu.addItem(openURLItem)
 
+        let libraryItem = NSMenuItem(
+            title: L10n.text(.wallpaperLibrary),
+            action: #selector(showWallpaperLibrary),
+            keyEquivalent: "l"
+        )
+        libraryItem.target = self
+        menu.addItem(libraryItem)
+
         let reloadItem = NSMenuItem(
             title: L10n.text(.reloadWallpaper),
             action: #selector(reloadWallpaper),
@@ -302,15 +338,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(pauseItem)
         pauseMenuItem = pauseItem
 
-        let backgroundPauseItem = NSMenuItem(
-            title: L10n.text(.pauseWhenOtherAppActive),
-            action: #selector(toggleBackgroundPause),
+        let desktopHiddenPauseItem = NSMenuItem(
+            title: L10n.text(.pauseWhenDesktopHidden),
+            action: #selector(toggleDesktopHiddenPause),
             keyEquivalent: ""
         )
-        backgroundPauseItem.target = self
-        backgroundPauseItem.state = pauseWhenOtherApplicationActive ? .on : .off
-        menu.addItem(backgroundPauseItem)
-        backgroundPauseMenuItem = backgroundPauseItem
+        desktopHiddenPauseItem.target = self
+        desktopHiddenPauseItem.state = pauseWhenDesktopHidden ? .on : .off
+        menu.addItem(desktopHiddenPauseItem)
+        desktopHiddenPauseMenuItem = desktopHiddenPauseItem
 
         let muteItem = NSMenuItem(
             title: isAudioMuted ? L10n.text(.unmuteAudio) : L10n.text(.muteAudio),
@@ -359,7 +395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func registerForSystemEvents() {
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(screenConfigurationChanged),
+            selector: #selector(screenConfigurationChanged(_:)),
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
@@ -367,37 +403,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let workspaceCenter = NSWorkspace.shared.notificationCenter
         workspaceCenter.addObserver(
             self,
-            selector: #selector(systemWillSuspend),
+            selector: #selector(systemWillSuspend(_:)),
             name: NSWorkspace.willSleepNotification,
             object: nil
         )
         workspaceCenter.addObserver(
             self,
-            selector: #selector(systemDidResume),
+            selector: #selector(systemDidResume(_:)),
             name: NSWorkspace.didWakeNotification,
             object: nil
         )
         workspaceCenter.addObserver(
             self,
-            selector: #selector(systemWillSuspend),
+            selector: #selector(systemWillSuspend(_:)),
             name: NSWorkspace.sessionDidResignActiveNotification,
             object: nil
         )
         workspaceCenter.addObserver(
             self,
-            selector: #selector(systemDidResume),
+            selector: #selector(systemDidResume(_:)),
             name: NSWorkspace.sessionDidBecomeActiveNotification,
             object: nil
         )
         workspaceCenter.addObserver(
             self,
-            selector: #selector(activeSpaceChanged),
+            selector: #selector(activeSpaceChanged(_:)),
             name: NSWorkspace.activeSpaceDidChangeNotification,
             object: nil
         )
         workspaceCenter.addObserver(
             self,
-            selector: #selector(foregroundLayoutChanged),
+            selector: #selector(foregroundLayoutChanged(_:)),
             name: NSWorkspace.didActivateApplicationNotification,
             object: nil
         )
@@ -420,7 +456,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wallpaperControllers.forEach { $0.prepareForPresentation() }
         previousControllers.forEach { $0.close() }
         evaluateForegroundCoverage()
-        scheduleFallbackRefresh()
     }
 
     private func reconcileWallpaperWindows() {
@@ -461,7 +496,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .filter { !retainedControllers.contains(ObjectIdentifier($0)) }
             .forEach { $0.close() }
         evaluateForegroundCoverage()
-        scheduleFallbackRefresh()
         NSLog(
             "Wallflow display reconciliation: reused %d, created %d, removed %d",
             reusedCount,
@@ -475,13 +509,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func applyRenderingState() {
-        let backgroundPaused = pauseWhenOtherApplicationActive && isOtherApplicationActive
-        let shouldRender = !isManuallyPaused && !isSystemSuspended && !backgroundPaused
+        let shouldRender = !isManuallyPaused && !isSystemSuspended
         wallpaperControllers.forEach { $0.setRenderingEnabled(shouldRender) }
         pauseMenuItem?.title = isManuallyPaused
             ? L10n.text(.resumeAnimation)
             : L10n.text(.pauseAnimation)
-        backgroundPauseMenuItem?.state = pauseWhenOtherApplicationActive ? .on : .off
+        desktopHiddenPauseMenuItem?.state = pauseWhenDesktopHidden ? .on : .off
     }
 
     private func applyAudioState() {
@@ -490,47 +523,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func evaluateForegroundCoverage() {
-        guard automaticallyPauseCoveredDisplays else {
-            wallpaperControllers.forEach { $0.setCoveredByForegroundWindow(false) }
+        guard automaticallyPauseCoveredDisplays, pauseWhenDesktopHidden else {
+            wallpaperControllers.forEach { $0.setDesktopHidden(false) }
             return
         }
-        let options: CGWindowListOption = [
-            .optionOnScreenOnly,
-            .excludeDesktopElements
-        ]
-        guard let windowInfo = CGWindowListCopyWindowInfo(
-            options,
-            kCGNullWindowID
-        ) as? [[String: Any]] else {
-            return
-        }
-
-        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let windowBounds = DesktopVisibility.visibleApplicationWindowBounds()
+        let canResume = ProcessInfo.processInfo.systemUptime >= desktopResumeNotBefore
         for controller in wallpaperControllers {
             let screenBounds = controller.displayBounds
-            let screenArea = screenBounds.width * screenBounds.height
-
-            let isCovered = windowInfo.contains { info in
-                guard let layer = info[kCGWindowLayer as String] as? Int,
-                      layer == 0,
-                      let ownerPID = info[kCGWindowOwnerPID as String] as? Int,
-                      ownerPID != ownPID,
-                      let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
-                      let bounds = CGRect(
-                          dictionaryRepresentation: boundsDictionary as CFDictionary
-                      ),
-                      screenArea > 0 else {
-                    return false
-                }
-
-                let intersection = bounds.intersection(screenBounds)
-                let coveredArea = max(0, intersection.width) * max(0, intersection.height)
-                return coveredArea / screenArea >= 0.97
-            }
-
-            let coverageChanged = controller.setCoveredByForegroundWindow(isCovered)
-            if coverageChanged, isCovered {
-                refreshFallback(for: controller)
+            let isDesktopHidden = DesktopVisibility.isDisplayHidden(
+                screenBounds,
+                by: windowBounds
+            )
+            if isDesktopHidden || canResume || !controller.isDesktopHidden {
+                controller.setDesktopHidden(isDesktopHidden)
             }
         }
     }
@@ -561,6 +567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let sourceURL = project.manifestURL ?? project.entryURL ?? url
             let savedSource = sourceURL.isFileURL ? sourceURL.path : sourceURL.absoluteString
             UserDefaults.standard.set(savedSource, forKey: Self.savedProjectPathKey)
+            wallpaperLibrary.install(project: project, sourceURL: sourceURL)
         }
         updateProjectTitle()
         rebuildWallpaperWindows()
@@ -588,6 +595,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateProjectTitle() {
         projectTitleMenuItem?.title = L10n.projectTitle(for: currentProject)
         propertiesMenuItem?.isEnabled = supportsEditableProperties
+        refreshLibraryWindow()
     }
 
     private func showError(_ error: Error) {
@@ -610,7 +618,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         persistUserProperties()
         let changed = JSONValue.object([key: changedDefinition])
         wallpaperControllers.forEach { $0.applyUserProperties(changed) }
-        scheduleFallbackRefresh(delay: 0.35)
     }
 
     private func resetUserProperties() {
@@ -619,7 +626,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.removeObject(forKey: key)
         }
         wallpaperControllers.forEach { $0.applyUserProperties(currentUserProperties) }
-        scheduleFallbackRefresh(delay: 0.35)
         propertiesWindowController?.close()
         propertiesWindowController = nil
         showWallpaperProperties()
@@ -645,58 +651,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .object(definitions)
     }
 
-    private func restoreBackgroundPausePreference() {
+    private func restoreDesktopVisibilityPreference() {
         let defaults = UserDefaults.standard
-        if defaults.object(forKey: Self.pauseWhenOtherApplicationActiveKey) != nil {
-            pauseWhenOtherApplicationActive = defaults.bool(
-                forKey: Self.pauseWhenOtherApplicationActiveKey
+        if defaults.object(forKey: Self.pauseWhenDesktopHiddenKey) != nil {
+            pauseWhenDesktopHidden = defaults.bool(
+                forKey: Self.pauseWhenDesktopHiddenKey
             )
         }
     }
 
-    private func updateForegroundApplicationState() {
-        guard let application = NSWorkspace.shared.frontmostApplication else {
-            isOtherApplicationActive = false
+    private func registerCurrentProjectInLibrary() {
+        guard currentProject.kind != .builtIn,
+              let sourceURL = currentProject.manifestURL
+                ?? currentProject.entryURL
+                ?? currentProject.rootURL else {
             return
         }
-        let isFinder = application.bundleIdentifier == "com.apple.finder"
-        let isWallflow = application.processIdentifier
-            == ProcessInfo.processInfo.processIdentifier
-        let newValue = !isFinder
-            && !isWallflow
-            && Self.hasVisibleWindow(processIdentifier: application.processIdentifier)
-        guard newValue != isOtherApplicationActive else { return }
-        isOtherApplicationActive = newValue
-        if didFinishLaunching {
-            applyRenderingState()
+        wallpaperLibrary.install(project: currentProject, sourceURL: sourceURL)
+    }
+
+    private var currentLibraryEntryID: UUID? {
+        wallpaperLibrary.entry(for: currentProject)?.id
+    }
+
+    private func refreshLibraryWindow() {
+        libraryWindowController?.update(
+            entries: wallpaperLibrary.entries,
+            currentEntryID: currentLibraryEntryID,
+            isBuiltInCurrent: currentProject.kind == .builtIn
+        )
+    }
+
+    private func activateLibraryEntry(_ entry: WallpaperLibraryEntry?) {
+        guard let entry else {
+            useBuiltInWallpaper()
+            refreshLibraryWindow()
+            return
+        }
+        do {
+            try selectProject(at: entry.sourceURL, persist: true)
+        } catch {
+            showError(error)
         }
     }
 
-    private static func hasVisibleWindow(processIdentifier: pid_t) -> Bool {
-        let options: CGWindowListOption = [
-            .optionOnScreenOnly,
-            .excludeDesktopElements
-        ]
-        guard let windowInfo = CGWindowListCopyWindowInfo(
-            options,
-            kCGNullWindowID
-        ) as? [[String: Any]] else {
-            return true
-        }
-        return windowInfo.contains { info in
-            let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
-            let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue
-            let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
-            guard ownerPID == processIdentifier,
-                  layer == 0,
-                  alpha > 0.01,
-                  let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
-                  let bounds = CGRect(
-                      dictionaryRepresentation: boundsDictionary as CFDictionary
-                  ) else {
-                return false
+    private func confirmLibraryRemoval(_ entry: WallpaperLibraryEntry) {
+        let isManaged = wallpaperLibrary.isManaged(entry)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = L10n.libraryRemoveTitle(entry.title)
+        alert.informativeText = L10n.text(
+            isManaged ? .libraryRemoveManagedMessage : .libraryRemoveReferenceMessage
+        )
+        alert.addButton(withTitle: L10n.text(.libraryRemove))
+        alert.addButton(withTitle: L10n.text(.cancel))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let wasCurrent = currentLibraryEntryID == entry.id
+        do {
+            try wallpaperLibrary.remove(entry, deleteManagedFiles: isManaged)
+            if wasCurrent {
+                useBuiltInWallpaper()
             }
-            return bounds.width * bounds.height >= 4_096
+            refreshLibraryWindow()
+        } catch {
+            showError(error)
         }
     }
 
@@ -729,38 +748,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var supportsEditableProperties: Bool {
         currentProject.kind == .web
             && currentUserProperties.objectValue?.isEmpty == false
-    }
-
-    private func scheduleFallbackRefresh(delay: TimeInterval = 1.0) {
-        fallbackRefreshGeneration += 1
-        let generation = fallbackRefreshGeneration
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, generation == self.fallbackRefreshGeneration else { return }
-            self.wallpaperControllers.forEach { self.refreshFallback(for: $0) }
-        }
-        if delay <= 1.0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-                guard let self, generation == self.fallbackRefreshGeneration else { return }
-                self.wallpaperControllers.forEach { self.refreshFallback(for: $0) }
-            }
-        }
-    }
-
-    private func refreshFallback(for controller: DesktopWindowController) {
-        controller.captureFrame { [weak self, weak controller] image in
-            guard let self,
-                  let controller,
-                  let image,
-                  let snapshot = WallpaperSnapshot.preparedImage(from: image) else {
-                return
-            }
-            controller.setTransitionFrame(snapshot)
-            self.desktopFallbackManager.update(
-                image: snapshot,
-                for: controller.screen,
-                displayID: controller.displayID
-            )
-        }
     }
 
     private static func currentDisplayConfigurationSignature() -> String {

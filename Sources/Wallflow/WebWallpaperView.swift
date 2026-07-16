@@ -97,11 +97,16 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
 
         if enabled {
             webView.isHidden = false
-            setHostAnimationPaused(false)
-            webView.setAllMediaPlaybackSuspended(false) { [weak self] in
-                self?.scheduleFrozenFrameRemoval(generation: generation, delay: 0.12)
+            setHostAnimationPaused(false) { [weak self] in
+                guard let self,
+                      self.isRenderingEnabled,
+                      self.presentationGeneration == generation else {
+                    return
+                }
+                self.webView.setAllMediaPlaybackSuspended(false) { [weak self] in
+                    self?.waitForLiveFrame(generation: generation, attempt: 0)
+                }
             }
-            scheduleFrozenFrameRemoval(generation: generation, delay: 0.4)
             callPropertyListener("setPaused", argument: "false")
             startInputBridge()
         } else {
@@ -118,16 +123,6 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         displayIfNeeded()
         if !isRenderingEnabled, frozenImageView.image == nil {
             freezeCurrentFrame()
-        }
-    }
-
-    func captureFrame(completion: @escaping (NSImage?) -> Void) {
-        if let frozenImage = frozenImageView.image {
-            completion(frozenImage)
-            return
-        }
-        webView.takeSnapshot(with: nil) { image, _ in
-            completion(image.flatMap(WallpaperSnapshot.preparedImage))
         }
     }
 
@@ -302,7 +297,11 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
 
     private func dispatchMouseButton(_ event: NSEvent) {
         let global = NSEvent.mouseLocation
-        guard desktopFrame.contains(global) else { return }
+        guard desktopFrame.contains(global),
+              let quartzPoint = event.cgEvent?.location ?? CGEvent(source: nil)?.location,
+              DesktopVisibility.isDesktopExposed(at: quartzPoint) else {
+            return
+        }
         lastMouseMovementTime = CACurrentMediaTime()
         if inputPollingFPS != 60 {
             scheduleMouseTimer(fps: 60)
@@ -368,14 +367,26 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         }
     }
 
-    private func scheduleFrozenFrameRemoval(generation: Int, delay: TimeInterval) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+    private func waitForLiveFrame(generation: Int, attempt: Int) {
+        guard isRenderingEnabled, presentationGeneration == generation else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
             guard let self,
                   self.isRenderingEnabled,
                   self.presentationGeneration == generation else {
                 return
             }
-            self.frozenImageView.isHidden = true
+            self.webView.takeSnapshot(with: nil) { [weak self] image, _ in
+                guard let self,
+                      self.isRenderingEnabled,
+                      self.presentationGeneration == generation else {
+                    return
+                }
+                if image != nil {
+                    self.frozenImageView.isHidden = true
+                } else if attempt < 12 {
+                    self.waitForLiveFrame(generation: generation, attempt: attempt + 1)
+                }
+            }
         }
     }
 
