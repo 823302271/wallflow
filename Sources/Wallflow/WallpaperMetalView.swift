@@ -21,7 +21,10 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
     private var lastInteractionTime = CACurrentMediaTime()
     private var configuredFPS = 0
     private var frozenElapsedTime: Float?
+    private var frozenActivity: Float?
+    private var isRenderingEnabled = true
     private let renderScale: CGFloat = 0.75
+    private let frozenPresentationFPS = 5
 
     init(
         frame: CGRect,
@@ -45,18 +48,21 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
     }
 
     func setRenderingEnabled(_ enabled: Bool) {
-        let isCurrentlyEnabled = !isPaused
-        guard enabled != isCurrentlyEnabled else { return }
+        guard enabled != isRenderingEnabled else { return }
+        isRenderingEnabled = enabled
         if enabled {
             frozenElapsedTime = nil
-        } else {
-            frozenElapsedTime = Float(CACurrentMediaTime() - startTime)
-        }
-        isPaused = !enabled
-        if enabled {
+            frozenActivity = nil
             lastInteractionTime = CACurrentMediaTime()
-            draw()
+            setPreferredFPS(60)
+        } else {
+            let now = CACurrentMediaTime()
+            frozenElapsedTime = Float(now - startTime)
+            frozenActivity = updateMouseState(now: now).activity
+            setPreferredFPS(frozenPresentationFPS)
         }
+        isPaused = false
+        draw()
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -102,8 +108,14 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
         }
 
         let now = CACurrentMediaTime()
-        let mouseState = updateMouseState(now: now)
-        setPreferredFPS(mouseState.isActive ? 60 : 24)
+        let mouseState: (isActive: Bool, activity: Float)
+        if isRenderingEnabled {
+            mouseState = updateMouseState(now: now)
+            setPreferredFPS(mouseState.isActive ? 60 : 24)
+        } else {
+            mouseState = (false, frozenActivity ?? 0)
+            setPreferredFPS(frozenPresentationFPS)
+        }
 
         var uniforms = WallpaperUniforms(
             resolution: SIMD2(Float(drawableSize.width), Float(drawableSize.height)),
