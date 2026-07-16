@@ -18,6 +18,7 @@ enum WallflowSelfTest {
         try testDesktopVisibilityRules()
         try testWallpaperLibrary()
         try testWebManifest()
+        try testCanvasMetalSelection()
         try testRemoteWebProject()
         try testVideoProjects()
         try testUnsafeManifestEntry()
@@ -233,6 +234,59 @@ enum WallflowSelfTest {
             project.userProperties.objectValue?["speed"]?.objectValue?["value"]
                 == .number(2),
             "Web user property defaults were not decoded"
+        )
+    }
+
+    private static func testCanvasMetalSelection() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try """
+        <!doctype html><canvas id="wallpaper"></canvas><script src="wallpaper.js"></script>
+        """.write(
+            to: directory.appendingPathComponent("index.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try """
+        const canvas = document.getElementById('wallpaper');
+        const ctx = canvas.getContext('2d');
+        function draw() {
+          ctx.clearRect(0, 0, innerWidth, innerHeight);
+          ctx.beginPath();
+          ctx.arc(40, 40, 20, 0, Math.PI * 2);
+          ctx.fillStyle = '#fff';
+          ctx.fill();
+          requestAnimationFrame(draw);
+        }
+        requestAnimationFrame(draw);
+        """.write(
+            to: directory.appendingPathComponent("wallpaper.js"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try """
+        { "file": "index.html", "type": "web", "title": "Canvas Fixture" }
+        """.write(
+            to: directory.appendingPathComponent("project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let project = try WallpaperProjectLoader.load(directory)
+        try expect(
+            CanvasMetalProgramLoader.load(project: project) != nil,
+            "Compatible Canvas wallpaper did not select Metal"
+        )
+
+        try "ctx.drawImage(image, 0, 0);".write(
+            to: directory.appendingPathComponent("wallpaper.js"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try expect(
+            CanvasMetalProgramLoader.load(project: project) == nil,
+            "Unsupported Canvas wallpaper did not fall back to WebKit"
         )
     }
 

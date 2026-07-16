@@ -20,7 +20,7 @@ Wallpaper Engine web and scene compatibility.
 ## Current prototype
 
 - AppKit desktop-level windows on every display
-- Metal-rendered animation with no CPU-side particle simulation
+- Native Metal animation and a reusable Canvas 2D-to-Metal renderer
 - Global cursor tracking without intercepting desktop clicks
 - Smooth cursor parallax, bending lines, and interaction ripples
 - Adaptive 60 FPS while interacting and 24 FPS while idle
@@ -35,6 +35,7 @@ Wallpaper Engine web and scene compatibility.
 - Persistent wallpaper library with switching, reveal, and uninstall actions
 - Runtime language switching between English and Simplified Chinese
 - Native MP4, M4V, and MOV playback through AVFoundation
+- Automatic Metal rendering for compatible script-only Canvas 2D wallpapers
 - Project import from a video, directory, `project.json`, `index.html`, or `scene.pkg`
 
 ## Native video wallpapers
@@ -53,6 +54,11 @@ are decoded at the capped working resolution.
 
 Implemented:
 
+- Automatic detection of compatible local Canvas 2D wallpapers
+- Original wallpaper JavaScript execution through JavaScriptCore without modifying project files
+- Metal-backed paths, full circles, solid fills, rounded strokes, simple shadows, and overlay effects
+- Canvas animation frames, resize, mouse events, body background color, and property callbacks
+- Conservative WebKit fallback when a project uses unsupported Canvas, DOM, image, media, or network APIs
 - Local HTML, CSS, JavaScript, media, and project-relative assets through WebKit
 - `window.wallpaperPropertyListener.applyUserProperties`
 - `applyGeneralProperties` with the host FPS target
@@ -66,6 +72,8 @@ Implemented:
 
 Not implemented yet:
 
+- The Metal Canvas path does not yet translate images, text, gradients, partial arcs,
+  complex transforms, clipping, or complex DOM/CSS; those projects use WebKit
 - Live audio spectrum data
 - macOS media player metadata forwarding
 - Random-file directory callbacks currently return an empty path
@@ -171,11 +179,12 @@ so it does not display a Dock icon.
 ## Performance design
 
 Wallflow targets Apple Silicon exclusively and uses Metal as the rendering
-backbone. It avoids continuous CPU-side simulation, lowers the frame rate while
-idle, renders below Retina native resolution, uses a two-buffer swap chain, and
-suspends covered displays. HTML wallpapers are capped at 24 FPS and a device
-pixel ratio of 1, and run in WebKit only when a web project is selected. Native
-video uses AVFoundation with short buffering and a 1080p decode cap.
+backbone. Native and Canvas-Metal renderers draw below Retina native resolution,
+use short command buffers, and suspend covered displays. Compatible Canvas 2D
+wallpapers run their original JavaScript in-process and batch drawing into Metal
+at 24 FPS. Other HTML wallpapers fall back to WebKit at 24 FPS and a device pixel
+ratio of 1. Native video uses AVFoundation with short buffering and a 1080p
+decode cap.
 
 The default **Pause When Desktop Is Hidden** option stops rendering, media,
 audio, and wallpaper input only when the union of visible application windows
@@ -196,10 +205,12 @@ every retained display renderer when another display is connected or disconnecte
 ## Architecture direction
 
 Metal is the shared rendering foundation for the Apple Silicon-only target.
-Standalone video uses AVFoundation. WebKit remains an isolated compatibility
-host for HTML projects, and supported scene image layers currently use Core
-Animation as an interim compositor. Shader effects, particles, and scene layers
-will move through the shared Metal pipeline as their translators are implemented.
+The Canvas compatibility layer now executes the original wallpaper JavaScript
+with JavaScriptCore and translates supported Canvas 2D commands into reusable
+Metal primitives. It is selected by capabilities rather than wallpaper identity,
+so compatible projects need no per-wallpaper source changes. Standalone video
+uses AVFoundation, unsupported web capabilities fall back to WebKit, and current
+scene image layers use Core Animation until their Metal translators are ready.
 
 ## Verification
 
@@ -208,17 +219,18 @@ Line Tools alone:
 
 ```sh
 swift run Wallflow --self-test
+swift run Wallflow --canvas-metal-self-test /path/to/project.json
 swift run Wallflow --web-self-test
 swift run Wallflow --video-self-test /path/to/video.mp4
 swift run Wallflow --library-self-test
 ```
 
-The first command validates project loading, the wallpaper library, desktop
-visibility rules, package bounds checks, scene resolution, LZ4, embedded images,
-DXT, and scene layer construction. The second
-starts a real WKWebView and verifies Wallpaper Engine property and mouse APIs.
-The third opens a real video and verifies playback, pause/resume, and frame capture.
-The fourth renders the bilingual wallpaper management window to a PNG fixture.
+The first command validates project loading, renderer selection, the wallpaper
+library, desktop visibility, packages, textures, and scene construction. The
+second executes an unchanged Canvas wallpaper through Metal and verifies drawing,
+properties, input, pause, and resume. The third starts a real WKWebView. The
+fourth verifies native video playback and frame capture. The fifth renders the
+bilingual wallpaper management window to a PNG fixture.
 
 ## Project layout
 

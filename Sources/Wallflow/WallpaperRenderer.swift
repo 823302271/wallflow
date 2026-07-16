@@ -54,6 +54,13 @@ enum WallpaperRendererFactory {
         case .builtIn:
             return WallpaperMetalView(frame: frame, desktopFrame: desktopFrame)
         case .web:
+            if let metalRenderer = CanvasMetalWallpaperView.makeIfSupported(
+                frame: frame,
+                desktopFrame: desktopFrame,
+                project: project
+            ) {
+                return metalRenderer
+            }
             return WebWallpaperView(
                 frame: frame,
                 desktopFrame: desktopFrame,

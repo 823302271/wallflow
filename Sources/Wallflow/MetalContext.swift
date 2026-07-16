@@ -30,6 +30,8 @@ final class MetalContext {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     let pipeline: MTLRenderPipelineState
+    let canvasSourcePipeline: MTLRenderPipelineState
+    let canvasOverlayPipeline: MTLRenderPipelineState
 
     private init() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -56,5 +58,29 @@ final class MetalContext {
         self.device = device
         self.commandQueue = commandQueue
         self.pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
+
+        guard let canvasVertex = library.makeFunction(name: "canvasShapeVertex") else {
+            throw MetalContextError.shaderFunctionMissing("canvasShapeVertex")
+        }
+        guard let canvasFragment = library.makeFunction(name: "canvasShapeFragment") else {
+            throw MetalContextError.shaderFunctionMissing("canvasShapeFragment")
+        }
+
+        let canvasDescriptor = MTLRenderPipelineDescriptor()
+        canvasDescriptor.label = "Wallflow Canvas Shapes"
+        canvasDescriptor.vertexFunction = canvasVertex
+        canvasDescriptor.fragmentFunction = canvasFragment
+        canvasDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        let attachment = canvasDescriptor.colorAttachments[0]!
+        attachment.isBlendingEnabled = true
+        attachment.rgbBlendOperation = .add
+        attachment.alphaBlendOperation = .add
+        attachment.sourceRGBBlendFactor = .one
+        attachment.sourceAlphaBlendFactor = .one
+        attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        let canvasPipeline = try device.makeRenderPipelineState(descriptor: canvasDescriptor)
+        canvasSourcePipeline = canvasPipeline
+        canvasOverlayPipeline = canvasPipeline
     }
 }

@@ -66,6 +66,24 @@ if CommandLine.arguments.contains("--self-test") {
     }
     application.run()
     withExtendedLifetime(runner) {}
+} else if let testIndex = CommandLine.arguments.firstIndex(of: "--canvas-metal-self-test"),
+          CommandLine.arguments.indices.contains(testIndex + 1) {
+    let application = NSApplication.shared
+    let runner = WallflowCanvasMetalSelfTest()
+    let projectURL = URL(fileURLWithPath: CommandLine.arguments[testIndex + 1])
+    application.setActivationPolicy(.prohibited)
+    runner.run(projectURL: projectURL) { result in
+        switch result {
+        case .success:
+            print("Wallflow Canvas Metal self-test passed")
+            exit(EXIT_SUCCESS)
+        case .failure(let error):
+            fputs("Wallflow Canvas Metal self-test failed: \(error)\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    }
+    application.run()
+    withExtendedLifetime(runner) {}
 } else if CommandLine.arguments.contains("--web-self-test") {
     let application = NSApplication.shared
     let runner = WallflowWebSelfTest()

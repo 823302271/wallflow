@@ -101,5 +101,133 @@ enum MetalShader {
         color += grain * 0.012;
         return float4(color * uniforms.intensity, 1.0);
     }
+
+    struct CanvasUniforms {
+        float2 canvasSize;
+    };
+
+    struct CanvasShapeInstance {
+        float2 positionA;
+        float2 positionB;
+        float2 positionC;
+        float2 padding0;
+        float4 color;
+        float width;
+        uint kind;
+        float softness;
+        float padding1;
+    };
+
+    struct CanvasShapeOutput {
+        float4 position [[position]];
+        float2 local;
+        float2 parameters;
+        float4 color;
+        uint kind [[flat]];
+        float softness;
+    };
+
+    vertex CanvasShapeOutput canvasShapeVertex(
+        uint vertexID [[vertex_id]],
+        uint instanceID [[instance_id]],
+        constant CanvasUniforms &uniforms [[buffer(0)]],
+        const device CanvasShapeInstance *instances [[buffer(1)]]
+    ) {
+        const float2 corners[6] = {
+            float2(-1.0, -1.0), float2(1.0, -1.0), float2(-1.0, 1.0),
+            float2(-1.0, 1.0), float2(1.0, -1.0), float2(1.0, 1.0)
+        };
+        CanvasShapeInstance instance = instances[instanceID];
+        float2 pixel = instance.positionA;
+        float2 local = float2(0.0);
+        float2 parameters = float2(0.0);
+
+        if (instance.kind == 0) {
+            float2 delta = instance.positionB - instance.positionA;
+            float lengthValue = max(length(delta), 0.001);
+            float2 direction = delta / lengthValue;
+            float2 perpendicular = float2(-direction.y, direction.x);
+            float halfLength = lengthValue * 0.5;
+            float halfWidth = max(instance.width * 0.5, 0.5);
+            float2 extent = float2(
+                halfLength + halfWidth + instance.softness,
+                halfWidth + instance.softness
+            );
+            local = corners[vertexID] * extent;
+            pixel = (instance.positionA + instance.positionB) * 0.5
+                + direction * local.x + perpendicular * local.y;
+            parameters = float2(halfLength, halfWidth);
+        } else if (instance.kind == 1) {
+            float radius = max(instance.positionB.x, 0.5);
+            float extent = radius + instance.softness;
+            local = corners[vertexID] * extent;
+            pixel = instance.positionA + local;
+            parameters = float2(radius, instance.width);
+        } else if (instance.kind == 2) {
+            const uint triangleIndices[6] = { 0, 1, 2, 2, 2, 2 };
+            const float2 points[3] = {
+                instance.positionA, instance.positionB, instance.positionC
+            };
+            pixel = points[triangleIndices[vertexID]];
+        } else {
+            local = corners[vertexID];
+            pixel = (local * 0.5 + 0.5) * uniforms.canvasSize;
+        }
+
+        float2 ndc = float2(
+            pixel.x / uniforms.canvasSize.x * 2.0 - 1.0,
+            1.0 - pixel.y / uniforms.canvasSize.y * 2.0
+        );
+        CanvasShapeOutput output;
+        output.position = float4(ndc, 0.0, 1.0);
+        output.local = local;
+        output.parameters = parameters;
+        output.color = instance.color;
+        output.kind = instance.kind;
+        output.softness = max(instance.softness, 0.75);
+        return output;
+    }
+
+    fragment float4 canvasShapeFragment(CanvasShapeOutput input [[stage_in]]) {
+        float alpha = input.color.a;
+        if (input.kind == 0) {
+            float2 capsule = float2(
+                max(abs(input.local.x) - input.parameters.x, 0.0),
+                input.local.y
+            );
+            float distanceToShape = length(capsule) - input.parameters.y;
+            alpha *= 1.0 - smoothstep(
+                -input.softness * 0.5,
+                input.softness * 0.5,
+                distanceToShape
+            );
+        } else if (input.kind == 1) {
+            float radialDistance = length(input.local);
+            float outerDistance = radialDistance - input.parameters.x;
+            float outerAlpha = 1.0 - smoothstep(
+                -input.softness * 0.5,
+                input.softness * 0.5,
+                outerDistance
+            );
+            if (input.parameters.y > 0.0) {
+                float innerRadius = max(input.parameters.x - input.parameters.y, 0.0);
+                float innerDistance = radialDistance - innerRadius;
+                float innerAlpha = 1.0 - smoothstep(
+                    -input.softness * 0.5,
+                    input.softness * 0.5,
+                    innerDistance
+                );
+                alpha *= max(outerAlpha - innerAlpha, 0.0);
+            } else {
+                alpha *= outerAlpha;
+            }
+        } else if (input.kind == 3) {
+            float radius = length(input.local * float2(0.72, 1.0));
+            alpha *= smoothstep(0.52, 1.16, radius);
+        }
+
+        if (alpha < 0.001) discard_fragment();
+        return float4(input.color.rgb * alpha, alpha);
+    }
     """#
 }
