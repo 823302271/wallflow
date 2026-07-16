@@ -45,11 +45,14 @@ final class DesktopWindowController {
         window.hasShadow = false
         window.ignoresMouseEvents = true
         window.isReleasedWhenClosed = false
+        window.animationBehavior = .none
         window.level = NSWindow.Level(
             rawValue: Int(CGWindowLevelForKey(.desktopWindow)) + 1
         )
         window.collectionBehavior = [
             .canJoinAllSpaces,
+            .canJoinAllApplications,
+            .fullScreenAuxiliary,
             .stationary,
             .ignoresCycle
         ]
@@ -73,6 +76,12 @@ final class DesktopWindowController {
 
     func applyUserProperties(_ properties: JSONValue) {
         wallpaperRenderer.applyUserProperties(properties)
+    }
+
+    func prepareForPresentation() {
+        window.orderFrontRegardless()
+        window.displayIfNeeded()
+        wallpaperRenderer.prepareForPresentation()
     }
 
     private func applyRenderingState() {

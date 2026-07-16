@@ -99,8 +99,53 @@ final class WallflowWebSelfTest {
                     )
                     return
                 }
-                self.verifyMouseBridge()
+                self.verifyPauseAndResume()
             }
+        }
+    }
+
+    private func verifyPauseAndResume() {
+        wallpaperView?.setRenderingEnabled(false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.wallpaperView?.evaluateJavaScriptForTesting(
+                "window.__wallflowProbe.paused"
+            ) { [weak self] value, error in
+                guard let self else { return }
+                if let error {
+                    self.finish(.failure(error))
+                    return
+                }
+                guard (value as? NSNumber)?.boolValue == true else {
+                    self.finish(
+                        .failure(WallflowSelfTestError.failed("Web pause callback did not fire"))
+                    )
+                    return
+                }
+
+                self.wallpaperView?.setRenderingEnabled(true)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                    self?.verifyResumedState()
+                }
+            }
+        }
+    }
+
+    private func verifyResumedState() {
+        wallpaperView?.evaluateJavaScriptForTesting(
+            "window.__wallflowProbe.paused"
+        ) { [weak self] value, error in
+            guard let self else { return }
+            if let error {
+                self.finish(.failure(error))
+                return
+            }
+            guard (value as? NSNumber)?.boolValue == false else {
+                self.finish(
+                    .failure(WallflowSelfTestError.failed("Web resume callback did not fire"))
+                )
+                return
+            }
+            self.verifyMouseBridge()
         }
     }
 

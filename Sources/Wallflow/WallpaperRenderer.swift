@@ -5,15 +5,24 @@ protocol WallpaperRenderer: AnyObject {
     func setRenderingEnabled(_ enabled: Bool)
     func setAudioMuted(_ muted: Bool)
     func applyUserProperties(_ properties: JSONValue)
+    func prepareForPresentation()
 }
 
 extension WallpaperRenderer {
     func setAudioMuted(_ muted: Bool) {}
     func applyUserProperties(_ properties: JSONValue) {}
+    func prepareForPresentation() {
+        contentView.displayIfNeeded()
+    }
 }
 
 extension WallpaperMetalView: WallpaperRenderer {
     var contentView: NSView { self }
+
+    func prepareForPresentation() {
+        displayIfNeeded()
+        draw()
+    }
 }
 
 enum WallpaperRendererFactory {

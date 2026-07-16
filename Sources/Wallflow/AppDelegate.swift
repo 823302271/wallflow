@@ -14,6 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isAudioMuted = false
     private var currentProject = WallpaperProject.builtIn
     private var currentUserProperties: JSONValue = .object([:])
+    private var displayConfigurationSignature = ""
+    private var coverageEvaluationGeneration = 0
     private let automaticallyPauseCoveredDisplays = !CommandLine.arguments.contains(
         "--no-auto-pause"
     )
@@ -113,12 +115,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func screenConfigurationChanged() {
+        let signature = Self.currentDisplayConfigurationSignature()
+        guard signature != displayConfigurationSignature else {
+            prepareWallpaperWindowsForPresentation()
+            return
+        }
         rebuildWallpaperWindows()
     }
 
     @objc private func foregroundLayoutChanged() {
+        scheduleForegroundCoverageEvaluation()
+    }
+
+    @objc private func activeSpaceChanged() {
+        prepareWallpaperWindowsForPresentation()
+        DispatchQueue.main.async { [weak self] in
+            self?.prepareWallpaperWindowsForPresentation()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            self?.prepareWallpaperWindowsForPresentation()
+        }
+        scheduleForegroundCoverageEvaluation()
+    }
+
+    private func scheduleForegroundCoverageEvaluation() {
+        coverageEvaluationGeneration += 1
+        let generation = coverageEvaluationGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            self?.evaluateForegroundCoverage()
+            guard let self, generation == self.coverageEvaluationGeneration else { return }
+            self.evaluateForegroundCoverage()
         }
     }
 
@@ -129,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func systemDidResume() {
         isSystemSuspended = false
+        prepareWallpaperWindowsForPresentation()
         applyRenderingState()
     }
 
@@ -248,7 +274,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         workspaceCenter.addObserver(
             self,
-            selector: #selector(foregroundLayoutChanged),
+            selector: #selector(activeSpaceChanged),
             name: NSWorkspace.activeSpaceDidChangeNotification,
             object: nil
         )
@@ -261,6 +287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func rebuildWallpaperWindows() {
+        displayConfigurationSignature = Self.currentDisplayConfigurationSignature()
         wallpaperControllers.removeAll()
         wallpaperControllers = NSScreen.screens.enumerated().map { index, screen in
             DesktopWindowController(
@@ -273,6 +300,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyAudioState()
         wallpaperControllers.forEach { $0.applyUserProperties(currentUserProperties) }
         evaluateForegroundCoverage()
+    }
+
+    private func prepareWallpaperWindowsForPresentation() {
+        wallpaperControllers.forEach { $0.prepareForPresentation() }
     }
 
     private func applyRenderingState() {
@@ -433,5 +464,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let encodedPath = Data(url.standardizedFileURL.path.utf8).base64EncodedString()
         return "Wallflow.userProperties.\(encodedPath)"
+    }
+
+    private static func currentDisplayConfigurationSignature() -> String {
+        NSScreen.screens.map { screen in
+            let displayID = (screen.deviceDescription[
+                NSDeviceDescriptionKey("NSScreenNumber")
+            ] as? NSNumber)?.uint32Value ?? 0
+            let frame = screen.frame
+            return [
+                String(displayID),
+                String(Double(frame.origin.x)),
+                String(Double(frame.origin.y)),
+                String(Double(frame.width)),
+                String(Double(frame.height)),
+                String(Double(screen.backingScaleFactor))
+            ].joined(separator: ":")
+        }
+        .sorted()
+        .joined(separator: "|")
     }
 }

@@ -17,6 +17,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
     private var inputPollingFPS = 0
     private var lastMouseMovementTime = CACurrentMediaTime()
     private var isAudioMuted = false
+    private var presentationGeneration = 0
     private var userProperties: JSONValue
     var runtimeReadyHandler: (() -> Void)?
 
@@ -87,17 +88,28 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
     func setRenderingEnabled(_ enabled: Bool) {
         guard enabled != isRenderingEnabled else { return }
         isRenderingEnabled = enabled
+        presentationGeneration += 1
+        let generation = presentationGeneration
 
         if enabled {
-            frozenImageView.isHidden = true
             webView.isHidden = false
-            webView.setAllMediaPlaybackSuspended(false, completionHandler: nil)
+            webView.setAllMediaPlaybackSuspended(false) { [weak self] in
+                self?.scheduleFrozenFrameRemoval(generation: generation, delay: 0.12)
+            }
+            scheduleFrozenFrameRemoval(generation: generation, delay: 0.4)
             callPropertyListener("setPaused", argument: "false")
             startInputBridge()
         } else {
             stopInputBridge()
             callPropertyListener("setPaused", argument: "true")
             webView.setAllMediaPlaybackSuspended(true, completionHandler: nil)
+            freezeCurrentFrame()
+        }
+    }
+
+    func prepareForPresentation() {
+        displayIfNeeded()
+        if !isRenderingEnabled, frozenImageView.image == nil {
             freezeCurrentFrame()
         }
     }
@@ -295,6 +307,17 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
             self.frozenImageView.image = image
             self.frozenImageView.isHidden = false
             self.webView.isHidden = true
+        }
+    }
+
+    private func scheduleFrozenFrameRemoval(generation: Int, delay: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self,
+                  self.isRenderingEnabled,
+                  self.presentationGeneration == generation else {
+                return
+            }
+            self.frozenImageView.isHidden = true
         }
     }
 

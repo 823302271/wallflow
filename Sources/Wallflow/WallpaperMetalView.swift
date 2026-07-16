@@ -20,6 +20,7 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
     private var lastMouse = SIMD2<Float>(0.5, 0.5)
     private var lastInteractionTime = CACurrentMediaTime()
     private var configuredFPS = 0
+    private var frozenElapsedTime: Float?
     private let renderScale: CGFloat = 0.75
 
     init(
@@ -44,6 +45,13 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
     }
 
     func setRenderingEnabled(_ enabled: Bool) {
+        let isCurrentlyEnabled = !isPaused
+        guard enabled != isCurrentlyEnabled else { return }
+        if enabled {
+            frozenElapsedTime = nil
+        } else {
+            frozenElapsedTime = Float(CACurrentMediaTime() - startTime)
+        }
         isPaused = !enabled
         if enabled {
             lastInteractionTime = CACurrentMediaTime()
@@ -100,7 +108,7 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
         var uniforms = WallpaperUniforms(
             resolution: SIMD2(Float(drawableSize.width), Float(drawableSize.height)),
             mouse: smoothedMouse,
-            time: Float(now - startTime),
+            time: frozenElapsedTime ?? Float(now - startTime),
             activity: mouseState.activity,
             intensity: 1
         )
