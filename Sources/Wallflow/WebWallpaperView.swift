@@ -324,9 +324,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         guard !stateAlreadyHandled else { return }
 
         let global = NSEvent.mouseLocation
-        guard desktopFrame.contains(global),
-              let quartzPoint = event.cgEvent?.location ?? CGEvent(source: nil)?.location,
-              DesktopVisibility.isDesktopExposed(at: quartzPoint) else {
+        guard desktopFrame.contains(global) else {
             return
         }
         dispatchMouseButtonChange(button: button, isDown: isDown, globalLocation: global)
@@ -337,9 +335,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         let changed = current ^ lastPressedMouseButtons
         lastPressedMouseButtons = current
         guard changed != 0,
-              desktopFrame.contains(globalLocation),
-              let quartzPoint = CGEvent(source: nil)?.location,
-              DesktopVisibility.isDesktopExposed(at: quartzPoint) else {
+              desktopFrame.contains(globalLocation) else {
             return
         }
         if changed & 1 != 0 {

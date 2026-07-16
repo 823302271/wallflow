@@ -181,8 +181,9 @@ The default **Pause When Desktop Is Hidden** option stops rendering, media,
 audio, and wallpaper input only when the union of visible application windows
 hides an entire display's desktop. This also handles browsers that compose full
 screen from several windows. Normal application windows do not pause Wallflow
-while any desktop area remains exposed. Clicks over application windows are
-filtered out; only clicks on exposed desktop areas reach a wallpaper.
+while any desktop area remains exposed. Mouse input is observed globally without
+intercepting it, so the original application receives the click and an interactive
+wallpaper can react to the same click.
 
 During a full-screen or Space transition, Wallflow keeps the same desktop window,
 WebKit surface, and renderer alive at a constant desktop level. It pauses only the

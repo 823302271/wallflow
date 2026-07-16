@@ -226,6 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func activeSpaceChanged(_ notification: Notification) {
+        NSLog("Wallflow active Space changed")
         evaluateForegroundCoverage()
         scheduleForegroundCoverageEvaluation(after: 0.25)
         scheduleFallbackRefresh(delay: 0.8)
@@ -533,7 +534,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 screenBounds,
                 by: windowBounds
             )
-            controller.setDesktopHidden(isDesktopHidden)
+            let changed = controller.setDesktopHidden(isDesktopHidden)
+            if changed {
+                NSLog(
+                    "Wallflow display %u rendering %@",
+                    controller.displayID,
+                    isDesktopHidden ? "paused" : "resumed"
+                )
+            }
         }
     }
 
