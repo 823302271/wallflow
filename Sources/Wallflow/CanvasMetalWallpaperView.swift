@@ -27,7 +27,6 @@ private struct CanvasDrawBatch {
 
 final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRenderer {
     private static let framesPerSecond = 24
-    private static let renderScale: CGFloat = 0.75
 
     private let metalContext: MetalContext
     private let runtime: CanvasMetalRuntime
@@ -116,6 +115,11 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
         }
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateDrawableSize()
+    }
+
     func setRenderingEnabled(_ enabled: Bool) {
         guard enabled != isRenderingEnabled else { return }
         isRenderingEnabled = enabled
@@ -184,9 +188,10 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
     }
 
     private func updateDrawableSize() {
+        let backingBounds = convertToBacking(bounds)
         drawableSize = CGSize(
-            width: max(1, bounds.width * Self.renderScale),
-            height: max(1, bounds.height * Self.renderScale)
+            width: max(1, backingBounds.width),
+            height: max(1, backingBounds.height)
         )
     }
 

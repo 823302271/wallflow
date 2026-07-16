@@ -24,7 +24,8 @@ Wallpaper Engine web and scene compatibility.
 - Global cursor tracking without intercepting desktop clicks
 - Smooth cursor parallax, bending lines, and interaction ripples
 - Adaptive 60 FPS while interacting and 24 FPS while idle
-- 75% logical render scale to reduce fill-rate cost on Retina displays
+- 75% logical render scale for the built-in abstract scene
+- Full native backing resolution for Canvas-Metal wallpapers
 - Two-buffer Metal swap chain instead of the default three-buffer allocation
 - Rendering suspension when visible app windows collectively hide a display's desktop
 - Automatic suspension during sleep and inactive login sessions
@@ -179,8 +180,9 @@ so it does not display a Dock icon.
 ## Performance design
 
 Wallflow targets Apple Silicon exclusively and uses Metal as the rendering
-backbone. Native and Canvas-Metal renderers draw below Retina native resolution,
-use short command buffers, and suspend covered displays. Compatible Canvas 2D
+backbone. Canvas-Metal wallpapers use the display's full native backing
+resolution, while the built-in abstract scene retains its lower render scale.
+Renderers use short command buffers and suspend covered displays. Compatible Canvas 2D
 wallpapers run their original JavaScript in-process and batch drawing into Metal
 at 24 FPS. Other HTML wallpapers fall back to WebKit at 24 FPS and a device pixel
 ratio of 1. Native video uses AVFoundation with short buffering and a 1080p

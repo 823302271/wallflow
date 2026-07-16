@@ -58,6 +58,7 @@ final class WallflowCanvasMetalSelfTest {
             guard let view = wallpaperView,
                   view.schedulerActiveForTesting,
                   view.commandCountForTesting > 100,
+                  view.drawableSize == view.convertToBacking(view.bounds).size,
                   try integer(from: view.evaluateJavaScriptForTesting("config.fishCount")) == 15,
                   try integer(from: view.evaluateJavaScriptForTesting("kois.length")) == 15 else {
                 throw WallflowSelfTestError.failed("Canvas Metal initial state failed")
