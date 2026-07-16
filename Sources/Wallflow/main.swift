@@ -14,6 +14,24 @@ if CommandLine.arguments.contains("--self-test") {
         fputs("Wallflow self-test failed: \(error)\n", stderr)
         exit(EXIT_FAILURE)
     }
+} else if let testIndex = CommandLine.arguments.firstIndex(of: "--external-web-self-test"),
+          CommandLine.arguments.indices.contains(testIndex + 1) {
+    let application = NSApplication.shared
+    let runner = WallflowExternalWebTest()
+    let projectURL = URL(fileURLWithPath: CommandLine.arguments[testIndex + 1])
+    application.setActivationPolicy(.accessory)
+    runner.run(projectURL: projectURL) { result in
+        switch result {
+        case .success:
+            print("Wallflow external web self-test passed")
+            exit(EXIT_SUCCESS)
+        case .failure(let error):
+            fputs("Wallflow external web self-test failed: \(error)\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    }
+    application.run()
+    withExtendedLifetime(runner) {}
 } else if CommandLine.arguments.contains("--web-self-test") {
     let application = NSApplication.shared
     let runner = WallflowWebSelfTest()

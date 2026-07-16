@@ -20,6 +20,9 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 cp "$ROOT_DIR/.build/release/Wallflow" "$MACOS_DIR/Wallflow"
 cp "$ROOT_DIR/AppBundle/Info.plist" "$CONTENTS_DIR/Info.plist"
 cp "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$RESOURCES_DIR/THIRD_PARTY_NOTICES.md"
+if [ -d "$ROOT_DIR/.build/release/Wallflow_Wallflow.bundle" ]; then
+    cp -R "$ROOT_DIR/.build/release/Wallflow_Wallflow.bundle" "$RESOURCES_DIR/"
+fi
 chmod 755 "$MACOS_DIR/Wallflow"
 
 codesign --force --sign - "$APP_DIR"

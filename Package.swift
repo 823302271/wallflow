@@ -4,10 +4,14 @@ import PackageDescription
 
 let package = Package(
     name: "Wallflow",
+    defaultLocalization: "en",
     platforms: [
         .macOS(.v13)
     ],
     targets: [
-        .executableTarget(name: "Wallflow")
+        .executableTarget(
+            name: "Wallflow",
+            resources: [.process("Resources")]
+        )
     ]
 )

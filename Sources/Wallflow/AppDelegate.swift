@@ -16,6 +16,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentUserProperties: JSONValue = .object([:])
     private var displayConfigurationSignature = ""
     private var coverageEvaluationGeneration = 0
+    private var didFinishLaunching = false
+    private var pendingOpenURLs: [URL] = []
+    private let importService = WallpaperImportService()
     private let automaticallyPauseCoveredDisplays = !CommandLine.arguments.contains(
         "--no-auto-pause"
     )
@@ -28,6 +31,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configureStatusItem()
         rebuildWallpaperWindows()
         registerForSystemEvents()
+        didFinishLaunching = true
+        if let sourceURL = pendingOpenURLs.first {
+            pendingOpenURLs.removeAll()
+            importWallpaper(from: sourceURL, persist: true)
+        }
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard didFinishLaunching else {
+            pendingOpenURLs = urls
+            return
+        }
+        guard let sourceURL = urls.first else { return }
+        importWallpaper(from: sourceURL, persist: true)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -53,19 +70,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.activate(ignoringOtherApps: true)
 
         let panel = NSOpenPanel()
-        panel.title = "Open Wallpaper Engine Project"
-        panel.message = "Choose a project folder, project.json, index.html, or scene.pkg."
-        panel.prompt = "Open Wallpaper"
+        panel.title = L10n.text(.openPanelTitle)
+        panel.message = L10n.text(.openPanelMessage)
+        panel.prompt = L10n.text(.openPanelPrompt)
         panel.canChooseDirectories = true
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
 
         guard panel.runModal() == .OK, let selectedURL = panel.url else { return }
-        do {
-            try selectProject(at: selectedURL, persist: true)
-        } catch {
-            showError(error)
+        importWallpaper(from: selectedURL, persist: true)
+    }
+
+    @objc private func importWallpaperURL() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 440, height: 24))
+        input.placeholderString = L10n.text(.importURLPlaceholder)
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = L10n.text(.importURLTitle)
+        alert.informativeText = L10n.text(.importURLMessage)
+        alert.accessoryView = input
+        alert.addButton(withTitle: L10n.text(.importAction))
+        alert.addButton(withTitle: L10n.text(.cancel))
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let value = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let sourceURL = URL(string: value), sourceURL.scheme != nil else {
+            showError(WallpaperImportError.invalidURL)
+            return
         }
+        importWallpaper(from: sourceURL, persist: true)
     }
 
     @objc private func reloadWallpaper() {
@@ -84,7 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showWallpaperProperties() {
-        guard currentUserProperties.objectValue?.isEmpty == false else { return }
+        guard supportsEditableProperties else { return }
         NSApplication.shared.activate(ignoringOtherApps: true)
 
         let controller = WallpaperPropertiesWindowController(
@@ -112,6 +148,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.removeObject(forKey: Self.savedProjectPathKey)
         updateProjectTitle()
         rebuildWallpaperWindows()
+    }
+
+    @objc private func selectLanguage(_ sender: NSMenuItem) {
+        guard let language = AppLanguage(menuTag: sender.tag),
+              language != AppLanguage.current else {
+            return
+        }
+        AppLanguage.current = language
+        propertiesWindowController?.close()
+        propertiesWindowController = nil
+        rebuildStatusMenu()
     }
 
     @objc private func screenConfigurationChanged() {
@@ -164,24 +211,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             systemSymbolName: "waveform.path",
             accessibilityDescription: "Wallflow"
         )
+        statusItem = item
+        rebuildStatusMenu()
+    }
 
+    private func rebuildStatusMenu() {
+        guard let item = statusItem else { return }
         let menu = NSMenu()
-        let title = NSMenuItem(title: currentProject.displayTitle, action: nil, keyEquivalent: "")
+        let title = NSMenuItem(
+            title: L10n.projectTitle(for: currentProject),
+            action: nil,
+            keyEquivalent: ""
+        )
         title.isEnabled = false
         menu.addItem(title)
         projectTitleMenuItem = title
         menu.addItem(.separator())
 
         let openItem = NSMenuItem(
-            title: "Open Wallpaper...",
+            title: L10n.text(.openWallpaper),
             action: #selector(openWallpaper),
             keyEquivalent: "o"
         )
         openItem.target = self
         menu.addItem(openItem)
 
+        let openURLItem = NSMenuItem(
+            title: L10n.text(.openWallpaperURL),
+            action: #selector(importWallpaperURL),
+            keyEquivalent: ""
+        )
+        openURLItem.target = self
+        menu.addItem(openURLItem)
+
         let reloadItem = NSMenuItem(
-            title: "Reload Wallpaper",
+            title: L10n.text(.reloadWallpaper),
             action: #selector(reloadWallpaper),
             keyEquivalent: "r"
         )
@@ -189,17 +253,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(reloadItem)
 
         let propertiesItem = NSMenuItem(
-            title: "Wallpaper Properties...",
+            title: L10n.text(.wallpaperProperties),
             action: #selector(showWallpaperProperties),
             keyEquivalent: ","
         )
         propertiesItem.target = self
-        propertiesItem.isEnabled = currentUserProperties.objectValue?.isEmpty == false
+        propertiesItem.isEnabled = supportsEditableProperties
         menu.addItem(propertiesItem)
         propertiesMenuItem = propertiesItem
 
         let builtInItem = NSMenuItem(
-            title: "Use Native Demo",
+            title: L10n.text(.useNativeDemo),
             action: #selector(useBuiltInWallpaper),
             keyEquivalent: ""
         )
@@ -208,7 +272,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         let pauseItem = NSMenuItem(
-            title: "Pause Animation",
+            title: isManuallyPaused ? L10n.text(.resumeAnimation) : L10n.text(.pauseAnimation),
             action: #selector(togglePause),
             keyEquivalent: "p"
         )
@@ -217,7 +281,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pauseMenuItem = pauseItem
 
         let muteItem = NSMenuItem(
-            title: "Mute Audio",
+            title: isAudioMuted ? L10n.text(.unmuteAudio) : L10n.text(.muteAudio),
             action: #selector(toggleMute),
             keyEquivalent: "m"
         )
@@ -227,8 +291,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        let languageItem = NSMenuItem(
+            title: L10n.text(.language),
+            action: nil,
+            keyEquivalent: ""
+        )
+        let languageMenu = NSMenu(title: L10n.text(.language))
+        for language in AppLanguage.allCases {
+            let item = NSMenuItem(
+                title: language.menuTitle,
+                action: #selector(selectLanguage(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.tag = language.menuTag
+            item.state = language == AppLanguage.current ? .on : .off
+            languageMenu.addItem(item)
+        }
+        languageItem.submenu = languageMenu
+        menu.addItem(languageItem)
+
+        menu.addItem(.separator())
+
         let quitItem = NSMenuItem(
-            title: "Quit Wallflow",
+            title: L10n.text(.quit),
             action: #selector(quit),
             keyEquivalent: "q"
         )
@@ -236,7 +322,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
 
         item.menu = menu
-        statusItem = item
     }
 
     private func registerForSystemEvents() {
@@ -309,12 +394,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func applyRenderingState() {
         let shouldRender = !isManuallyPaused && !isSystemSuspended
         wallpaperControllers.forEach { $0.setRenderingEnabled(shouldRender) }
-        pauseMenuItem?.title = isManuallyPaused ? "Resume Animation" : "Pause Animation"
+        pauseMenuItem?.title = isManuallyPaused
+            ? L10n.text(.resumeAnimation)
+            : L10n.text(.pauseAnimation)
     }
 
     private func applyAudioState() {
         wallpaperControllers.forEach { $0.setAudioMuted(isAudioMuted) }
-        muteMenuItem?.title = isAudioMuted ? "Unmute Audio" : "Mute Audio"
+        muteMenuItem?.title = isAudioMuted ? L10n.text(.unmuteAudio) : L10n.text(.muteAudio)
     }
 
     private func evaluateForegroundCoverage() {
@@ -365,12 +452,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             !$0.hasPrefix("--")
         }
         let savedPath = UserDefaults.standard.string(forKey: Self.savedProjectPathKey)
-        guard let path = commandLinePath ?? savedPath else { return }
+        guard let source = commandLinePath ?? savedPath else { return }
 
         do {
-            currentProject = try WallpaperProjectLoader.load(
-                URL(fileURLWithPath: path)
-            )
+            currentProject = try WallpaperProjectLoader.load(Self.sourceURL(from: source))
             currentUserProperties = restoredUserProperties(for: currentProject)
         } catch {
             NSLog("Wallflow could not restore wallpaper: %@", error.localizedDescription)
@@ -386,21 +471,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         propertiesWindowController = nil
         if persist {
             let sourceURL = project.manifestURL ?? project.entryURL ?? url
-            UserDefaults.standard.set(sourceURL.path, forKey: Self.savedProjectPathKey)
+            let savedSource = sourceURL.isFileURL ? sourceURL.path : sourceURL.absoluteString
+            UserDefaults.standard.set(savedSource, forKey: Self.savedProjectPathKey)
         }
         updateProjectTitle()
         rebuildWallpaperWindows()
     }
 
+    private func importWallpaper(from sourceURL: URL, persist: Bool) {
+        projectTitleMenuItem?.title = L10n.text(.importing)
+        importService.prepare(sourceURL: sourceURL) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let preparedURL):
+                do {
+                    try self.selectProject(at: preparedURL, persist: persist)
+                } catch {
+                    self.updateProjectTitle()
+                    self.showError(error)
+                }
+            case .failure(let error):
+                self.updateProjectTitle()
+                self.showError(error)
+            }
+        }
+    }
+
     private func updateProjectTitle() {
-        projectTitleMenuItem?.title = currentProject.displayTitle
-        propertiesMenuItem?.isEnabled = currentUserProperties.objectValue?.isEmpty == false
+        projectTitleMenuItem?.title = L10n.projectTitle(for: currentProject)
+        propertiesMenuItem?.isEnabled = supportsEditableProperties
     }
 
     private func showError(_ error: Error) {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Could Not Open Wallpaper"
+        alert.messageText = L10n.text(.openErrorTitle)
         alert.informativeText = error.localizedDescription
         alert.runModal()
     }
@@ -462,8 +567,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let url = project.manifestURL ?? project.entryURL ?? project.rootURL else {
             return nil
         }
-        let encodedPath = Data(url.standardizedFileURL.path.utf8).base64EncodedString()
+        let source = url.isFileURL ? url.standardizedFileURL.path : url.absoluteString
+        let encodedPath = Data(source.utf8).base64EncodedString()
         return "Wallflow.userProperties.\(encodedPath)"
+    }
+
+    private static func sourceURL(from source: String) -> URL {
+        if let url = URL(string: source),
+           let scheme = url.scheme?.lowercased(),
+           ["http", "https"].contains(scheme) {
+            return url
+        }
+        return URL(fileURLWithPath: source)
+    }
+
+    private var supportsEditableProperties: Bool {
+        currentProject.kind == .web
+            && currentUserProperties.objectValue?.isEmpty == false
     }
 
     private static func currentDisplayConfigurationSignature() -> String {

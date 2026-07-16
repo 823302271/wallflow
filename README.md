@@ -29,6 +29,7 @@ and scene compatibility.
 - Rendering suspension when a foreground window covers an entire display
 - Automatic suspension during sleep and inactive login sessions
 - Menu bar pause and resume controls
+- Runtime language switching between English and Simplified Chinese
 - Project import from a directory, `project.json`, `index.html`, or `scene.pkg`
 
 ## Wallpaper Engine web compatibility
@@ -91,6 +92,49 @@ Use the waveform icon in the menu bar to pause or quit Wallflow.
 
 Use **Open Wallpaper...** from the menu bar to choose a Wallpaper Engine
 project. A web compatibility fixture is included at `Fixtures/web-wallpaper`.
+
+## Import wallpapers
+
+- **Open Wallpaper...** accepts a project directory, `project.json`,
+  `index.html`, `scene.pkg`, or a complete ZIP archive.
+- **Import from URL...** accepts an HTTP(S) web wallpaper URL or an HTTP(S)
+  URL to a complete ZIP project.
+- A supported file or ZIP can be opened with Wallflow from Finder, including by
+  dragging the file onto `Wallflow.app`.
+- ZIP imports are checked for path traversal, symbolic links, excessive file
+  count, and excessive extracted size before they are loaded.
+
+For projects with local assets, import the complete project directory or ZIP.
+A remote `project.json` or `scene.pkg` alone is incomplete because its sibling
+textures, scripts, materials, and media are not included.
+
+### Why an import can fail
+
+| Message or reason | Resolution |
+| --- | --- |
+| No supported project entry | Include `project.json`, `index.html`, or `scene.pkg`. |
+| Malformed `project.json` | Validate its JSON and confirm the `file` and `type` fields. |
+| Missing or outside entry file | Keep the entry and all assets inside the project directory. |
+| Unsupported wallpaper type | Video and application wallpapers are not implemented yet. |
+| Remote `.json` or `.pkg` is incomplete | Package the entire project as ZIP and import that URL. |
+| Steam Workshop URL | Import the locally downloaded Workshop folder or an author-provided ZIP. |
+| Unsafe ZIP path or symbolic link | Rebuild the archive with regular files and relative paths only. |
+| Archive is too large | Downloads are limited to 512 MB; extracted projects to 1 GB and 100,000 files. |
+| Multiple projects at the same archive level | Put one wallpaper project in each ZIP. |
+
+An import may succeed while some scene effects are missing. Check the scene
+compatibility section for unsupported shaders, particles, scripts, and video.
+
+## Animation customization
+
+Web wallpapers can expose Wallpaper Engine user properties. Wallflow currently
+applies checkbox, slider, color, combo, text, file, and directory values and
+persists them per project.
+
+Scene customization will be added in stages. The planned order is playback
+speed and FPS limits, camera/parallax controls, effect toggles, per-layer
+properties, then particle and audio-reactive parameters. Scene controls will
+only appear after the corresponding renderer binding is implemented.
 
 To create a double-clickable app bundle:
 

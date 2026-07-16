@@ -14,7 +14,9 @@ enum WallflowSelfTestError: Error, CustomStringConvertible {
 
 enum WallflowSelfTest {
     static func run() throws {
+        try testLocalizationResources()
         try testWebManifest()
+        try testRemoteWebProject()
         try testUnsafeManifestEntry()
         try testScenePackageAndDocument()
         try testUnsafePackagePath()
@@ -25,6 +27,33 @@ enum WallflowSelfTest {
         try testDXTTextures()
         try testSpriteTexture()
         try testSceneViewBuildsImageLayer()
+    }
+
+    private static func testLocalizationResources() throws {
+        try expect(
+            L10n.text(.openWallpaper, language: .english) == "Open Wallpaper...",
+            "English localization resource was not loaded"
+        )
+        try expect(
+            L10n.text(.openWallpaper, language: .simplifiedChinese) == "打开壁纸...",
+            "Simplified Chinese localization resource was not loaded"
+        )
+        try expect(
+            L10n.format(
+                .propertiesWindowTitle,
+                language: .simplifiedChinese,
+                "Koi Pond"
+            ) == "Koi Pond 属性",
+            "Localized format string was not resolved"
+        )
+    }
+
+    private static func testRemoteWebProject() throws {
+        let url = URL(string: "https://example.com/wallpaper/index.html")!
+        let project = try WallpaperProjectLoader.load(url)
+        try expect(project.kind == .web, "Remote web project kind was not detected")
+        try expect(project.entryURL == url, "Remote web entry URL was not preserved")
+        try expect(project.rootURL == nil, "Remote web project unexpectedly has a local root")
     }
 
     private static func testWebManifest() throws {

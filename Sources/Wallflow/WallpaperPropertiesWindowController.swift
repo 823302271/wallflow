@@ -33,7 +33,7 @@ final class WallpaperPropertiesWindowController: NSWindowController {
             backing: .buffered,
             defer: false
         )
-        window.title = "\(title) Properties"
+        window.title = L10n.propertiesWindowTitle(title)
         window.minSize = NSSize(width: 440, height: 320)
         super.init(window: window)
         window.contentView = makeContentView(properties: properties)
@@ -76,7 +76,7 @@ final class WallpaperPropertiesWindowController: NSWindowController {
         documentView.addSubview(stack)
         scrollView.documentView = documentView
 
-        let resetButton = NSButton(title: "Reset Defaults", target: nil, action: nil)
+        let resetButton = NSButton(title: L10n.text(.resetDefaults), target: nil, action: nil)
         resetButton.bezelStyle = .rounded
         let resetTarget = ActionTarget { [weak self] _ in self?.onReset() }
         resetButton.target = resetTarget
@@ -112,8 +112,10 @@ final class WallpaperPropertiesWindowController: NSWindowController {
         row.spacing = 12
         row.translatesAutoresizingMaskIntoConstraints = false
 
-        let rawTitle = values["text"]?.stringValue
-        let title = rawTitle?.hasPrefix("ui_") == false ? rawTitle ?? key : key
+        let title = L10n.wallpaperPropertyTitle(
+            rawTitle: values["text"]?.stringValue,
+            key: key
+        )
         let label = NSTextField(labelWithString: title)
         label.lineBreakMode = .byTruncatingTail
         label.toolTip = key
@@ -218,7 +220,7 @@ final class WallpaperPropertiesWindowController: NSWindowController {
             let label = object["label"]?.stringValue
                 ?? object["text"]?.stringValue
                 ?? object["value"]?.stringValue
-                ?? "Option"
+                ?? L10n.text(.option)
             popup.addItem(withTitle: label.hasPrefix("ui_") ? label.dropFirst(3).description : label)
             return object["value"] ?? .string(label)
         }
@@ -268,12 +270,17 @@ final class WallpaperPropertiesWindowController: NSWindowController {
         container.alignment = .centerY
         container.spacing = 8
 
-        let valueLabel = NSTextField(labelWithString: value.isEmpty ? "None" : value)
+        let valueLabel = NSTextField(
+            labelWithString: value.isEmpty ? L10n.text(.none) : value
+        )
         valueLabel.lineBreakMode = .byTruncatingMiddle
         valueLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 170).isActive = true
 
-        let button = NSButton(title: "Choose...", target: nil, action: nil)
-        button.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "Choose")
+        let button = NSButton(title: L10n.text(.choose), target: nil, action: nil)
+        button.image = NSImage(
+            systemSymbolName: "folder",
+            accessibilityDescription: L10n.text(.choose)
+        )
         button.imagePosition = .imageLeading
         let target = ActionTarget { [weak self, weak valueLabel] _ in
             let panel = NSOpenPanel()

@@ -50,21 +50,24 @@ enum WallpaperProjectLoaderError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .unsupportedSelection(let url):
-            return "No supported Wallpaper Engine project was found at \(url.path)."
+            return L10n.unsupportedSelection(url.path)
         case .malformedManifest(let url, let error):
-            return "Could not read \(url.lastPathComponent): \(error.localizedDescription)"
+            return L10n.malformedManifest(url.lastPathComponent, error: error)
         case .unsupportedType(let type):
-            return "Wallpaper type '\(type)' is not supported yet."
+            return L10n.unsupportedType(type)
         case .missingEntry(let url):
-            return "Wallpaper entry file is missing: \(url.path)"
+            return L10n.missingEntry(url.path)
         case .entryOutsideProject(let url):
-            return "Wallpaper entry is outside its project directory: \(url.path)"
+            return L10n.entryOutsideProject(url.path)
         }
     }
 }
 
 enum WallpaperProjectLoader {
     static func load(_ selectedURL: URL) throws -> WallpaperProject {
+        if !selectedURL.isFileURL {
+            return try loadRemoteWebURL(selectedURL)
+        }
         let url = selectedURL.standardizedFileURL
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
@@ -104,6 +107,22 @@ enum WallpaperProjectLoader {
             }
             throw WallpaperProjectLoaderError.unsupportedSelection(url)
         }
+    }
+
+    private static func loadRemoteWebURL(_ url: URL) throws -> WallpaperProject {
+        guard let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              url.host != nil else {
+            throw WallpaperImportError.invalidURL
+        }
+        return WallpaperProject(
+            kind: .web,
+            rootURL: nil,
+            entryURL: url,
+            manifestURL: nil,
+            manifest: nil,
+            displayTitle: url.host ?? url.absoluteString
+        )
     }
 
     private static func loadDirectory(_ directory: URL) throws -> WallpaperProject {

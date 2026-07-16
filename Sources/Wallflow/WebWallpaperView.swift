@@ -147,11 +147,14 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
     }
 
     private func loadWallpaper() {
-        guard let entryURL = project.entryURL,
-              let rootURL = project.rootURL else {
+        guard let entryURL = project.entryURL else {
             return
         }
-        webView.loadFileURL(entryURL, allowingReadAccessTo: rootURL)
+        if entryURL.isFileURL, let rootURL = project.rootURL {
+            webView.loadFileURL(entryURL, allowingReadAccessTo: rootURL)
+        } else {
+            webView.load(URLRequest(url: entryURL))
+        }
     }
 
     private func dispatchInitialProperties() {
@@ -371,6 +374,11 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         };
         const target = document.elementFromPoint(x, y) || document;
         target.dispatchEvent(new MouseEvent(type, options));
+        if (type === 'mouseup' && button === 0) {
+          target.dispatchEvent(new MouseEvent('click', options));
+        } else if (type === 'mouseup' && button === 2) {
+          target.dispatchEvent(new MouseEvent('contextmenu', options));
+        }
         if (type === 'mousemove' && typeof PointerEvent !== 'undefined') {
           target.dispatchEvent(new PointerEvent('pointermove', options));
         }
