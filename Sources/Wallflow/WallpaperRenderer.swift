@@ -4,15 +4,33 @@ protocol WallpaperRenderer: AnyObject {
     var contentView: NSView { get }
     func setRenderingEnabled(_ enabled: Bool)
     func setAudioMuted(_ muted: Bool)
+    func setPlaysAudio(_ enabled: Bool)
+    func updateDesktopFrame(_ frame: CGRect)
     func applyUserProperties(_ properties: JSONValue)
     func prepareForPresentation()
+    func captureFrame(completion: @escaping (NSImage?) -> Void)
 }
 
 extension WallpaperRenderer {
     func setAudioMuted(_ muted: Bool) {}
+    func setPlaysAudio(_ enabled: Bool) {}
+    func updateDesktopFrame(_ frame: CGRect) {}
     func applyUserProperties(_ properties: JSONValue) {}
     func prepareForPresentation() {
         contentView.displayIfNeeded()
+    }
+    func captureFrame(completion: @escaping (NSImage?) -> Void) {
+        let bounds = contentView.bounds
+        guard bounds.width > 0,
+              bounds.height > 0,
+              let representation = contentView.bitmapImageRepForCachingDisplay(in: bounds) else {
+            completion(nil)
+            return
+        }
+        contentView.cacheDisplay(in: bounds, to: representation)
+        let image = NSImage(size: bounds.size)
+        image.addRepresentation(representation)
+        completion(image)
     }
 }
 
@@ -46,6 +64,12 @@ enum WallpaperRendererFactory {
             return SceneWallpaperView(
                 frame: frame,
                 desktopFrame: desktopFrame,
+                project: project,
+                playsAudio: playsAudio
+            )
+        case .video:
+            return VideoWallpaperView(
+                frame: frame,
                 project: project,
                 playsAudio: playsAudio
             )

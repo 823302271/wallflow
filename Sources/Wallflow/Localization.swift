@@ -62,6 +62,7 @@ enum L10n {
         case useNativeDemo = "menu.use_native_demo"
         case pauseAnimation = "menu.pause_animation"
         case resumeAnimation = "menu.resume_animation"
+        case pauseWhenOtherAppActive = "menu.pause_when_other_app_active"
         case muteAudio = "menu.mute_audio"
         case unmuteAudio = "menu.unmute_audio"
         case language = "menu.language"

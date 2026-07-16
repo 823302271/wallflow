@@ -241,8 +241,9 @@ final class WallpaperImportService {
     }
 
     private func locateProject(in rootURL: URL) throws -> URL {
-        let namesByPriority = ["project.json", "index.html", "scene.pkg"]
-        for name in namesByPriority {
+        let entryFileNames = ["project.json", "index.html", "scene.pkg"]
+        let videoExtensions = ["mp4", "m4v", "mov"]
+        for name in entryFileNames {
             let directURL = rootURL.appendingPathComponent(name)
             if FileManager.default.fileExists(atPath: directURL.path) {
                 return name == "project.json" ? directURL : rootURL
@@ -259,9 +260,14 @@ final class WallpaperImportService {
 
         var candidates: [(priority: Int, depth: Int, url: URL)] = []
         while let fileURL = enumerator.nextObject() as? URL {
-            guard let priority = namesByPriority.firstIndex(
-                of: fileURL.lastPathComponent.lowercased()
-            ) else {
+            let fileName = fileURL.lastPathComponent.lowercased()
+            let extensionName = fileURL.pathExtension.lowercased()
+            let priority: Int
+            if let entryPriority = entryFileNames.firstIndex(of: fileName) {
+                priority = entryPriority
+            } else if videoExtensions.contains(extensionName) {
+                priority = entryFileNames.count
+            } else {
                 continue
             }
             let relative = fileURL.path.dropFirst(rootURL.path.count)
@@ -283,6 +289,7 @@ final class WallpaperImportService {
             throw WallpaperImportError.multipleProjectsInArchive
         }
         return best.url.lastPathComponent.lowercased() == "project.json"
+            || videoExtensions.contains(best.url.pathExtension.lowercased())
             ? best.url
             : best.url.deletingLastPathComponent()
     }

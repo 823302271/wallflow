@@ -24,7 +24,6 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
     private var frozenActivity: Float?
     private var isRenderingEnabled = true
     private let renderScale: CGFloat = 0.75
-    private let frozenPresentationFPS = 5
 
     init(
         frame: CGRect,
@@ -55,14 +54,18 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
             frozenActivity = nil
             lastInteractionTime = CACurrentMediaTime()
             setPreferredFPS(60)
+            isPaused = false
         } else {
             let now = CACurrentMediaTime()
             frozenElapsedTime = Float(now - startTime)
             frozenActivity = updateMouseState(now: now).activity
-            setPreferredFPS(frozenPresentationFPS)
+            draw()
+            isPaused = true
         }
-        isPaused = false
-        draw()
+    }
+
+    func updateDesktopFrame(_ frame: CGRect) {
+        desktopFrame = frame
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -114,7 +117,6 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
             setPreferredFPS(mouseState.isActive ? 60 : 24)
         } else {
             mouseState = (false, frozenActivity ?? 0)
-            setPreferredFPS(frozenPresentationFPS)
         }
 
         var uniforms = WallpaperUniforms(

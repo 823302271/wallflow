@@ -13,6 +13,7 @@ struct WallpaperProject: Equatable {
         case builtIn
         case web
         case scene
+        case video
     }
 
     let kind: Kind
@@ -105,6 +106,9 @@ enum WallpaperProjectLoader {
                     displayTitle: url.deletingPathExtension().lastPathComponent
                 )
             }
+            if Self.videoExtensions.contains(url.pathExtension.lowercased()) {
+                return videoProject(entryURL: url)
+            }
             throw WallpaperProjectLoaderError.unsupportedSelection(url)
         }
     }
@@ -115,8 +119,11 @@ enum WallpaperProjectLoader {
               url.host != nil else {
             throw WallpaperImportError.invalidURL
         }
+        let kind: WallpaperProject.Kind = videoExtensions.contains(
+            url.pathExtension.lowercased()
+        ) ? .video : .web
         return WallpaperProject(
-            kind: .web,
+            kind: kind,
             rootURL: nil,
             entryURL: url,
             manifestURL: nil,
@@ -141,6 +148,15 @@ enum WallpaperProjectLoader {
             return try load(sceneURL)
         }
 
+        let videos = (try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ))?.filter { videoExtensions.contains($0.pathExtension.lowercased()) } ?? []
+        if videos.count == 1 {
+            return videoProject(entryURL: videos[0])
+        }
+
         throw WallpaperProjectLoaderError.unsupportedSelection(directory)
     }
 
@@ -159,6 +175,8 @@ enum WallpaperProjectLoader {
             kind = .web
         case "scene":
             kind = .scene
+        case "video":
+            kind = .video
         default:
             throw WallpaperProjectLoaderError.unsupportedType(manifest.type)
         }
@@ -182,6 +200,19 @@ enum WallpaperProjectLoader {
             manifestURL: manifestURL,
             manifest: manifest,
             displayTitle: manifest.title ?? rootURL.lastPathComponent
+        )
+    }
+
+    private static let videoExtensions = Set(["mp4", "m4v", "mov"])
+
+    private static func videoProject(entryURL: URL) -> WallpaperProject {
+        WallpaperProject(
+            kind: .video,
+            rootURL: entryURL.isFileURL ? entryURL.deletingLastPathComponent() : nil,
+            entryURL: entryURL,
+            manifestURL: nil,
+            manifest: nil,
+            displayTitle: entryURL.deletingPathExtension().lastPathComponent
         )
     }
 }

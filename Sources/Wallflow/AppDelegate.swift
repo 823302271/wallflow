@@ -5,6 +5,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var wallpaperControllers: [DesktopWindowController] = []
     private var statusItem: NSStatusItem?
     private var pauseMenuItem: NSMenuItem?
+    private var backgroundPauseMenuItem: NSMenuItem?
     private var muteMenuItem: NSMenuItem?
     private var projectTitleMenuItem: NSMenuItem?
     private var propertiesMenuItem: NSMenuItem?
@@ -12,21 +13,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isManuallyPaused = false
     private var isSystemSuspended = false
     private var isAudioMuted = false
+    private var pauseWhenOtherApplicationActive = true
+    private var isOtherApplicationActive = false
     private var currentProject = WallpaperProject.builtIn
     private var currentUserProperties: JSONValue = .object([:])
     private var displayConfigurationSignature = ""
     private var coverageEvaluationGeneration = 0
+    private var spaceTransitionGeneration = 0
     private var didFinishLaunching = false
     private var pendingOpenURLs: [URL] = []
     private let importService = WallpaperImportService()
+    private let desktopFallbackManager = DesktopFallbackManager()
+    private var fallbackRefreshGeneration = 0
     private let automaticallyPauseCoveredDisplays = !CommandLine.arguments.contains(
         "--no-auto-pause"
     )
 
     private static let savedProjectPathKey = "Wallflow.selectedProjectPath"
+    private static let pauseWhenOtherApplicationActiveKey =
+        "Wallflow.pauseWhenOtherApplicationActive"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         loadInitialProject()
+        restoreBackgroundPausePreference()
+        updateForegroundApplicationState()
         currentUserProperties = restoredUserProperties(for: currentProject)
         configureStatusItem()
         rebuildWallpaperWindows()
@@ -48,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        desktopFallbackManager.restoreOriginalDesktops()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         NotificationCenter.default.removeObserver(self)
     }
@@ -60,6 +71,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleMute() {
         isAudioMuted.toggle()
         applyAudioState()
+    }
+
+    @objc private func toggleBackgroundPause() {
+        pauseWhenOtherApplicationActive.toggle()
+        UserDefaults.standard.set(
+            pauseWhenOtherApplicationActive,
+            forKey: Self.pauseWhenOtherApplicationActiveKey
+        )
+        applyRenderingState()
     }
 
     @objc private func quit() {
@@ -167,20 +187,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             prepareWallpaperWindowsForPresentation()
             return
         }
-        rebuildWallpaperWindows()
+        reconcileWallpaperWindows()
     }
 
     @objc private func foregroundLayoutChanged() {
+        updateForegroundApplicationState()
         scheduleForegroundCoverageEvaluation()
     }
 
     @objc private func activeSpaceChanged() {
-        prepareWallpaperWindowsForPresentation()
-        DispatchQueue.main.async { [weak self] in
-            self?.prepareWallpaperWindowsForPresentation()
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-            self?.prepareWallpaperWindowsForPresentation()
+        spaceTransitionGeneration += 1
+        let generation = spaceTransitionGeneration
+        wallpaperControllers.forEach { $0.beginSpaceTransition() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
+            guard let self, generation == self.spaceTransitionGeneration else { return }
+            self.wallpaperControllers.forEach { $0.finishSpaceTransition() }
         }
         scheduleForegroundCoverageEvaluation()
     }
@@ -190,6 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let generation = coverageEvaluationGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             guard let self, generation == self.coverageEvaluationGeneration else { return }
+            self.updateForegroundApplicationState()
             self.evaluateForegroundCoverage()
         }
     }
@@ -279,6 +301,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pauseItem.target = self
         menu.addItem(pauseItem)
         pauseMenuItem = pauseItem
+
+        let backgroundPauseItem = NSMenuItem(
+            title: L10n.text(.pauseWhenOtherAppActive),
+            action: #selector(toggleBackgroundPause),
+            keyEquivalent: ""
+        )
+        backgroundPauseItem.target = self
+        backgroundPauseItem.state = pauseWhenOtherApplicationActive ? .on : .off
+        menu.addItem(backgroundPauseItem)
+        backgroundPauseMenuItem = backgroundPauseItem
 
         let muteItem = NSMenuItem(
             title: isAudioMuted ? L10n.text(.unmuteAudio) : L10n.text(.muteAudio),
@@ -373,18 +405,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func rebuildWallpaperWindows() {
         displayConfigurationSignature = Self.currentDisplayConfigurationSignature()
-        wallpaperControllers.removeAll()
-        wallpaperControllers = NSScreen.screens.enumerated().map { index, screen in
+        let previousControllers = wallpaperControllers
+        let newControllers = NSScreen.screens.enumerated().map { index, screen in
             DesktopWindowController(
                 screen: screen,
                 project: currentProject,
                 playsAudio: index == 0
             )
         }
+        wallpaperControllers = newControllers
         applyRenderingState()
         applyAudioState()
         wallpaperControllers.forEach { $0.applyUserProperties(currentUserProperties) }
+        wallpaperControllers.forEach { $0.prepareForPresentation() }
+        previousControllers.forEach { $0.close() }
         evaluateForegroundCoverage()
+        scheduleFallbackRefresh()
+    }
+
+    private func reconcileWallpaperWindows() {
+        displayConfigurationSignature = Self.currentDisplayConfigurationSignature()
+        let previousControllers = wallpaperControllers
+        var availableByDisplayID: [CGDirectDisplayID: DesktopWindowController] = [:]
+        previousControllers.forEach { controller in
+            if availableByDisplayID[controller.displayID] == nil {
+                availableByDisplayID[controller.displayID] = controller
+            }
+        }
+        var nextControllers: [DesktopWindowController] = []
+        var reusedCount = 0
+
+        for (index, screen) in NSScreen.screens.enumerated() {
+            let displayID = DesktopWindowController.displayID(for: screen)
+            if let controller = availableByDisplayID.removeValue(forKey: displayID) {
+                controller.update(screen: screen, playsAudio: index == 0)
+                nextControllers.append(controller)
+                reusedCount += 1
+            } else {
+                nextControllers.append(
+                    DesktopWindowController(
+                        screen: screen,
+                        project: currentProject,
+                        playsAudio: index == 0
+                    )
+                )
+            }
+        }
+
+        wallpaperControllers = nextControllers
+        applyRenderingState()
+        applyAudioState()
+        wallpaperControllers.forEach { $0.applyUserProperties(currentUserProperties) }
+        let retainedControllers = Set(nextControllers.map(ObjectIdentifier.init))
+        previousControllers
+            .filter { !retainedControllers.contains(ObjectIdentifier($0)) }
+            .forEach { $0.close() }
+        evaluateForegroundCoverage()
+        scheduleFallbackRefresh()
+        NSLog(
+            "Wallflow display reconciliation: reused %d, created %d, removed %d",
+            reusedCount,
+            max(0, nextControllers.count - reusedCount),
+            availableByDisplayID.count
+        )
     }
 
     private func prepareWallpaperWindowsForPresentation() {
@@ -392,11 +475,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func applyRenderingState() {
-        let shouldRender = !isManuallyPaused && !isSystemSuspended
+        let backgroundPaused = pauseWhenOtherApplicationActive && isOtherApplicationActive
+        let shouldRender = !isManuallyPaused && !isSystemSuspended && !backgroundPaused
         wallpaperControllers.forEach { $0.setRenderingEnabled(shouldRender) }
         pauseMenuItem?.title = isManuallyPaused
             ? L10n.text(.resumeAnimation)
             : L10n.text(.pauseAnimation)
+        backgroundPauseMenuItem?.state = pauseWhenOtherApplicationActive ? .on : .off
     }
 
     private func applyAudioState() {
@@ -443,7 +528,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return coveredArea / screenArea >= 0.97
             }
 
-            controller.setCoveredByForegroundWindow(isCovered)
+            let coverageChanged = controller.setCoveredByForegroundWindow(isCovered)
+            if coverageChanged, isCovered {
+                refreshFallback(for: controller)
+            }
         }
     }
 
@@ -522,6 +610,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         persistUserProperties()
         let changed = JSONValue.object([key: changedDefinition])
         wallpaperControllers.forEach { $0.applyUserProperties(changed) }
+        scheduleFallbackRefresh(delay: 0.35)
     }
 
     private func resetUserProperties() {
@@ -530,6 +619,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.removeObject(forKey: key)
         }
         wallpaperControllers.forEach { $0.applyUserProperties(currentUserProperties) }
+        scheduleFallbackRefresh(delay: 0.35)
         propertiesWindowController?.close()
         propertiesWindowController = nil
         showWallpaperProperties()
@@ -553,6 +643,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             definitions[propertyKey] = .object(definition)
         }
         return .object(definitions)
+    }
+
+    private func restoreBackgroundPausePreference() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: Self.pauseWhenOtherApplicationActiveKey) != nil {
+            pauseWhenOtherApplicationActive = defaults.bool(
+                forKey: Self.pauseWhenOtherApplicationActiveKey
+            )
+        }
+    }
+
+    private func updateForegroundApplicationState() {
+        guard let application = NSWorkspace.shared.frontmostApplication else {
+            isOtherApplicationActive = false
+            return
+        }
+        let isFinder = application.bundleIdentifier == "com.apple.finder"
+        let isWallflow = application.processIdentifier
+            == ProcessInfo.processInfo.processIdentifier
+        let newValue = !isFinder
+            && !isWallflow
+            && Self.hasVisibleWindow(processIdentifier: application.processIdentifier)
+        guard newValue != isOtherApplicationActive else { return }
+        isOtherApplicationActive = newValue
+        if didFinishLaunching {
+            applyRenderingState()
+        }
+    }
+
+    private static func hasVisibleWindow(processIdentifier: pid_t) -> Bool {
+        let options: CGWindowListOption = [
+            .optionOnScreenOnly,
+            .excludeDesktopElements
+        ]
+        guard let windowInfo = CGWindowListCopyWindowInfo(
+            options,
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return true
+        }
+        return windowInfo.contains { info in
+            let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+            let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue
+            let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
+            guard ownerPID == processIdentifier,
+                  layer == 0,
+                  alpha > 0.01,
+                  let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(
+                      dictionaryRepresentation: boundsDictionary as CFDictionary
+                  ) else {
+                return false
+            }
+            return bounds.width * bounds.height >= 4_096
+        }
     }
 
     private func persistUserProperties() {
@@ -584,6 +729,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var supportsEditableProperties: Bool {
         currentProject.kind == .web
             && currentUserProperties.objectValue?.isEmpty == false
+    }
+
+    private func scheduleFallbackRefresh(delay: TimeInterval = 1.0) {
+        fallbackRefreshGeneration += 1
+        let generation = fallbackRefreshGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, generation == self.fallbackRefreshGeneration else { return }
+            self.wallpaperControllers.forEach { self.refreshFallback(for: $0) }
+        }
+        if delay <= 1.0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                guard let self, generation == self.fallbackRefreshGeneration else { return }
+                self.wallpaperControllers.forEach { self.refreshFallback(for: $0) }
+            }
+        }
+    }
+
+    private func refreshFallback(for controller: DesktopWindowController) {
+        controller.captureFrame { [weak self, weak controller] image in
+            guard let self,
+                  let controller,
+                  let image,
+                  let snapshot = WallpaperSnapshot.preparedImage(from: image) else {
+                return
+            }
+            controller.setTransitionFrame(snapshot)
+            self.desktopFallbackManager.update(
+                image: snapshot,
+                for: controller.screen,
+                displayID: controller.displayID
+            )
+        }
     }
 
     private static func currentDisplayConfigurationSignature() -> String {

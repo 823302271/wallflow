@@ -8,6 +8,8 @@
     <string>Wallflow</string>
     <key>CFBundleIdentifier</key>
     <string>dev.wallflow.prototype</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -34,6 +36,9 @@
                 <string>htm</string>
                 <string>pkg</string>
                 <string>zip</string>
+                <string>mp4</string>
+                <string>m4v</string>
+                <string>mov</string>
             </array>
         </dict>
     </array>
@@ -46,6 +51,8 @@
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsArbitraryLoadsInWebContent</key>
+        <true/>
+        <key>NSAllowsArbitraryLoadsForMedia</key>
         <true/>
     </dict>
 </dict>

@@ -17,6 +17,7 @@ enum WallflowSelfTest {
         try testLocalizationResources()
         try testWebManifest()
         try testRemoteWebProject()
+        try testVideoProjects()
         try testUnsafeManifestEntry()
         try testScenePackageAndDocument()
         try testUnsafePackagePath()
@@ -39,6 +40,13 @@ enum WallflowSelfTest {
             "Simplified Chinese localization resource was not loaded"
         )
         try expect(
+            L10n.text(
+                .pauseWhenOtherAppActive,
+                language: .simplifiedChinese
+            ) == "其他应用在前台时暂停",
+            "Background pause localization resource was not loaded"
+        )
+        try expect(
             L10n.format(
                 .propertiesWindowTitle,
                 language: .simplifiedChinese,
@@ -54,6 +62,32 @@ enum WallflowSelfTest {
         try expect(project.kind == .web, "Remote web project kind was not detected")
         try expect(project.entryURL == url, "Remote web entry URL was not preserved")
         try expect(project.rootURL == nil, "Remote web project unexpectedly has a local root")
+    }
+
+    private static func testVideoProjects() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let videoURL = directory.appendingPathComponent("wallflow-test.mp4")
+        try Data().write(to: videoURL)
+        let directProject = try WallpaperProjectLoader.load(videoURL)
+        try expect(directProject.kind == .video, "Local MP4 project kind was not detected")
+        try expect(directProject.entryURL == videoURL, "Local MP4 entry URL was not preserved")
+
+        let remoteURL = URL(string: "https://example.com/wallpaper/demo.mp4")!
+        let remoteProject = try WallpaperProjectLoader.load(remoteURL)
+        try expect(remoteProject.kind == .video, "Remote MP4 project kind was not detected")
+
+        try """
+        { "file": "wallflow-test.mp4", "type": "video", "title": "Video Fixture" }
+        """.write(
+            to: directory.appendingPathComponent("project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let manifestProject = try WallpaperProjectLoader.load(directory)
+        try expect(manifestProject.kind == .video, "Video manifest kind was not detected")
+        try expect(manifestProject.displayTitle == "Video Fixture", "Video title was not decoded")
     }
 
     private static func testWebManifest() throws {

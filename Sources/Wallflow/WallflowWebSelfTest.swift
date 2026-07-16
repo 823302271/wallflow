@@ -53,7 +53,7 @@ final class WallflowWebSelfTest {
                   let speed = properties["speed"] as? [String: Any],
                   (speed["value"] as? NSNumber)?.doubleValue == 2,
                   let general = probe["general"] as? [String: Any],
-                  (general["fps"] as? NSNumber)?.intValue == 30,
+                  (general["fps"] as? NSNumber)?.intValue == 24,
                   (probe["paused"] as? NSNumber)?.boolValue == false else {
                 self.finish(
                     .failure(WallflowSelfTestError.failed("Web property callbacks were incomplete"))
@@ -107,6 +107,16 @@ final class WallflowWebSelfTest {
     private func verifyPauseAndResume() {
         wallpaperView?.setRenderingEnabled(false)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard self?.wallpaperView?.inputBridgeActiveForTesting == false else {
+                self?.finish(
+                    .failure(
+                        WallflowSelfTestError.failed(
+                            "Web input bridge remained active while paused"
+                        )
+                    )
+                )
+                return
+            }
             self?.wallpaperView?.evaluateJavaScriptForTesting(
                 "window.__wallflowProbe.paused"
             ) { [weak self] value, error in
@@ -124,6 +134,16 @@ final class WallflowWebSelfTest {
 
                 self.wallpaperView?.setRenderingEnabled(true)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                    guard self?.wallpaperView?.inputBridgeActiveForTesting == true else {
+                        self?.finish(
+                            .failure(
+                                WallflowSelfTestError.failed(
+                                    "Web input bridge did not resume"
+                                )
+                            )
+                        )
+                        return
+                    }
                     self?.verifyResumedState()
                 }
             }

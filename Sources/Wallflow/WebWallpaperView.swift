@@ -3,11 +3,12 @@ import QuartzCore
 import WebKit
 
 final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
+    private static let hostFPS = 24
     private let webView: WKWebView
     private let frozenImageView: NSImageView
-    private let desktopFrame: CGRect
+    private var desktopFrame: CGRect
     private let project: WallpaperProject
-    private let playsAudio: Bool
+    private var playsAudio: Bool
     private var mouseTimer: Timer?
     private var globalMouseMonitor: Any?
     private var lastMouseLocation = CGPoint(x: -.greatestFiniteMagnitude, y: 0)
@@ -20,6 +21,9 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
     private var presentationGeneration = 0
     private var userProperties: JSONValue
     var runtimeReadyHandler: (() -> Void)?
+    var inputBridgeActiveForTesting: Bool {
+        mouseTimer != nil && globalMouseMonitor != nil
+    }
 
     var contentView: NSView { self }
 
@@ -93,6 +97,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
 
         if enabled {
             webView.isHidden = false
+            setHostAnimationPaused(false)
             webView.setAllMediaPlaybackSuspended(false) { [weak self] in
                 self?.scheduleFrozenFrameRemoval(generation: generation, delay: 0.12)
             }
@@ -103,7 +108,9 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
             stopInputBridge()
             callPropertyListener("setPaused", argument: "true")
             webView.setAllMediaPlaybackSuspended(true, completionHandler: nil)
-            freezeCurrentFrame()
+            setHostAnimationPaused(true) { [weak self] in
+                self?.freezeCurrentFrame()
+            }
         }
     }
 
@@ -114,9 +121,29 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         }
     }
 
+    func captureFrame(completion: @escaping (NSImage?) -> Void) {
+        if let frozenImage = frozenImageView.image {
+            completion(frozenImage)
+            return
+        }
+        webView.takeSnapshot(with: nil) { image, _ in
+            completion(image.flatMap(WallpaperSnapshot.preparedImage))
+        }
+    }
+
     func setAudioMuted(_ muted: Bool) {
         isAudioMuted = muted
         applyAudioMuteState()
+    }
+
+    func setPlaysAudio(_ enabled: Bool) {
+        playsAudio = enabled
+        applyAudioMuteState()
+    }
+
+    func updateDesktopFrame(_ frame: CGRect) {
+        desktopFrame = frame
+        lastMouseLocation = CGPoint(x: -.greatestFiniteMagnitude, y: 0)
     }
 
     func applyUserProperties(_ properties: JSONValue) {
@@ -160,8 +187,16 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
     private func dispatchInitialProperties() {
         guard isRuntimeReady else { return }
         let propertiesJSON = Self.javascriptJSON(userProperties.foundationObject)
+        webView.evaluateJavaScript(
+            "window.__wallflowSetFPS(\(Self.hostFPS));",
+            completionHandler: nil
+        )
+        setHostAnimationPaused(!isRenderingEnabled)
         callPropertyListener("applyUserProperties", argument: propertiesJSON)
-        callPropertyListener("applyGeneralProperties", argument: "{fps: 30}")
+        callPropertyListener(
+            "applyGeneralProperties",
+            argument: "{fps: \(Self.hostFPS)}"
+        )
         callPropertyListener("setPaused", argument: isRenderingEnabled ? "false" : "true")
         applyAudioMuteState()
     }
@@ -186,6 +221,21 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
             "window.__wallflowSetMuted(\(effectiveMuted ? "true" : "false"));",
             completionHandler: nil
         )
+    }
+
+    private func setHostAnimationPaused(
+        _ paused: Bool,
+        completion: (() -> Void)? = nil
+    ) {
+        guard isRuntimeReady else {
+            completion?()
+            return
+        }
+        webView.evaluateJavaScript(
+            "window.__wallflowSetPaused(\(paused ? "true" : "false"));"
+        ) { _, _ in
+            completion?()
+        }
     }
 
     private func startInputBridge() {
@@ -306,8 +356,13 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
 
     private func freezeCurrentFrame() {
         webView.takeSnapshot(with: nil) { [weak self] image, _ in
-            guard let self, !self.isRenderingEnabled, let image else { return }
-            self.frozenImageView.image = image
+            guard let self,
+                  !self.isRenderingEnabled,
+                  let image,
+                  let snapshot = WallpaperSnapshot.preparedImage(from: image) else {
+                return
+            }
+            self.frozenImageView.image = snapshot
             self.frozenImageView.isHidden = false
             self.webView.isHidden = true
         }
@@ -347,6 +402,102 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
 
     private static let compatibilityBootstrap = #"""
     (() => {
+      const nativeRequestAnimationFrame = window.requestAnimationFrame.bind(window);
+      const nativeCancelAnimationFrame = window.cancelAnimationFrame.bind(window);
+      let frameInterval = 1000 / 24;
+      let lastFrameTime = -Infinity;
+      let nextFrameRequestId = 1;
+      let nativePumpId = null;
+      let timerId = null;
+      let isPumping = false;
+      let hostPaused = false;
+      let virtualFrameTime = null;
+      const frameCallbacks = new Map();
+
+      function scheduleAnimationPump() {
+        if (hostPaused || nativePumpId !== null || timerId !== null || frameCallbacks.size === 0) return;
+        const elapsed = performance.now() - lastFrameTime;
+        const delay = Math.max(0, frameInterval - elapsed);
+        if (delay <= 1) {
+          nativePumpId = nativeRequestAnimationFrame(pumpAnimationFrame);
+        } else {
+          timerId = setTimeout(() => {
+            timerId = null;
+            nativePumpId = nativeRequestAnimationFrame(pumpAnimationFrame);
+          }, delay);
+        }
+      }
+
+      function pumpAnimationFrame(timestamp) {
+        nativePumpId = null;
+        const elapsed = Number.isFinite(lastFrameTime) ? timestamp - lastFrameTime : 0;
+        lastFrameTime = timestamp;
+        if (virtualFrameTime === null) {
+          virtualFrameTime = timestamp;
+        } else {
+          virtualFrameTime += Math.min(Math.max(elapsed, 0), frameInterval * 2);
+        }
+        const callbacks = Array.from(frameCallbacks.values());
+        frameCallbacks.clear();
+        isPumping = true;
+        callbacks.forEach(callback => callback(virtualFrameTime));
+        isPumping = false;
+        scheduleAnimationPump();
+      }
+
+      window.requestAnimationFrame = function(callback) {
+        const id = nextFrameRequestId++;
+        frameCallbacks.set(id, callback);
+        if (!isPumping) scheduleAnimationPump();
+        return id;
+      };
+      window.cancelAnimationFrame = function(id) {
+        frameCallbacks.delete(id);
+        if (frameCallbacks.size === 0) {
+          if (nativePumpId !== null) {
+            nativeCancelAnimationFrame(nativePumpId);
+            nativePumpId = null;
+          }
+          if (timerId !== null) {
+            clearTimeout(timerId);
+            timerId = null;
+          }
+        }
+      };
+      window.__wallflowSetFPS = function(fps) {
+        const value = Number(fps);
+        frameInterval = 1000 / Math.min(Math.max(Number.isFinite(value) ? value : 24, 1), 60);
+        if (timerId !== null) {
+          clearTimeout(timerId);
+          timerId = null;
+        }
+        scheduleAnimationPump();
+      };
+      window.__wallflowSetPaused = function(paused) {
+        hostPaused = Boolean(paused);
+        if (hostPaused) {
+          if (nativePumpId !== null) {
+            nativeCancelAnimationFrame(nativePumpId);
+            nativePumpId = null;
+          }
+          if (timerId !== null) {
+            clearTimeout(timerId);
+            timerId = null;
+          }
+        } else {
+          lastFrameTime = performance.now();
+          scheduleAnimationPump();
+        }
+      };
+
+      const nativeDevicePixelRatio = window.devicePixelRatio || 1;
+      try {
+        Object.defineProperty(window, 'devicePixelRatio', {
+          configurable: true,
+          get: () => Math.min(nativeDevicePixelRatio, 1)
+        });
+      } catch (_) {}
+
       window.wallpaperEngineVersion = '2.5.0-wallflow';
       window.wallpaperRegisterAudioListener = function(listener) {
         window.__wallflowAudioListener = listener;

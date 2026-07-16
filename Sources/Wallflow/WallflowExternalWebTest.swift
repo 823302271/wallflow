@@ -186,6 +186,76 @@ final class WallflowExternalWebTest {
                 )
                 return
             }
+            self.verifyHostPause()
+        }
+    }
+
+    private func verifyHostPause() {
+        wallpaperView?.setRenderingEnabled(false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.wallpaperView?.evaluateJavaScriptForTesting("causticTime") {
+                [weak self] value, error in
+                guard let self else { return }
+                if let error {
+                    self.finish(.failure(error))
+                    return
+                }
+                guard let pausedClock = (value as? NSNumber)?.doubleValue else {
+                    self.finish(
+                        .failure(
+                            WallflowSelfTestError.failed(
+                                "Koi pause clock was unavailable"
+                            )
+                        )
+                    )
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    self?.verifyPausedClock(pausedClock)
+                }
+            }
+        }
+    }
+
+    private func verifyPausedClock(_ pausedClock: Double) {
+        wallpaperView?.evaluateJavaScriptForTesting("causticTime") { [weak self] value, error in
+            guard let self else { return }
+            if let error {
+                self.finish(.failure(error))
+                return
+            }
+            guard let currentClock = (value as? NSNumber)?.doubleValue,
+                  abs(currentClock - pausedClock) < 0.001 else {
+                self.finish(
+                    .failure(
+                        WallflowSelfTestError.failed(
+                            "Koi animation advanced while Wallflow was paused"
+                        )
+                    )
+                )
+                return
+            }
+            self.wallpaperView?.setRenderingEnabled(true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                self?.verifyResumedClock(pausedClock)
+            }
+        }
+    }
+
+    private func verifyResumedClock(_ pausedClock: Double) {
+        wallpaperView?.evaluateJavaScriptForTesting("causticTime") { [weak self] value, error in
+            guard let self else { return }
+            if let error {
+                self.finish(.failure(error))
+                return
+            }
+            guard let currentClock = (value as? NSNumber)?.doubleValue,
+                  currentClock > pausedClock else {
+                self.finish(
+                    .failure(WallflowSelfTestError.failed("Koi animation did not resume"))
+                )
+                return
+            }
             self.finish(.success(()))
         }
     }

@@ -8,15 +8,18 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
         var basePosition: CGPoint
     }
 
-    private let desktopFrame: CGRect
+    private var desktopFrame: CGRect
     private let project: WallpaperProject
-    private let playsAudio: Bool
+    private var playsAudio: Bool
     private let previewLayer = CALayer()
     private var renderedLayers: [RenderedLayer] = []
     private var mouseTimer: Timer?
     private var lastMouseLocation = CGPoint(x: -.greatestFiniteMagnitude, y: 0)
     private var sceneDocument: SceneDocument?
     private var isRenderingEnabled = true
+    private var isAudioMuted = false
+    private var scenePackage: ScenePackage?
+    private var sceneSounds: [SceneSoundObject] = []
     private var audioController: SceneAudioController?
 
     var contentView: NSView { self }
@@ -75,7 +78,24 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
     }
 
     func setAudioMuted(_ muted: Bool) {
+        isAudioMuted = muted
         audioController?.setMuted(muted)
+    }
+
+    func setPlaysAudio(_ enabled: Bool) {
+        guard enabled != playsAudio else { return }
+        playsAudio = enabled
+        if enabled {
+            configureAudioIfNeeded()
+        } else {
+            audioController?.setRenderingEnabled(false)
+            audioController = nil
+        }
+    }
+
+    func updateDesktopFrame(_ frame: CGRect) {
+        desktopFrame = frame
+        lastMouseLocation = CGPoint(x: -.greatestFiniteMagnitude, y: 0)
     }
 
     private func loadScene() {
@@ -83,15 +103,12 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
         do {
             let package = try ScenePackage(url: packageURL)
             let document = try SceneDocument(package: package)
+            scenePackage = package
+            sceneSounds = document.sounds
             sceneDocument = document
             applyClearColor(document.general.clearColor)
             loadSceneLayers(package: package, document: document)
-            if playsAudio, !document.sounds.isEmpty {
-                audioController = SceneAudioController(
-                    package: package,
-                    sounds: document.sounds
-                )
-            }
+            configureAudioIfNeeded()
             if renderedLayers.isEmpty {
                 loadPreviewImage(package: package)
             }
@@ -107,6 +124,22 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
         } catch {
             NSLog("Wallflow scene load failed: %@", error.localizedDescription)
         }
+    }
+
+    private func configureAudioIfNeeded() {
+        guard playsAudio,
+              audioController == nil,
+              let scenePackage,
+              !sceneSounds.isEmpty else {
+            return
+        }
+        let controller = SceneAudioController(
+            package: scenePackage,
+            sounds: sceneSounds
+        )
+        controller.setMuted(isAudioMuted)
+        controller.setRenderingEnabled(isRenderingEnabled)
+        audioController = controller
     }
 
     private func loadSceneLayers(package: ScenePackage, document: SceneDocument) {
