@@ -187,10 +187,11 @@ filtered out; only clicks on exposed desktop areas reach a wallpaper.
 During a full-screen or Space transition, Wallflow pauses the existing renderer,
 keeps that same window on its last frame through the transition, and resumes it
 after the desktop is visible. It does not create a second player or reload the
-wallpaper. Wallflow also does not modify the system wallpaper, because macOS
-stores desktop images per Space. Incremental display reconciliation separately
-reuses every retained display renderer when another display is connected or
-disconnected.
+wallpaper. Because WindowServer can draw the system desktop before third-party
+windows during a Space transition, Wallflow also installs a static frame of the
+current wallpaper as the macOS desktop fallback for each desktop Space after it
+is visited. Incremental display reconciliation separately reuses every retained
+display renderer when another display is connected or disconnected.
 
 ## Architecture direction
 

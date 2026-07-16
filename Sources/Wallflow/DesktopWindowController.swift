@@ -116,6 +116,10 @@ final class DesktopWindowController {
         wallpaperRenderer.applyUserProperties(properties)
     }
 
+    func captureFrame(completion: @escaping (NSImage?) -> Void) {
+        wallpaperRenderer.captureFrame(completion: completion)
+    }
+
     func prepareForPresentation() {
         window.orderFrontRegardless()
         window.displayIfNeeded()

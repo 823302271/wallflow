@@ -39,4 +39,19 @@ enum WallpaperSnapshot {
             size: NSSize(width: width, height: height)
         )
     }
+
+    static func pngData(from image: NSImage) -> Data? {
+        var rect = CGRect(origin: .zero, size: image.size)
+        guard let cgImage = image.cgImage(
+            forProposedRect: &rect,
+            context: nil,
+            hints: nil
+        ) else {
+            return nil
+        }
+        return NSBitmapImageRep(cgImage: cgImage).representation(
+            using: .png,
+            properties: [:]
+        )
+    }
 }

@@ -20,10 +20,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var displayConfigurationSignature = ""
     private var coverageEvaluationGeneration = 0
     private var desktopResumeNotBefore = 0.0
+    private var fallbackRefreshGeneration = 0
     private var didFinishLaunching = false
     private var pendingOpenURLs: [URL] = []
     private let importService = WallpaperImportService()
     private let wallpaperLibrary = WallpaperLibrary()
+    private let desktopFallbackManager = DesktopFallbackManager()
     private let automaticallyPauseCoveredDisplays = !CommandLine.arguments.contains(
         "--no-auto-pause"
     )
@@ -228,6 +230,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         desktopResumeNotBefore = ProcessInfo.processInfo.systemUptime + 0.55
         evaluateForegroundCoverage()
         scheduleForegroundCoverageEvaluation(after: 0.55)
+        scheduleFallbackRefresh(delay: 0.8)
     }
 
     private func scheduleForegroundCoverageEvaluation(after delay: TimeInterval = 0.35) {
@@ -253,6 +256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isSystemSuspended = false
         prepareWallpaperWindowsForPresentation()
         applyRenderingState()
+        scheduleFallbackRefresh(delay: 0.8)
     }
 
     private func configureStatusItem() {
@@ -456,6 +460,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wallpaperControllers.forEach { $0.prepareForPresentation() }
         previousControllers.forEach { $0.close() }
         evaluateForegroundCoverage()
+        scheduleFallbackRefresh()
     }
 
     private func reconcileWallpaperWindows() {
@@ -496,6 +501,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .filter { !retainedControllers.contains(ObjectIdentifier($0)) }
             .forEach { $0.close() }
         evaluateForegroundCoverage()
+        scheduleFallbackRefresh()
         NSLog(
             "Wallflow display reconciliation: reused %d, created %d, removed %d",
             reusedCount,
@@ -618,6 +624,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         persistUserProperties()
         let changed = JSONValue.object([key: changedDefinition])
         wallpaperControllers.forEach { $0.applyUserProperties(changed) }
+        scheduleFallbackRefresh(delay: 0.35)
     }
 
     private func resetUserProperties() {
@@ -626,6 +633,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.removeObject(forKey: key)
         }
         wallpaperControllers.forEach { $0.applyUserProperties(currentUserProperties) }
+        scheduleFallbackRefresh(delay: 0.35)
         propertiesWindowController?.close()
         propertiesWindowController = nil
         showWallpaperProperties()
@@ -748,6 +756,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var supportsEditableProperties: Bool {
         currentProject.kind == .web
             && currentUserProperties.objectValue?.isEmpty == false
+    }
+
+    private func scheduleFallbackRefresh(delay: TimeInterval = 1.0) {
+        fallbackRefreshGeneration += 1
+        let generation = fallbackRefreshGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, generation == self.fallbackRefreshGeneration else { return }
+            self.wallpaperControllers.forEach { self.refreshFallback(for: $0) }
+        }
+        if delay <= 1.0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                guard let self, generation == self.fallbackRefreshGeneration else { return }
+                self.wallpaperControllers.forEach { self.refreshFallback(for: $0) }
+            }
+        }
+    }
+
+    private func refreshFallback(for controller: DesktopWindowController) {
+        guard !controller.isDesktopHidden else { return }
+        controller.captureFrame { [weak self, weak controller] image in
+            guard let self,
+                  let controller,
+                  !controller.isDesktopHidden,
+                  let image,
+                  let snapshot = WallpaperSnapshot.preparedImage(from: image) else {
+                return
+            }
+            self.desktopFallbackManager.update(
+                image: snapshot,
+                for: controller.screen,
+                displayID: controller.displayID
+            )
+        }
     }
 
     private static func currentDisplayConfigurationSignature() -> String {

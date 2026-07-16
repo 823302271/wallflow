@@ -126,6 +126,16 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         }
     }
 
+    func captureFrame(completion: @escaping (NSImage?) -> Void) {
+        if !frozenImageView.isHidden, let frozenImage = frozenImageView.image {
+            completion(frozenImage)
+            return
+        }
+        webView.takeSnapshot(with: nil) { image, _ in
+            completion(image.flatMap(WallpaperSnapshot.preparedImage))
+        }
+    }
+
     func setAudioMuted(_ muted: Bool) {
         isAudioMuted = muted
         applyAudioMuteState()
