@@ -15,7 +15,7 @@ and scene compatibility.
 
 - macOS 13 Ventura or later
 - Swift 5.10 or later (Xcode or Apple Command Line Tools)
-- Apple Silicon or Intel Mac with Metal support
+- Apple Silicon Mac; Intel and Universal builds are intentionally unsupported
 
 ## Current prototype
 
@@ -104,20 +104,20 @@ so it does not display a Dock icon.
 
 ## Performance design
 
-Wallflow keeps the native renderer as the default path and avoids continuous
-CPU-side simulation. It lowers the frame rate while idle, renders below Retina
-native resolution, uses a two-buffer swap chain, and suspends covered displays.
-HTML wallpapers run in WebKit only when a web project is selected, because the
-web process has a higher baseline memory cost than the native renderer.
+Wallflow targets Apple Silicon exclusively and uses Metal as the rendering
+backbone. It avoids continuous CPU-side simulation, lowers the frame rate while
+idle, renders below Retina native resolution, uses a two-buffer swap chain, and
+suspends covered displays. HTML wallpapers run in WebKit only when a web project
+is selected, because the web process has a higher baseline memory cost than the
+native renderer.
 
 ## Architecture direction
 
-The native Metal renderer remains the default for low CPU and memory usage.
-Video support will use AVFoundation. Web wallpapers will run in an optional,
-isolated WebKit renderer because a web process has a much larger memory floor.
-Scene packages are decoded into native scene objects; supported image layers
-currently use Core Animation, while shader-driven effects and particles will
-move onto the shared Metal renderer as their translators are implemented.
+Metal is the shared rendering foundation for the Apple Silicon-only target.
+Video support will use AVFoundation. WebKit remains an isolated compatibility
+host for HTML projects, and supported scene image layers currently use Core
+Animation as an interim compositor. Shader effects, particles, and scene layers
+will move through the shared Metal pipeline as their translators are implemented.
 
 ## Verification
 

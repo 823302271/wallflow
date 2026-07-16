@@ -1,3 +1,7 @@
+#if !arch(arm64)
+#error("Wallflow supports Apple Silicon Macs only.")
+#endif
+
 import AppKit
 import Darwin
 

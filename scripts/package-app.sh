@@ -2,6 +2,11 @@
 
 set -eu
 
+if [ "$(uname -m)" != "arm64" ]; then
+    echo "Wallflow supports Apple Silicon Macs only." >&2
+    exit 1
+fi
+
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 APP_DIR="$ROOT_DIR/dist/Wallflow.app"
 CONTENTS_DIR="$APP_DIR/Contents"
