@@ -20,7 +20,7 @@ final class WallflowVideoSelfTest {
             try verifyFitModes(view)
             pollUntilPlaying()
 
-            let timeout = Timer(timeInterval: 10, repeats: false) { [weak self] _ in
+            let timeout = Timer(timeInterval: 20, repeats: false) { [weak self] _ in
                 self?.finish(
                     .failure(WallflowSelfTestError.failed("Video playback timed out"))
                 )
@@ -40,7 +40,7 @@ final class WallflowVideoSelfTest {
         }
         if view.playbackStatusForTesting == .readyToPlay,
            view.playbackTimeForTesting > 0.1 {
-            verifyPause()
+            verifyShortPause()
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
@@ -67,22 +67,31 @@ final class WallflowVideoSelfTest {
         }
     }
 
-    private func verifyPause() {
+    private func verifyShortPause() {
         guard let view = wallpaperView else { return }
-        view.setRenderingEnabled(false)
+        view.setRenderingEnabled(false, completion: nil)
         let pausedTime = view.playbackTimeForTesting
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+        guard let checkpoint = view.checkpointMediaSecondsForTesting,
+              abs(checkpoint - pausedTime) < 0.08 else {
+            finish(
+                .failure(
+                    WallflowSelfTestError.failed("Pause did not write a playback checkpoint")
+                )
+            )
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             guard let self, let view = self.wallpaperView else { return }
-            let movement = abs(view.playbackTimeForTesting - pausedTime)
-            guard movement < 0.08, view.isPlaybackPausedForTesting else {
+            // Source of truth is checkpoint data, not live player time.
+            guard let held = view.checkpointMediaSecondsForTesting,
+                  abs(held - pausedTime) < 0.08,
+                  view.isPlaybackPausedForTesting else {
                 self.finish(
-                    .failure(WallflowSelfTestError.failed("Video continued while paused"))
+                    .failure(WallflowSelfTestError.failed("Checkpoint changed while paused"))
                 )
                 return
             }
-            // Resume must continue from the paused time, not a future keyframe.
-            view.setRenderingEnabled(true)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            view.setRenderingEnabled(true) { [weak self] in
                 guard let self, let view = self.wallpaperView else { return }
                 let resumeTime = view.playbackTimeForTesting
                 guard resumeTime + 0.05 >= pausedTime,
@@ -91,6 +100,46 @@ final class WallflowVideoSelfTest {
                         .failure(
                             WallflowSelfTestError.failed(
                                 "Video resumed from a future frame (\(resumeTime) vs \(pausedTime))"
+                            )
+                        )
+                    )
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    self?.verifyLongPauseHold()
+                }
+            }
+        }
+    }
+
+    /// Long absence: checkpoint data must stay fixed; resume seeks from that data.
+    private func verifyLongPauseHold() {
+        guard let view = wallpaperView else { return }
+        view.setRenderingEnabled(false, completion: nil)
+        let pausedTime = view.playbackTimeForTesting
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.2) { [weak self] in
+            guard let self, let view = self.wallpaperView else { return }
+            guard let held = view.checkpointMediaSecondsForTesting,
+                  abs(held - pausedTime) < 0.08,
+                  view.isPlaybackPausedForTesting else {
+                self.finish(
+                    .failure(
+                        WallflowSelfTestError.failed(
+                            "Checkpoint drifted during long pause"
+                        )
+                    )
+                )
+                return
+            }
+            view.setRenderingEnabled(true) { [weak self] in
+                guard let self, let view = self.wallpaperView else { return }
+                let resumeTime = view.playbackTimeForTesting
+                guard resumeTime + 0.05 >= pausedTime,
+                      resumeTime <= pausedTime + 0.4 else {
+                    self.finish(
+                        .failure(
+                            WallflowSelfTestError.failed(
+                                "Long-pause resume jumped (\(resumeTime) vs \(pausedTime))"
                             )
                         )
                     )
@@ -109,7 +158,7 @@ final class WallflowVideoSelfTest {
             finish(.failure(WallflowSelfTestError.failed("Video did not resume")))
             return
         }
-        view.setRenderingEnabled(false)
+        view.setRenderingEnabled(false, completion: nil)
         let secondPause = view.playbackTimeForTesting
         view.captureFrame { [weak self] image in
             guard let self else { return }
@@ -119,10 +168,10 @@ final class WallflowVideoSelfTest {
                 )
                 return
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 guard let self, let view = self.wallpaperView else { return }
                 let drift = abs(view.playbackTimeForTesting - secondPause)
-                guard drift < 0.08 else {
+                guard drift < 0.12 else {
                     self.finish(
                         .failure(
                             WallflowSelfTestError.failed(

@@ -31,6 +31,8 @@ Wallpaper Engine web and scene compatibility.
 - Automatic suspension during sleep and inactive login sessions
 - Incremental display reconciliation without restarting retained-screen renderers
 - Per-display Space handling: only the hidden display pauses and keeps its last frame; other displays keep playing
+- Video pause writes a playback checkpoint and resume seeks to that time (smooth even after long Space absences)
+- On pause, the current frame is captured and set as that display's system desktop wallpaper
 - Menu bar pause and resume controls
 - Default-on pause only when a display's desktop is fully hidden
 - Persistent wallpaper library with switching, reveal, and uninstall actions
@@ -51,6 +53,14 @@ Wallpaper Engine-style `project.json` with `"type": "video"` are supported.
 Playback buffers are kept short and decoding is capped at 1920 x 1080 to limit
 memory, GPU, and energy use. Higher-resolution sources still fill the display but
 are decoded at the capped working resolution.
+
+**Pause and resume (checkpoint model):** When the desktop is hidden or playback is
+paused, Wallflow writes the current media time into an in-memory checkpoint and
+captures that frame for the freeze overlay and system desktop fallback. On resume
+it always seeks to the checkpoint time and then plays, instead of relying on the
+player to keep its playhead frozen during a long pause. Returning from another
+Space after a long absence therefore continues smoothly from the paused frame
+rather than jumping ahead.
 
 ## Wallpaper Engine web compatibility
 
@@ -218,12 +228,14 @@ wallpaper can react to the same click.
 
 During a full-screen or Space transition, Wallflow keeps the same desktop window,
 WebKit surface, and renderer alive above the system wallpaper and below desktop
-icons. Before the desktop disappears, Wallflow saves the last rendered frame. It
-shows that frozen frame first when the desktop returns, then reveals the live
-renderer after Metal or WebKit has produced content again. Wallflow also syncs the
-latest frame to the static macOS desktop so a transition cannot expose the previous
-wallpaper. Incremental display reconciliation separately reuses every retained
-display renderer when another display is connected or disconnected.
+icons. Visibility is evaluated **per display**: switching Space or going full
+screen on one monitor pauses only that monitor. Before the desktop disappears,
+Wallflow saves the last frame and writes it as the system desktop fallback. When
+the desktop returns, the frozen frame is shown first; video then seeks from its
+checkpoint and the live surface is revealed without a jump. Incremental display
+reconciliation reuses retained-screen renderers when another display is connected
+or disconnected. Only left-clicks are bridged into wallpapers; right-clicks stay
+with the system desktop menu.
 
 ## Architecture direction
 
