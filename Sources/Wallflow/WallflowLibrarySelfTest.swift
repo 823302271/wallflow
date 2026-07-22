@@ -36,6 +36,7 @@ final class WallflowLibrarySelfTest {
             currentEntryID: entries[1].id,
             isBuiltInCurrent: false,
             onUse: { _ in },
+            onLocateUnavailable: { _ in },
             onRemove: { _ in },
             onReveal: { _ in },
             onImportFile: {},

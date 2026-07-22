@@ -26,6 +26,7 @@
 "library.column.type" = "Type";
 "library.column.source" = "Source";
 "library.use" = "Use Wallpaper";
+"library.locate" = "Locate Wallpaper...";
 "library.remove" = "Remove";
 "library.reveal" = "Show in Finder";
 "library.import" = "Import Wallpaper";
@@ -46,6 +47,11 @@
 "properties.option" = "Option";
 "properties.scheme_color" = "Scheme Color";
 "properties.window_title" = "%@ Properties";
+"properties.fit_mode" = "Display Mode";
+"properties.fit_mode.automatic" = "Auto";
+"properties.fit_mode.fill" = "Fill";
+"properties.fit_mode.fit" = "Fit";
+"properties.fit_mode.stretch" = "Stretch";
 "error.unsupported_selection" = "No supported Wallpaper Engine project was found at %@.";
 "error.malformed_manifest" = "Could not read %@: %@";
 "error.unsupported_type" = "Wallpaper type '%@' is not supported yet.";

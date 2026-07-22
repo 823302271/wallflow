@@ -16,10 +16,12 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
     private var mouseDispatchPending = false
     private var inputPollingFPS = 0
     private var lastPressedMouseButtons = NSEvent.pressedMouseButtons
+    private var desktopPressedMouseButtons = 0
     private var lastMouseMovementTime = CACurrentMediaTime()
     private var isAudioMuted = false
     private var presentationGeneration = 0
     private var userProperties: JSONValue
+    private var fitMode: WallpaperFitMode
     var runtimeReadyHandler: (() -> Void)?
     var inputBridgeActiveForTesting: Bool {
         mouseTimer != nil && globalMouseMonitor != nil
@@ -31,11 +33,13 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         frame: CGRect,
         desktopFrame: CGRect,
         project: WallpaperProject,
-        playsAudio: Bool
+        playsAudio: Bool,
+        fitMode: WallpaperFitMode = .automatic
     ) {
         self.desktopFrame = desktopFrame
         self.project = project
         self.playsAudio = playsAudio
+        self.fitMode = fitMode
         userProperties = project.userProperties
 
         let userContentController = WKUserContentController()
@@ -134,6 +138,12 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         applyAudioMuteState()
     }
 
+    func setFitMode(_ fitMode: WallpaperFitMode) {
+        guard fitMode != self.fitMode else { return }
+        self.fitMode = fitMode
+        applyFitMode()
+    }
+
     func updateDesktopFrame(_ frame: CGRect) {
         desktopFrame = frame
         lastMouseLocation = CGPoint(x: -.greatestFiniteMagnitude, y: 0)
@@ -191,6 +201,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
             argument: "{fps: \(Self.hostFPS)}"
         )
         callPropertyListener("setPaused", argument: isRenderingEnabled ? "false" : "true")
+        applyFitMode()
         applyAudioMuteState()
     }
 
@@ -212,6 +223,14 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         let effectiveMuted = isAudioMuted || !playsAudio
         webView.evaluateJavaScript(
             "window.__wallflowSetMuted(\(effectiveMuted ? "true" : "false"));",
+            completionHandler: nil
+        )
+    }
+
+    private func applyFitMode() {
+        guard isRuntimeReady else { return }
+        webView.evaluateJavaScript(
+            "window.__wallflowSetFitMode('\(fitMode.rawValue)');",
             completionHandler: nil
         )
     }
@@ -259,6 +278,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         mouseTimer?.invalidate()
         mouseTimer = nil
         inputPollingFPS = 0
+        desktopPressedMouseButtons = 0
         if let globalMouseMonitor {
             NSEvent.removeMonitor(globalMouseMonitor)
             self.globalMouseMonitor = nil
@@ -323,35 +343,61 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         }
         guard !stateAlreadyHandled else { return }
 
-        let global = NSEvent.mouseLocation
-        guard desktopFrame.contains(global) else {
-            return
-        }
-        dispatchMouseButtonChange(button: button, isDown: isDown, globalLocation: global)
+        dispatchDesktopMouseButtonIfNeeded(
+            button: button,
+            isDown: isDown,
+            globalLocation: NSEvent.mouseLocation,
+            quartzPoint: event.cgEvent?.location
+        )
     }
 
     private func pollMouseButtons(globalLocation: CGPoint) {
         let current = NSEvent.pressedMouseButtons
         let changed = current ^ lastPressedMouseButtons
         lastPressedMouseButtons = current
-        guard changed != 0,
-              desktopFrame.contains(globalLocation) else {
-            return
-        }
+        guard changed != 0 else { return }
+        let quartzPoint = CGEvent(source: nil)?.location
         if changed & 1 != 0 {
-            dispatchMouseButtonChange(
+            dispatchDesktopMouseButtonIfNeeded(
                 button: 0,
                 isDown: current & 1 != 0,
-                globalLocation: globalLocation
+                globalLocation: globalLocation,
+                quartzPoint: quartzPoint
             )
         }
         if changed & 2 != 0 {
-            dispatchMouseButtonChange(
+            dispatchDesktopMouseButtonIfNeeded(
                 button: 2,
                 isDown: current & 2 != 0,
-                globalLocation: globalLocation
+                globalLocation: globalLocation,
+                quartzPoint: quartzPoint
             )
         }
+    }
+
+    private func dispatchDesktopMouseButtonIfNeeded(
+        button: Int,
+        isDown: Bool,
+        globalLocation: CGPoint,
+        quartzPoint: CGPoint?
+    ) {
+        let mask = button == 0 ? 1 : 2
+        if isDown {
+            guard desktopFrame.contains(globalLocation),
+                  let quartzPoint,
+                  DesktopVisibility.isDesktopExposed(at: quartzPoint) else {
+                return
+            }
+            desktopPressedMouseButtons |= mask
+        } else {
+            guard desktopPressedMouseButtons & mask != 0 else { return }
+            desktopPressedMouseButtons &= ~mask
+        }
+        dispatchMouseButtonChange(
+            button: button,
+            isDown: isDown,
+            globalLocation: globalLocation
+        )
     }
 
     private func dispatchMouseButtonChange(
@@ -420,6 +466,36 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
       let hostPaused = false;
       let virtualFrameTime = null;
       const frameCallbacks = new Map();
+      const hostPausedAnimations = new Set();
+      let animationSyncScheduled = false;
+
+      function syncDocumentAnimations() {
+        animationSyncScheduled = false;
+        document.documentElement.toggleAttribute('data-wallflow-host-paused', hostPaused);
+        if (typeof document.getAnimations !== 'function') return;
+        if (hostPaused) {
+          document.getAnimations().forEach(animation => {
+            if (animation.playState !== 'running') return;
+            try {
+              animation.pause();
+              hostPausedAnimations.add(animation);
+            } catch (_) {}
+          });
+        } else {
+          hostPausedAnimations.forEach(animation => {
+            try {
+              if (animation.playState === 'paused') animation.play();
+            } catch (_) {}
+          });
+          hostPausedAnimations.clear();
+        }
+      }
+
+      function scheduleDocumentAnimationSync() {
+        if (animationSyncScheduled) return;
+        animationSyncScheduled = true;
+        Promise.resolve().then(syncDocumentAnimations);
+      }
 
       function scheduleAnimationPump() {
         if (hostPaused || nativePumpId !== null || timerId !== null || frameCallbacks.size === 0) return;
@@ -482,6 +558,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
       };
       window.__wallflowSetPaused = function(paused) {
         hostPaused = Boolean(paused);
+        scheduleDocumentAnimationSync();
         if (hostPaused) {
           if (nativePumpId !== null) {
             nativeCancelAnimationFrame(nativePumpId);
@@ -496,6 +573,17 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
           scheduleAnimationPump();
         }
       };
+
+      document.addEventListener('DOMContentLoaded', () => {
+        new MutationObserver(() => {
+          if (hostPaused) scheduleDocumentAnimationSync();
+        }).observe(document.documentElement, {
+          attributes: true,
+          childList: true,
+          subtree: true
+        });
+        scheduleDocumentAnimationSync();
+      });
 
       const nativeDevicePixelRatio = window.devicePixelRatio || 1;
       try {
@@ -536,6 +624,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
           target.dispatchEvent(new MouseEvent('click', options));
         } else if (type === 'mouseup' && button === 2) {
           target.dispatchEvent(new MouseEvent('contextmenu', options));
+          target.dispatchEvent(new MouseEvent('click', options));
         }
         if (type === 'mousemove' && typeof PointerEvent !== 'undefined') {
           target.dispatchEvent(new PointerEvent('pointermove', options));
@@ -559,12 +648,203 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
 
     private static let pageStyleBootstrap = #"""
     (() => {
-      const style = document.createElement('style');
-      style.textContent = `
+      const baseStyle = document.createElement('style');
+      baseStyle.textContent = `
         html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
         * { -webkit-user-select: none; user-select: none; }
       `;
-      document.head.appendChild(style);
+      document.head.appendChild(baseStyle);
+
+      const fitStyle = document.createElement('style');
+      fitStyle.textContent = `
+        html[data-wallflow-fit-active="true"] { background: #000 !important; }
+        html[data-wallflow-fit-active="true"] body { background-color: #000 !important; }
+        html[data-wallflow-host-paused] *,
+        html[data-wallflow-host-paused] *::before,
+        html[data-wallflow-host-paused] *::after {
+          animation-play-state: paused !important;
+        }
+        [data-wallflow-fit-container="true"] {
+          width: 100% !important;
+          height: 100% !important;
+          min-width: 0 !important;
+          min-height: 0 !important;
+          max-width: none !important;
+          max-height: none !important;
+          margin: 0 !important;
+        }
+        [data-wallflow-fit-target="true"] {
+          display: block !important;
+          float: none !important;
+          width: 100vw !important;
+          height: 100vh !important;
+          min-width: 0 !important;
+          min-height: 0 !important;
+          max-width: none !important;
+          max-height: none !important;
+          object-fit: var(--wallflow-object-fit) !important;
+          object-position: center center !important;
+        }
+        [data-wallflow-fit-background="true"] {
+          background-size: var(--wallflow-background-size) !important;
+          background-position: center center !important;
+          background-repeat: no-repeat !important;
+        }
+      `;
+      document.head.appendChild(fitStyle);
+
+      let fitMode = 'automatic';
+      let scheduled = false;
+
+      const isVisible = element => {
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' &&
+          Number(style.opacity || 1) > 0 && rect.width > 1 && rect.height > 1;
+      };
+
+      const area = element => {
+        const rect = element.getBoundingClientRect();
+        return rect.width * rect.height;
+      };
+
+      const viewportArea = () => Math.max(1, innerWidth * innerHeight);
+
+      const dominantMedia = includeCanvas => {
+        const primary = Array.from(document.querySelectorAll('img, video'))
+          .filter(isVisible)
+          .filter(element => area(element) >= viewportArea() * 0.15)
+          .sort((left, right) => area(right) - area(left))[0] || null;
+        if (primary || !includeCanvas) return primary;
+        return Array.from(document.querySelectorAll('canvas'))
+          .filter(isVisible)
+          .filter(element => area(element) >= viewportArea() * 0.15)
+          .sort((left, right) => area(right) - area(left))[0] || null;
+      };
+
+      const dominantBackground = () => {
+        const elements = [document.body, ...document.body.querySelectorAll('*')];
+        return elements
+          .filter(element => isVisible(element))
+          .filter(element => getComputedStyle(element).backgroundImage !== 'none')
+          .filter(element => area(element) >= viewportArea() * 0.45)
+          .sort((left, right) => area(right) - area(left))[0] || null;
+      };
+
+      const isSimpleMediaPage = target => {
+        if (!target || area(target) < viewportArea() * 0.45) return false;
+        const substantialMedia = Array.from(document.querySelectorAll('img, video'))
+          .filter(isVisible)
+          .filter(element => area(element) >= viewportArea() * 0.05);
+        if (substantialMedia.length !== 1) return false;
+        if (document.querySelector('iframe, object, embed, form, input, textarea, select, button')) {
+          return false;
+        }
+
+        const ancestors = new Set();
+        let ancestor = target.parentElement;
+        while (ancestor) {
+          ancestors.add(ancestor);
+          ancestor = ancestor.parentElement;
+        }
+        return !Array.from(document.body.querySelectorAll('*')).some(element => {
+          if (element === target || target.contains(element) || ancestors.has(element)) return false;
+          if (!isVisible(element)) return false;
+          if (['SCRIPT', 'STYLE', 'LINK', 'AUDIO', 'SOURCE', 'TRACK', 'CANVAS'].includes(element.tagName)) {
+            return false;
+          }
+          if ((element.textContent || '').trim().length > 0) return true;
+          const style = getComputedStyle(element);
+          return style.backgroundImage !== 'none' && area(element) >= viewportArea() * 0.05;
+        });
+      };
+
+      const isSimpleBackgroundPage = target => {
+        if (!target || area(target) < viewportArea() * 0.8) return false;
+        const substantialMedia = Array.from(document.querySelectorAll('img, video, canvas'))
+          .filter(isVisible)
+          .filter(element => area(element) >= viewportArea() * 0.05);
+        const hasVisibleText = [target, ...target.querySelectorAll('*')].some(element => {
+          if (!isVisible(element) || ['SCRIPT', 'STYLE'].includes(element.tagName)) return false;
+          return Array.from(element.childNodes).some(node =>
+            node.nodeType === Node.TEXT_NODE && (node.textContent || '').trim().length > 0
+          );
+        });
+        return substantialMedia.length === 0 && !hasVisibleText &&
+          !document.querySelector('iframe, object, embed, form, input, textarea, select, button');
+      };
+
+      const clearFitTargets = () => {
+        document.documentElement.removeAttribute('data-wallflow-fit-active');
+        document.querySelectorAll(
+          '[data-wallflow-fit-container], [data-wallflow-fit-target], [data-wallflow-fit-background]'
+        ).forEach(element => {
+          element.removeAttribute('data-wallflow-fit-container');
+          element.removeAttribute('data-wallflow-fit-target');
+          element.removeAttribute('data-wallflow-fit-background');
+        });
+      };
+
+      const markMedia = target => {
+        target.setAttribute('data-wallflow-fit-target', 'true');
+        let ancestor = target.parentElement;
+        while (ancestor) {
+          ancestor.setAttribute('data-wallflow-fit-container', 'true');
+          ancestor = ancestor.parentElement;
+        }
+      };
+
+      const applyFitMode = () => {
+        clearFitTargets();
+        document.documentElement.dataset.wallflowFitMode = fitMode;
+
+        const automatic = fitMode === 'automatic';
+        const media = dominantMedia(!automatic);
+        const background = dominantBackground();
+        const canFitMedia = automatic ? isSimpleMediaPage(media) : Boolean(media);
+        const canFitBackground = automatic
+          ? !canFitMedia && isSimpleBackgroundPage(background)
+          : !canFitMedia && Boolean(background);
+        if (!canFitMedia && !canFitBackground) return;
+
+        const objectFit = fitMode === 'fit'
+          ? 'contain'
+          : fitMode === 'stretch' ? 'fill' : 'cover';
+        const backgroundSize = fitMode === 'fit'
+          ? 'contain'
+          : fitMode === 'stretch' ? '100% 100%' : 'cover';
+        document.documentElement.style.setProperty('--wallflow-object-fit', objectFit);
+        document.documentElement.style.setProperty('--wallflow-background-size', backgroundSize);
+        document.documentElement.setAttribute('data-wallflow-fit-active', 'true');
+        if (canFitMedia) {
+          markMedia(media);
+        } else {
+          background.setAttribute('data-wallflow-fit-background', 'true');
+        }
+      };
+
+      const scheduleFit = () => {
+        if (scheduled) return;
+        scheduled = true;
+        setTimeout(() => {
+          scheduled = false;
+          applyFitMode();
+        }, 0);
+      };
+
+      window.__wallflowSetFitMode = mode => {
+        fitMode = ['automatic', 'fill', 'fit', 'stretch'].includes(mode)
+          ? mode
+          : 'automatic';
+        scheduleFit();
+      };
+      window.addEventListener('resize', scheduleFit);
+      window.addEventListener('load', scheduleFit, true);
+      new MutationObserver(scheduleFit).observe(document.body, {
+        childList: true,
+        subtree: true
+      });
+      scheduleFit();
       document.addEventListener('dragstart', event => event.preventDefault());
     })();
     """#

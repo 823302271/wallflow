@@ -83,6 +83,7 @@ enum L10n {
         case libraryColumnType = "library.column.type"
         case libraryColumnSource = "library.column.source"
         case libraryUse = "library.use"
+        case libraryLocate = "library.locate"
         case libraryRemove = "library.remove"
         case libraryReveal = "library.reveal"
         case libraryImport = "library.import"
@@ -103,6 +104,11 @@ enum L10n {
         case option = "properties.option"
         case schemeColor = "properties.scheme_color"
         case propertiesWindowTitle = "properties.window_title"
+        case fitMode = "properties.fit_mode"
+        case fitModeAutomatic = "properties.fit_mode.automatic"
+        case fitModeFill = "properties.fit_mode.fill"
+        case fitModeFit = "properties.fit_mode.fit"
+        case fitModeStretch = "properties.fit_mode.stretch"
         case unsupportedSelection = "error.unsupported_selection"
         case malformedManifest = "error.malformed_manifest"
         case unsupportedType = "error.unsupported_type"
@@ -162,6 +168,15 @@ enum L10n {
             return text(.schemeColor)
         }
         return rawTitle.dropFirst(3).replacingOccurrences(of: "_", with: " ")
+    }
+
+    static func fitModeTitle(_ fitMode: WallpaperFitMode) -> String {
+        switch fitMode {
+        case .automatic: text(.fitModeAutomatic)
+        case .fill: text(.fitModeFill)
+        case .fit: text(.fitModeFit)
+        case .stretch: text(.fitModeStretch)
+        }
     }
 
     static func unsupportedSelection(_ path: String) -> String {

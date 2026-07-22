@@ -5,6 +5,7 @@ protocol WallpaperRenderer: AnyObject {
     func setRenderingEnabled(_ enabled: Bool)
     func setAudioMuted(_ muted: Bool)
     func setPlaysAudio(_ enabled: Bool)
+    func setFitMode(_ fitMode: WallpaperFitMode)
     func updateDesktopFrame(_ frame: CGRect)
     func applyUserProperties(_ properties: JSONValue)
     func prepareForPresentation()
@@ -14,6 +15,7 @@ protocol WallpaperRenderer: AnyObject {
 extension WallpaperRenderer {
     func setAudioMuted(_ muted: Bool) {}
     func setPlaysAudio(_ enabled: Bool) {}
+    func setFitMode(_ fitMode: WallpaperFitMode) {}
     func updateDesktopFrame(_ frame: CGRect) {}
     func applyUserProperties(_ properties: JSONValue) {}
     func prepareForPresentation() {
@@ -48,7 +50,8 @@ enum WallpaperRendererFactory {
         project: WallpaperProject,
         frame: CGRect,
         desktopFrame: CGRect,
-        playsAudio: Bool
+        playsAudio: Bool,
+        fitMode: WallpaperFitMode
     ) -> WallpaperRenderer {
         switch project.kind {
         case .builtIn:
@@ -65,20 +68,23 @@ enum WallpaperRendererFactory {
                 frame: frame,
                 desktopFrame: desktopFrame,
                 project: project,
-                playsAudio: playsAudio
+                playsAudio: playsAudio,
+                fitMode: fitMode
             )
         case .scene:
             return SceneWallpaperView(
                 frame: frame,
                 desktopFrame: desktopFrame,
                 project: project,
-                playsAudio: playsAudio
+                playsAudio: playsAudio,
+                fitMode: fitMode
             )
         case .video:
             return VideoWallpaperView(
                 frame: frame,
                 project: project,
-                playsAudio: playsAudio
+                playsAudio: playsAudio,
+                fitMode: fitMode
             )
         }
     }

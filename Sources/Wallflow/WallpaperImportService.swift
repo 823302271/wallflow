@@ -56,22 +56,29 @@ final class WallpaperImportService {
         label: "dev.wallflow.wallpaper-import",
         qos: .userInitiated
     )
+    private let importedRootURL: URL
     private let maximumDownloadSize: Int64 = 512 * 1024 * 1024
     private let maximumExtractedSize: Int64 = 1024 * 1024 * 1024
     private let maximumFileCount = 100_000
+
+    init(importedRootURL: URL? = nil) {
+        self.importedRootURL = importedRootURL ?? Self.defaultImportedRootURL()
+    }
 
     func prepare(
         sourceURL: URL,
         completion: @escaping (Result<URL, Error>) -> Void
     ) {
         if sourceURL.isFileURL {
-            guard sourceURL.pathExtension.lowercased() == "zip" else {
-                completion(.success(sourceURL))
-                return
-            }
             workerQueue.async { [weak self] in
                 guard let self else { return }
-                self.finish(completion, with: Result { try self.extractArchive(sourceURL) })
+                let result = Result {
+                    if sourceURL.pathExtension.lowercased() == "zip" {
+                        return try self.extractArchive(sourceURL)
+                    }
+                    return try self.installLocalProject(sourceURL)
+                }
+                self.finish(completion, with: result)
             }
             return
         }
@@ -175,6 +182,62 @@ final class WallpaperImportService {
         let projectURL = try locateProject(in: destination)
         keepDestination = true
         return projectURL
+    }
+
+    func installLocalProject(_ sourceURL: URL) throws -> URL {
+        let sourceURL = sourceURL.standardizedFileURL
+        if Self.contains(sourceURL, in: importedRootURL) {
+            return sourceURL
+        }
+
+        let project = try WallpaperProjectLoader.load(sourceURL)
+        guard let projectSource = localProjectSource(for: project) else {
+            throw WallpaperProjectLoaderError.unsupportedSelection(sourceURL)
+        }
+
+        let destination = try makeImportDestination()
+        var keepDestination = false
+        defer {
+            if !keepDestination {
+                try? FileManager.default.removeItem(at: destination)
+            }
+        }
+
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(
+            atPath: projectSource.path,
+            isDirectory: &isDirectory
+        ) else {
+            throw WallpaperProjectLoaderError.unsupportedSelection(projectSource)
+        }
+        if isDirectory.boolValue {
+            try validateExtractedProject(projectSource)
+        } else {
+            let fileSize = try projectSource.resourceValues(
+                forKeys: [.fileSizeKey]
+            ).fileSize ?? 0
+            guard Int64(fileSize) <= maximumExtractedSize else {
+                throw WallpaperImportError.extractedProjectTooLarge(Int64(fileSize))
+            }
+        }
+
+        let installedSource = destination.appendingPathComponent(
+            projectSource.lastPathComponent,
+            isDirectory: isDirectory.boolValue
+        )
+        try FileManager.default.copyItem(at: projectSource, to: installedSource)
+        try validateExtractedProject(destination)
+        let projectURL = try locateProject(in: destination)
+        _ = try WallpaperProjectLoader.load(projectURL)
+        keepDestination = true
+        return projectURL
+    }
+
+    private func localProjectSource(for project: WallpaperProject) -> URL? {
+        if project.kind == .video, project.manifestURL == nil {
+            return project.entryURL
+        }
+        return project.rootURL
     }
 
     private func validateExtractedProject(_ rootURL: URL) throws {
@@ -295,18 +358,11 @@ final class WallpaperImportService {
     }
 
     private func makeImportDestination() throws -> URL {
-        let baseURL = try FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        .appendingPathComponent("Wallflow/ImportedWallpapers", isDirectory: true)
         try FileManager.default.createDirectory(
-            at: baseURL,
+            at: importedRootURL,
             withIntermediateDirectories: true
         )
-        let destination = baseURL.appendingPathComponent(
+        let destination = importedRootURL.appendingPathComponent(
             UUID().uuidString,
             isDirectory: true
         )
@@ -315,6 +371,23 @@ final class WallpaperImportService {
             withIntermediateDirectories: false
         )
         return destination
+    }
+
+    private static func defaultImportedRootURL() -> URL {
+        let applicationSupport = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        return (applicationSupport ?? FileManager.default.temporaryDirectory)
+            .appendingPathComponent("Wallflow/ImportedWallpapers", isDirectory: true)
+    }
+
+    private static func contains(_ url: URL, in rootURL: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        let rootPath = rootURL.standardizedFileURL.path
+        return path == rootPath || path.hasPrefix(rootPath + "/")
     }
 
     private func runProcess(

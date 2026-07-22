@@ -281,10 +281,17 @@ final class CanvasMetalRuntime {
         try throwIfFailed()
     }
 
-    func dispatchMouse(type: String, x: CGFloat, y: CGFloat) {
+    func dispatchMouse(
+        type: String,
+        x: CGFloat,
+        y: CGFloat,
+        button: Int = 0,
+        buttons: Int? = nil
+    ) {
         exceptionMessage = nil
+        let pressedButtons = buttons ?? (type == "mousedown" ? (button == 2 ? 2 : 1) : 0)
         context.objectForKeyedSubscript("__wallflowDispatchMouse")?.call(
-            withArguments: [type, x, y]
+            withArguments: [type, x, y, button, pressedButtons]
         )
     }
 
@@ -587,8 +594,14 @@ final class CanvasMetalRuntime {
           globalThis.wallpaperRegisterMediaPropertiesListener = function() {};
           globalThis.wallpaperRegisterMediaPlaybackListener = function() {};
 
-          globalThis.__wallflowDispatchMouse = function(type, x, y) {
-            const event = { type, clientX: x, clientY: y, button: 0, buttons: type === 'mousedown' ? 1 : 0 };
+          globalThis.__wallflowDispatchMouse = function(type, x, y, button, buttons) {
+            const event = {
+              type,
+              clientX: x,
+              clientY: y,
+              button: Number(button) || 0,
+              buttons: Number(buttons) || 0
+            };
             const listeners = (eventListeners.get(type) || []).slice();
             listeners.forEach(listener => listener(event));
           };

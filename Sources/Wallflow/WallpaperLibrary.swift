@@ -6,6 +6,45 @@ struct WallpaperLibraryEntry: Codable, Equatable, Identifiable {
     var title: String
     var kind: String
     var addedAt: Date
+    var fitMode: WallpaperFitMode
+
+    init(
+        id: UUID,
+        source: String,
+        title: String,
+        kind: String,
+        addedAt: Date,
+        fitMode: WallpaperFitMode = .automatic
+    ) {
+        self.id = id
+        self.source = source
+        self.title = title
+        self.kind = kind
+        self.addedAt = addedAt
+        self.fitMode = fitMode
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case source
+        case title
+        case kind
+        case addedAt
+        case fitMode
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        source = try container.decode(String.self, forKey: .source)
+        title = try container.decode(String.self, forKey: .title)
+        kind = try container.decode(String.self, forKey: .kind)
+        addedAt = try container.decode(Date.self, forKey: .addedAt)
+        fitMode = try container.decodeIfPresent(
+            WallpaperFitMode.self,
+            forKey: .fitMode
+        ) ?? .automatic
+    }
 
     var sourceURL: URL {
         if let url = URL(string: source),
@@ -54,7 +93,8 @@ final class WallpaperLibrary {
             source: normalizedSource,
             title: project.displayTitle,
             kind: project.kind.rawValue,
-            addedAt: Date()
+            addedAt: Date(),
+            fitMode: .automatic
         )
         entries.append(entry)
         sortEntries()
@@ -80,6 +120,20 @@ final class WallpaperLibrary {
         }
         let source = Self.normalizedSource(sourceURL)
         return entries.first { $0.source == source }
+    }
+
+    @discardableResult
+    func setFitMode(_ fitMode: WallpaperFitMode, for project: WallpaperProject) -> Bool {
+        guard let sourceURL = project.manifestURL ?? project.entryURL ?? project.rootURL else {
+            return false
+        }
+        let source = Self.normalizedSource(sourceURL)
+        guard let index = entries.firstIndex(where: { $0.source == source }) else {
+            return false
+        }
+        entries[index].fitMode = fitMode
+        save()
+        return true
     }
 
     private func discoverManagedWallpapers() {

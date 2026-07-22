@@ -3,9 +3,11 @@ import Foundation
 
 final class WallflowWebSelfTest {
     private var wallpaperView: WebWallpaperView?
+    private var testWindow: NSWindow?
     private var temporaryDirectory: URL?
     private var timeout: Timer?
     private var completion: ((Result<Void, Error>) -> Void)?
+    private var pausedAnimationTime = 0.0
 
     func run(completion: @escaping (Result<Void, Error>) -> Void) {
         self.completion = completion
@@ -21,6 +23,18 @@ final class WallflowWebSelfTest {
                 playsAudio: true
             )
             wallpaperView = view
+            let window = NSWindow(
+                contentRect: view.frame,
+                styleMask: .borderless,
+                backing: .buffered,
+                defer: false
+            )
+            window.contentView = view
+            window.alphaValue = 0.01
+            window.ignoresMouseEvents = true
+            window.level = .floating
+            window.orderFrontRegardless()
+            testWindow = window
             view.runtimeReadyHandler = { [weak self] in
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
                     self?.verifyProperties()
@@ -60,7 +74,63 @@ final class WallflowWebSelfTest {
                 )
                 return
             }
-            self.verifyIncrementalPropertiesAndMute()
+            self.verifyAutomaticFitMode()
+        }
+    }
+
+    private func verifyAutomaticFitMode() {
+        verifyFitMode(expectedMode: "automatic", expectedObjectFit: "cover") { [weak self] in
+            self?.wallpaperView?.setFitMode(.fit)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                self?.verifyFitMode(expectedMode: "fit", expectedObjectFit: "contain") {
+                    self?.wallpaperView?.setFitMode(.stretch)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                        self?.verifyFitMode(expectedMode: "stretch", expectedObjectFit: "fill") {
+                            self?.wallpaperView?.setFitMode(.fill)
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                                self?.verifyFitMode(
+                                    expectedMode: "fill",
+                                    expectedObjectFit: "cover"
+                                ) {
+                                    self?.verifyIncrementalPropertiesAndMute()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func verifyFitMode(
+        expectedMode: String,
+        expectedObjectFit: String,
+        completion: @escaping () -> Void
+    ) {
+        wallpaperView?.evaluateJavaScriptForTesting(
+            "JSON.stringify({ mode: document.documentElement.dataset.wallflowFitMode, fit: getComputedStyle(document.getElementById('hero')).objectFit, target: document.getElementById('hero').dataset.wallflowFitTarget })"
+        ) { [weak self] value, error in
+            guard let self else { return }
+            if let error {
+                self.finish(.failure(error))
+                return
+            }
+            guard let string = value as? String,
+                  let data = string.data(using: .utf8),
+                  let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  result["mode"] as? String == expectedMode,
+                  result["fit"] as? String == expectedObjectFit,
+                  result["target"] as? String == "true" else {
+                self.finish(
+                    .failure(
+                        WallflowSelfTestError.failed(
+                            "Web wallpaper fit mode did not apply: \(String(describing: value))"
+                        )
+                    )
+                )
+                return
+            }
+            completion()
         }
     }
 
@@ -105,7 +175,21 @@ final class WallflowWebSelfTest {
     }
 
     private func verifyPauseAndResume() {
-        wallpaperView?.setRenderingEnabled(false)
+        wallpaperView?.evaluateJavaScriptForTesting(
+            "document.getElementById('animated').getAnimations()[0].currentTime || 0"
+        ) { [weak self] value, error in
+            guard let self else { return }
+            if let error {
+                self.finish(.failure(error))
+                return
+            }
+            self.pausedAnimationTime = (value as? NSNumber)?.doubleValue ?? 0
+            self.wallpaperView?.setRenderingEnabled(false)
+            self.verifyPausedStateAfterDelay()
+        }
+    }
+
+    private func verifyPausedStateAfterDelay() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             guard self?.wallpaperView?.inputBridgeActiveForTesting == false else {
                 self?.finish(
@@ -118,19 +202,31 @@ final class WallflowWebSelfTest {
                 return
             }
             self?.wallpaperView?.evaluateJavaScriptForTesting(
-                "window.__wallflowProbe.paused"
+                "JSON.stringify({ paused: window.__wallflowProbe.paused, animationTime: document.getElementById('animated').getAnimations()[0].currentTime || 0 })"
             ) { [weak self] value, error in
                 guard let self else { return }
                 if let error {
                     self.finish(.failure(error))
                     return
                 }
-                guard (value as? NSNumber)?.boolValue == true else {
+                guard let string = value as? String,
+                      let data = string.data(using: .utf8),
+                      let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      (result["paused"] as? NSNumber)?.boolValue == true,
+                      let animationTime = (result["animationTime"] as? NSNumber)?.doubleValue,
+                      abs(animationTime - self.pausedAnimationTime) < 50 else {
                     self.finish(
-                        .failure(WallflowSelfTestError.failed("Web pause callback did not fire"))
+                        .failure(
+                            WallflowSelfTestError.failed(
+                                "Web pause did not freeze the animation frame: "
+                                    + "before=\(self.pausedAnimationTime), result=\(String(describing: value))"
+                            )
+                        )
                     )
                     return
                 }
+
+                self.pausedAnimationTime = animationTime
 
                 self.wallpaperView?.setRenderingEnabled(true)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
@@ -152,16 +248,26 @@ final class WallflowWebSelfTest {
 
     private func verifyResumedState() {
         wallpaperView?.evaluateJavaScriptForTesting(
-            "window.__wallflowProbe.paused"
+            "JSON.stringify({ paused: window.__wallflowProbe.paused, animationTime: document.getElementById('animated').getAnimations()[0].currentTime || 0 })"
         ) { [weak self] value, error in
             guard let self else { return }
             if let error {
                 self.finish(.failure(error))
                 return
             }
-            guard (value as? NSNumber)?.boolValue == false else {
+            guard let string = value as? String,
+                  let data = string.data(using: .utf8),
+                  let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  (result["paused"] as? NSNumber)?.boolValue == false,
+                  let animationTime = (result["animationTime"] as? NSNumber)?.doubleValue,
+                  animationTime > self.pausedAnimationTime else {
                 self.finish(
-                    .failure(WallflowSelfTestError.failed("Web resume callback did not fire"))
+                    .failure(
+                        WallflowSelfTestError.failed(
+                            "Web animation did not resume from the paused frame: "
+                                + "paused=\(self.pausedAnimationTime), result=\(String(describing: value))"
+                        )
+                    )
                 )
                 return
             }
@@ -174,7 +280,9 @@ final class WallflowWebSelfTest {
         window.__wallflowDispatchMouse('mousemove', 41, 73, 0, 0);
         window.__wallflowDispatchMouse('mousedown', 41, 73, 0, 1);
         window.__wallflowDispatchMouse('mouseup', 41, 73, 0, 0);
-        JSON.stringify({ mouse: window.__wallflowProbe.mouse, clicks: window.__wallflowProbe.clicks });
+        window.__wallflowDispatchMouse('mousedown', 41, 73, 2, 2);
+        window.__wallflowDispatchMouse('mouseup', 41, 73, 2, 0);
+        JSON.stringify({ mouse: window.__wallflowProbe.mouse, clicks: window.__wallflowProbe.clicks, contextmenus: window.__wallflowProbe.contextmenus });
         """
         wallpaperView?.evaluateJavaScriptForTesting(script) { [weak self] value, error in
             guard let self else { return }
@@ -188,9 +296,14 @@ final class WallflowWebSelfTest {
                   let mouse = result["mouse"] as? [String: Any],
                   (mouse["x"] as? NSNumber)?.intValue == 41,
                   (mouse["y"] as? NSNumber)?.intValue == 73,
-                  (result["clicks"] as? NSNumber)?.intValue == 1 else {
+                  (result["clicks"] as? NSNumber)?.intValue == 2,
+                  (result["contextmenus"] as? NSNumber)?.intValue == 1 else {
                 self.finish(
-                    .failure(WallflowSelfTestError.failed("Web mouse event bridge did not fire"))
+                    .failure(
+                        WallflowSelfTestError.failed(
+                            "Web mouse event bridge did not fire: \(String(describing: value))"
+                        )
+                    )
                 )
                 return
             }
@@ -204,6 +317,8 @@ final class WallflowWebSelfTest {
         timeout?.invalidate()
         timeout = nil
         wallpaperView = nil
+        testWindow?.orderOut(nil)
+        testWindow = nil
         if let temporaryDirectory {
             try? FileManager.default.removeItem(at: temporaryDirectory)
         }
@@ -239,8 +354,17 @@ final class WallflowWebSelfTest {
         try """
         <!doctype html>
         <html>
-        <head><meta charset="utf-8"></head>
+        <head>
+        <meta charset="utf-8">
+        <style>
+          @keyframes wallflow-probe { from { opacity: 0.2; } to { opacity: 0.8; } }
+          #animated { width: 10px; height: 10px; animation: wallflow-probe 5s linear infinite; }
+        </style>
+        </head>
         <body>
+        <img id="hero" alt="" style="display:block;width:100vw;height:50vh" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">
+        <canvas id="overlay" style="position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none"></canvas>
+        <div id="animated"></div>
         <audio id="media"></audio>
         <script>
           window.__wallflowProbe = {
@@ -248,7 +372,8 @@ final class WallflowWebSelfTest {
             general: null,
             paused: null,
             mouse: null,
-            clicks: 0
+            clicks: 0,
+            contextmenus: 0
           };
           window.wallpaperPropertyListener = {
             applyUserProperties(value) { window.__wallflowProbe.properties = value; },
@@ -260,6 +385,10 @@ final class WallflowWebSelfTest {
           });
           window.addEventListener('click', () => {
             window.__wallflowProbe.clicks += 1;
+          });
+          window.addEventListener('contextmenu', event => {
+            event.preventDefault();
+            window.__wallflowProbe.contextmenus += 1;
           });
         </script>
         </body>

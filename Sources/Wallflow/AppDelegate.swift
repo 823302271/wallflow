@@ -17,9 +17,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pauseWhenDesktopHidden = true
     private var currentProject = WallpaperProject.builtIn
     private var currentUserProperties: JSONValue = .object([:])
+    private var currentFitMode: WallpaperFitMode = .automatic
     private var displayConfigurationSignature = ""
     private var coverageEvaluationGeneration = 0
     private var coverageWatchdog: Timer?
+    private var displaysAwaitingSpaceCompletion: Set<CGDirectDisplayID> = []
+    private var spaceCompletionFallbackGeneration: [CGDirectDisplayID: Int] = [:]
     private var fallbackRefreshGeneration = 0
     private var didFinishLaunching = false
     private var pendingOpenURLs: [URL] = []
@@ -37,6 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         loadInitialProject()
         restoreDesktopVisibilityPreference()
         registerCurrentProjectInLibrary()
+        currentFitMode = wallpaperLibrary.entry(for: currentProject)?.fitMode ?? .automatic
         currentUserProperties = restoredUserProperties(for: currentProject)
         configureStatusItem()
         rebuildWallpaperWindows()
@@ -89,17 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openWallpaper() {
-        NSApplication.shared.activate(ignoringOtherApps: true)
-
-        let panel = NSOpenPanel()
-        panel.title = L10n.text(.openPanelTitle)
-        panel.message = L10n.text(.openPanelMessage)
-        panel.prompt = L10n.text(.openPanelPrompt)
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = true
-        panel.allowsMultipleSelection = false
-
-        guard panel.runModal() == .OK, let selectedURL = panel.url else { return }
+        guard let selectedURL = chooseWallpaperSource() else { return }
         importWallpaper(from: selectedURL, persist: true)
     }
 
@@ -135,6 +129,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 isBuiltInCurrent: currentProject.kind == .builtIn,
                 onUse: { [weak self] entry in
                     self?.activateLibraryEntry(entry)
+                },
+                onLocateUnavailable: { [weak self] entry in
+                    self?.locateUnavailableLibraryEntry(entry)
                 },
                 onRemove: { [weak self] entry in
                     self?.confirmLibraryRemoval(entry)
@@ -178,8 +175,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let controller = WallpaperPropertiesWindowController(
             title: currentProject.displayTitle,
             properties: currentUserProperties,
+            fitMode: currentFitMode,
             onChange: { [weak self] key, value in
                 self?.updateUserProperty(key: key, value: value)
+            },
+            onFitModeChange: { [weak self] fitMode in
+                self?.updateFitMode(fitMode)
             },
             onReset: { [weak self] in
                 self?.resetUserProperties()
@@ -194,6 +195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func useBuiltInWallpaper() {
         currentProject = .builtIn
+        currentFitMode = .automatic
         currentUserProperties = restoredUserProperties(for: currentProject)
         propertiesWindowController?.close()
         propertiesWindowController = nil
@@ -231,9 +233,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func activeSpaceChanged(_ notification: Notification) {
         NSLog("Wallflow active Space changed")
-        evaluateForegroundCoverage()
+        prepareWallpaperWindowsForPresentation()
+        displaysAwaitingSpaceCompletion.removeAll()
+        evaluateForegroundCoverage(allowResume: true)
         scheduleForegroundCoverageEvaluation(after: 0.25)
         scheduleFallbackRefresh(delay: 0.8)
+    }
+
+    @objc private func wallpaperWindowOcclusionChanged(_ notification: Notification) {
+        guard automaticallyPauseCoveredDisplays,
+              pauseWhenDesktopHidden,
+              let window = notification.object as? NSWindow,
+              let controller = wallpaperControllers.first(where: {
+                  $0.manages(window: window)
+              }) else {
+            return
+        }
+        if window.occlusionState.contains(.visible) {
+            evaluateForegroundCoverage()
+        } else {
+            displaysAwaitingSpaceCompletion.remove(controller.displayID)
+            applyDesktopHidden(true, to: controller)
+        }
     }
 
     private func scheduleForegroundCoverageEvaluation(after delay: TimeInterval = 0.35) {
@@ -411,7 +432,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
-
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(wallpaperWindowOcclusionChanged(_:)),
+            name: NSWindow.didChangeOcclusionStateNotification,
+            object: nil
+        )
         let workspaceCenter = NSWorkspace.shared.notificationCenter
         workspaceCenter.addObserver(
             self,
@@ -458,7 +484,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DesktopWindowController(
                 screen: screen,
                 project: currentProject,
-                playsAudio: index == 0
+                playsAudio: index == 0,
+                fitMode: currentFitMode
             )
         }
         wallpaperControllers = newControllers
@@ -494,7 +521,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     DesktopWindowController(
                         screen: screen,
                         project: currentProject,
-                        playsAudio: index == 0
+                        playsAudio: index == 0,
+                        fitMode: currentFitMode
                     )
                 )
             }
@@ -519,7 +547,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func prepareWallpaperWindowsForPresentation() {
-        wallpaperControllers.forEach { $0.prepareForPresentation() }
+        wallpaperControllers.forEach { $0.prepareForSpacePresentation() }
     }
 
     private func applyRenderingState() {
@@ -536,8 +564,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         muteMenuItem?.title = isAudioMuted ? L10n.text(.unmuteAudio) : L10n.text(.muteAudio)
     }
 
-    private func evaluateForegroundCoverage() {
+    private func evaluateForegroundCoverage(allowResume: Bool = false) {
         guard automaticallyPauseCoveredDisplays, pauseWhenDesktopHidden else {
+            displaysAwaitingSpaceCompletion.removeAll()
             wallpaperControllers.forEach { $0.setDesktopHidden(false) }
             return
         }
@@ -548,15 +577,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 screenBounds,
                 by: windowBounds
             )
-            let changed = controller.setDesktopHidden(isDesktopHidden)
-            if changed {
-                NSLog(
-                    "Wallflow display %u rendering %@",
-                    controller.displayID,
-                    isDesktopHidden ? "paused" : "resumed"
-                )
+            if !isDesktopHidden, controller.isDesktopHidden, !allowResume {
+                controller.prepareForPresentation()
+                holdResumeUntilSpaceCompletion(for: controller.displayID)
+                continue
             }
+            applyDesktopHidden(isDesktopHidden, to: controller)
         }
+    }
+
+    private func holdResumeUntilSpaceCompletion(for displayID: CGDirectDisplayID) {
+        guard displaysAwaitingSpaceCompletion.insert(displayID).inserted else { return }
+        let generation = (spaceCompletionFallbackGeneration[displayID] ?? 0) + 1
+        spaceCompletionFallbackGeneration[displayID] = generation
+        NSLog("Wallflow display %u waiting for Space completion", displayID)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self,
+                  self.spaceCompletionFallbackGeneration[displayID] == generation,
+                  self.displaysAwaitingSpaceCompletion.remove(displayID) != nil else {
+                return
+            }
+            self.evaluateForegroundCoverage(allowResume: true)
+        }
+    }
+
+    private func applyDesktopHidden(
+        _ hidden: Bool,
+        to controller: DesktopWindowController
+    ) {
+        guard controller.setDesktopHidden(hidden) else { return }
+        NSLog(
+            "Wallflow display %u rendering %@",
+            controller.displayID,
+            hidden ? "paused" : "resumed"
+        )
     }
 
     private func loadInitialProject() {
@@ -587,6 +641,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.set(savedSource, forKey: Self.savedProjectPathKey)
             wallpaperLibrary.install(project: project, sourceURL: sourceURL)
         }
+        currentFitMode = wallpaperLibrary.entry(for: project)?.fitMode ?? .automatic
         updateProjectTitle()
         rebuildWallpaperWindows()
     }
@@ -639,12 +694,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scheduleFallbackRefresh(delay: 0.35)
     }
 
+    private func updateFitMode(_ fitMode: WallpaperFitMode) {
+        guard currentProject.kind != .builtIn else { return }
+        currentFitMode = fitMode
+        if !wallpaperLibrary.setFitMode(fitMode, for: currentProject),
+           let sourceURL = currentProject.manifestURL
+            ?? currentProject.entryURL
+            ?? currentProject.rootURL {
+            wallpaperLibrary.install(project: currentProject, sourceURL: sourceURL)
+            wallpaperLibrary.setFitMode(fitMode, for: currentProject)
+        }
+        wallpaperControllers.forEach { $0.setFitMode(fitMode) }
+        refreshLibraryWindow()
+        scheduleFallbackRefresh(delay: 0.35)
+    }
+
     private func resetUserProperties() {
+        currentFitMode = .automatic
+        wallpaperLibrary.setFitMode(.automatic, for: currentProject)
         currentUserProperties = currentProject.userProperties
         if let key = userPropertiesStorageKey(for: currentProject) {
             UserDefaults.standard.removeObject(forKey: key)
         }
         wallpaperControllers.forEach { $0.applyUserProperties(currentUserProperties) }
+        wallpaperControllers.forEach { $0.setFitMode(.automatic) }
         scheduleFallbackRefresh(delay: 0.35)
         propertiesWindowController?.close()
         propertiesWindowController = nil
@@ -739,6 +812,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func locateUnavailableLibraryEntry(_ entry: WallpaperLibraryEntry) {
+        guard let sourceURL = chooseWallpaperSource() else { return }
+        projectTitleMenuItem?.title = L10n.text(.importing)
+        importService.prepare(sourceURL: sourceURL) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let preparedURL):
+                do {
+                    try self.selectProject(at: preparedURL, persist: true)
+                    try self.wallpaperLibrary.remove(entry, deleteManagedFiles: false)
+                    self.refreshLibraryWindow()
+                } catch {
+                    self.updateProjectTitle()
+                    self.showError(error)
+                }
+            case .failure(let error):
+                self.updateProjectTitle()
+                self.showError(error)
+            }
+        }
+    }
+
+    private func chooseWallpaperSource() -> URL? {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let panel = NSOpenPanel()
+        panel.title = L10n.text(.openPanelTitle)
+        panel.message = L10n.text(.openPanelMessage)
+        panel.prompt = L10n.text(.openPanelPrompt)
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
     private func persistUserProperties() {
         guard let key = userPropertiesStorageKey(for: currentProject),
               let data = try? JSONEncoder().encode(currentUserProperties) else {
@@ -766,8 +873,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var supportsEditableProperties: Bool {
-        currentProject.kind == .web
-            && currentUserProperties.objectValue?.isEmpty == false
+        currentProject.kind != .builtIn
     }
 
     private func scheduleFallbackRefresh(delay: TimeInterval = 1.0) {
@@ -786,11 +892,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshFallback(for controller: DesktopWindowController) {
-        guard !controller.isDesktopHidden else { return }
         controller.captureFrame { [weak self, weak controller] image in
             guard let self,
                   let controller,
-                  !controller.isDesktopHidden,
                   let image,
                   let snapshot = WallpaperSnapshot.preparedImage(from: image) else {
                 return

@@ -34,6 +34,7 @@ Wallpaper Engine web and scene compatibility.
 - Menu bar pause and resume controls
 - Default-on pause only when a display's desktop is fully hidden
 - Persistent wallpaper library with switching, reveal, and uninstall actions
+- Per-wallpaper Auto, Fill, Fit, and Stretch display modes
 - Runtime language switching between English and Simplified Chinese
 - Native MP4, M4V, and MOV playback through AVFoundation
 - Automatic Metal rendering for compatible script-only Canvas 2D wallpapers
@@ -69,6 +70,7 @@ Implemented:
 - Registration shims for audio and media listeners
 - Native property editor for checkbox, slider, color, combo, text, file, and directory values
 - Incremental property callbacks and per-project property persistence
+- Automatic cover sizing for simple dominant image and video pages without rewriting complex layouts
 - Global HTML media mute control, with only the primary display allowed to play audio
 
 Not implemented yet:
@@ -89,6 +91,7 @@ Implemented:
 - `scene.json` general settings and object classification
 - Image descriptor and material JSON resolution
 - Static image layers with origin, scale, rotation, alpha, and fullscreen layout
+- Per-wallpaper fill, fit, and non-uniform stretch scaling from the authored scene canvas
 - Camera parallax and per-layer parallax depth
 - `.tex` RGBA8888, R8, RG88, DXT1, DXT3, and DXT5 decoding
 - LZ4-compressed texture bodies
@@ -127,10 +130,15 @@ project. A web compatibility fixture is included at `Fixtures/web-wallpaper`.
   or a complete ZIP project URL.
 - A supported file or ZIP can be opened with Wallflow from Finder, including by
   dragging the file onto `Wallflow.app`.
-- Successful imports are added to **Wallpaper Library...** automatically. The
-  library also discovers existing projects under Wallflow's managed import folder.
-- Removing a managed ZIP import deletes Wallflow's installed copy after
-  confirmation. Removing an external file or URL only removes its library record.
+- Local files, project directories, and ZIPs are copied into
+  `~/Library/Application Support/Wallflow/ImportedWallpapers`, so they do not
+  depend on their original path or a temporary directory. Existing managed
+  import directories are rediscovered at launch.
+- Successful imports are added to **Wallpaper Library...** automatically.
+  Removing a local wallpaper deletes only Wallflow's installed copy, never the
+  original. URLs only lose their library reference.
+- Missing paths left by older versions are marked unavailable. Select one and
+  use **Locate Wallpaper...** to choose and install the original project again.
 - ZIP imports are checked for path traversal, symbolic links, excessive file
   count, and excessive extracted size before they are loaded.
 
@@ -161,6 +169,18 @@ yet supported. Check the scene compatibility section for the remaining limits.
 Web wallpapers can expose Wallpaper Engine user properties. Wallflow currently
 applies checkbox, slider, color, combo, text, file, and directory values and
 persists them per project.
+
+Every imported wallpaper also has a persistent **Display Mode** in
+**Wallpaper Properties...**:
+
+- **Auto** uses cover sizing for native video and simple pages with one dominant
+  image or video, while preserving complex web layouts.
+- **Fill** preserves aspect ratio and crops overflow to cover the display.
+- **Fit** preserves the complete frame and may add empty space around it.
+- **Stretch** fills the display without preserving aspect ratio.
+
+The mode is stored by Wallflow for each library entry and does not modify the
+wallpaper's `project.json` or source files.
 
 Scene customization will be added in stages. The planned order is playback
 speed and FPS limits, camera/parallax controls, effect toggles, per-layer
@@ -197,12 +217,13 @@ intercepting it, so the original application receives the click and an interacti
 wallpaper can react to the same click.
 
 During a full-screen or Space transition, Wallflow keeps the same desktop window,
-WebKit surface, and renderer alive at a constant desktop level. It pauses only the
-animation clock, media, audio, and input while the desktop is invisible, then
-continues from the same frame when the desktop returns. The static macOS desktop
-frame is only a fallback for times when Wallflow is not running; it is not used as
-a Space-transition layer. Incremental display reconciliation separately reuses
-every retained display renderer when another display is connected or disconnected.
+WebKit surface, and renderer alive above the system wallpaper and below desktop
+icons. Before the desktop disappears, Wallflow saves the last rendered frame. It
+shows that frozen frame first when the desktop returns, then reveals the live
+renderer after Metal or WebKit has produced content again. Wallflow also syncs the
+latest frame to the static macOS desktop so a transition cannot expose the previous
+wallpaper. Incremental display reconciliation separately reuses every retained
+display renderer when another display is connected or disconnected.
 
 ## Architecture direction
 

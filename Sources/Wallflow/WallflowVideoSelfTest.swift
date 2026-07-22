@@ -17,6 +17,7 @@ final class WallflowVideoSelfTest {
                 playsAudio: false
             )
             wallpaperView = view
+            try verifyFitModes(view)
             pollUntilPlaying()
 
             let timeout = Timer(timeInterval: 10, repeats: false) { [weak self] _ in
@@ -44,6 +45,25 @@ final class WallflowVideoSelfTest {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             self?.pollUntilPlaying()
+        }
+    }
+
+    private func verifyFitModes(_ view: VideoWallpaperView) throws {
+        view.setFitMode(.automatic)
+        guard view.videoGravityForTesting == .resizeAspectFill else {
+            throw WallflowSelfTestError.failed("Automatic video fit did not use aspect fill")
+        }
+        view.setFitMode(.fit)
+        guard view.videoGravityForTesting == .resizeAspect else {
+            throw WallflowSelfTestError.failed("Video fit mode did not preserve the full frame")
+        }
+        view.setFitMode(.stretch)
+        guard view.videoGravityForTesting == .resize else {
+            throw WallflowSelfTestError.failed("Video stretch mode did not resize the frame")
+        }
+        view.setFitMode(.fill)
+        guard view.videoGravityForTesting == .resizeAspectFill else {
+            throw WallflowSelfTestError.failed("Video fill mode did not crop to fill")
         }
     }
 

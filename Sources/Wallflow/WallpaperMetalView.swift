@@ -14,7 +14,7 @@ private struct WallpaperUniforms {
 
 final class WallpaperMetalView: MTKView, MTKViewDelegate {
     private let context: MetalContext
-    private let startTime = CACurrentMediaTime()
+    private var timelineOrigin = CACurrentMediaTime()
     private var desktopFrame: CGRect
     private var smoothedMouse = SIMD2<Float>(0.5, 0.5)
     private var lastMouse = SIMD2<Float>(0.5, 0.5)
@@ -50,14 +50,18 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
         guard enabled != isRenderingEnabled else { return }
         isRenderingEnabled = enabled
         if enabled {
+            let now = CACurrentMediaTime()
+            if let frozenElapsedTime {
+                timelineOrigin = now - Double(frozenElapsedTime)
+            }
             frozenElapsedTime = nil
             frozenActivity = nil
-            lastInteractionTime = CACurrentMediaTime()
+            lastInteractionTime = now
             setPreferredFPS(60)
             isPaused = false
         } else {
             let now = CACurrentMediaTime()
-            frozenElapsedTime = Float(now - startTime)
+            frozenElapsedTime = Float(now - timelineOrigin)
             frozenActivity = updateMouseState(now: now).activity
             draw()
             isPaused = true
@@ -66,6 +70,48 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
 
     func updateDesktopFrame(_ frame: CGRect) {
         desktopFrame = frame
+    }
+
+    func captureFrame(completion: @escaping (NSImage?) -> Void) {
+        let width = max(1, Int(drawableSize.width.rounded()))
+        let height = max(1, Int(drawableSize.height.rounded()))
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: colorPixelFormat,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        textureDescriptor.usage = [.renderTarget]
+        textureDescriptor.storageMode = .shared
+        guard let texture = context.device.makeTexture(descriptor: textureDescriptor),
+              let commandBuffer = context.commandQueue.makeCommandBuffer() else {
+            completion(nil)
+            return
+        }
+
+        let descriptor = MTLRenderPassDescriptor()
+        descriptor.colorAttachments[0].texture = texture
+        descriptor.colorAttachments[0].loadAction = .clear
+        descriptor.colorAttachments[0].storeAction = .store
+        descriptor.colorAttachments[0].clearColor = clearColor
+        var uniforms = currentUniforms()
+        guard encode(
+            uniforms: &uniforms,
+            descriptor: descriptor,
+            commandBuffer: commandBuffer
+        ) else {
+            completion(nil)
+            return
+        }
+        commandBuffer.addCompletedHandler { commandBuffer in
+            guard commandBuffer.status == .completed,
+                  let image = WallpaperSnapshot.image(fromBGRA8: texture) else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            DispatchQueue.main.async { completion(image) }
+        }
+        commandBuffer.commit()
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -103,13 +149,22 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
     private func renderFrame() {
         guard let renderPassDescriptor = currentRenderPassDescriptor,
               let drawable = currentDrawable,
-              let commandBuffer = context.commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeRenderCommandEncoder(
-                  descriptor: renderPassDescriptor
-              ) else {
+              let commandBuffer = context.commandQueue.makeCommandBuffer() else {
             return
         }
+        var uniforms = currentUniforms()
+        guard encode(
+            uniforms: &uniforms,
+            descriptor: renderPassDescriptor,
+            commandBuffer: commandBuffer
+        ) else {
+            return
+        }
+        commandBuffer.present(drawable)
+        commandBuffer.commit()
+    }
 
+    private func currentUniforms() -> WallpaperUniforms {
         let now = CACurrentMediaTime()
         let mouseState: (isActive: Bool, activity: Float)
         if isRenderingEnabled {
@@ -118,14 +173,25 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
         } else {
             mouseState = (false, frozenActivity ?? 0)
         }
-
-        var uniforms = WallpaperUniforms(
+        return WallpaperUniforms(
             resolution: SIMD2(Float(drawableSize.width), Float(drawableSize.height)),
             mouse: smoothedMouse,
-            time: frozenElapsedTime ?? Float(now - startTime),
+            time: frozenElapsedTime ?? Float(now - timelineOrigin),
             activity: mouseState.activity,
             intensity: 1
         )
+    }
+
+    private func encode(
+        uniforms: inout WallpaperUniforms,
+        descriptor: MTLRenderPassDescriptor,
+        commandBuffer: MTLCommandBuffer
+    ) -> Bool {
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(
+            descriptor: descriptor
+        ) else {
+            return false
+        }
 
         encoder.label = "Wallflow Frame"
         encoder.setRenderPipelineState(context.pipeline)
@@ -136,9 +202,7 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
         )
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
-
-        commandBuffer.present(drawable)
-        commandBuffer.commit()
+        return true
     }
 
     private func updateMouseState(now: CFTimeInterval) -> (isActive: Bool, activity: Float) {

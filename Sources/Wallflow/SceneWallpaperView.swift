@@ -5,6 +5,7 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
     private struct RenderedLayer {
         let model: SceneImageLayer
         let layer: CALayer
+        let automaticContentsGravity: CALayerContentsGravity
         var basePosition: CGPoint
     }
 
@@ -21,6 +22,7 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
     private var scenePackage: ScenePackage?
     private var sceneSounds: [SceneSoundObject] = []
     private var audioController: SceneAudioController?
+    private var fitMode: WallpaperFitMode
 
     var contentView: NSView { self }
 
@@ -28,16 +30,18 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
         frame: CGRect,
         desktopFrame: CGRect,
         project: WallpaperProject,
-        playsAudio: Bool
+        playsAudio: Bool,
+        fitMode: WallpaperFitMode = .automatic
     ) {
         self.desktopFrame = desktopFrame
         self.project = project
         self.playsAudio = playsAudio
+        self.fitMode = fitMode
         super.init(frame: frame)
 
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
-        previewLayer.contentsGravity = .resizeAspectFill
+        previewLayer.contentsGravity = contentsGravity(for: .resizeAspectFill)
         previewLayer.masksToBounds = true
         previewLayer.isHidden = true
         layer?.addSublayer(previewLayer)
@@ -57,8 +61,12 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
 
     override func layout() {
         super.layout()
-        let overflow = max(bounds.width, bounds.height) * 0.035
-        previewLayer.frame = bounds.insetBy(dx: -overflow, dy: -overflow)
+        if fitMode == .automatic || fitMode == .fill {
+            let overflow = max(bounds.width, bounds.height) * 0.035
+            previewLayer.frame = bounds.insetBy(dx: -overflow, dy: -overflow)
+        } else {
+            previewLayer.frame = bounds
+        }
         layoutSceneLayers()
     }
 
@@ -91,6 +99,19 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
             audioController?.setRenderingEnabled(false)
             audioController = nil
         }
+    }
+
+    func setFitMode(_ fitMode: WallpaperFitMode) {
+        guard fitMode != self.fitMode else { return }
+        self.fitMode = fitMode
+        previewLayer.contentsGravity = contentsGravity(for: .resizeAspectFill)
+        for rendered in renderedLayers {
+            rendered.layer.contentsGravity = contentsGravity(
+                for: rendered.automaticContentsGravity
+            )
+        }
+        needsLayout = true
+        layoutSubtreeIfNeeded()
     }
 
     func updateDesktopFrame(_ frame: CGRect) {
@@ -151,7 +172,10 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
                 let imageLayer = CALayer()
                 imageLayer.name = model.name
                 imageLayer.contents = texture.image
-                imageLayer.contentsGravity = texture.isSprite ? .resizeAspect : .resizeAspectFill
+                let automaticContentsGravity: CALayerContentsGravity = texture.isSprite
+                    ? .resizeAspect
+                    : .resizeAspectFill
+                imageLayer.contentsGravity = contentsGravity(for: automaticContentsGravity)
                 imageLayer.masksToBounds = true
                 imageLayer.opacity = Float(min(max(model.alpha, 0), 1))
                 imageLayer.minificationFilter = .linear
@@ -162,6 +186,7 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
                     RenderedLayer(
                         model: model,
                         layer: imageLayer,
+                        automaticContentsGravity: automaticContentsGravity,
                         basePosition: .zero
                     )
                 )
@@ -275,10 +300,23 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
         guard let document = sceneDocument else { return }
         let canvasWidth = max(document.general.canvasWidth, 1)
         let canvasHeight = max(document.general.canvasHeight, 1)
-        let sceneScale = max(
-            bounds.width / canvasWidth,
-            bounds.height / canvasHeight
-        )
+        let widthScale = bounds.width / canvasWidth
+        let heightScale = bounds.height / canvasHeight
+        let sceneScaleX: CGFloat
+        let sceneScaleY: CGFloat
+        switch fitMode {
+        case .automatic, .fill:
+            let scale = max(widthScale, heightScale)
+            sceneScaleX = scale
+            sceneScaleY = scale
+        case .fit:
+            let scale = min(widthScale, heightScale)
+            sceneScaleX = scale
+            sceneScaleY = scale
+        case .stretch:
+            sceneScaleX = widthScale
+            sceneScaleY = heightScale
+        }
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -294,14 +332,14 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
                 imageLayer.bounds = CGRect(
                     x: 0,
                     y: 0,
-                    width: max(1, model.width * scaleX * sceneScale),
-                    height: max(1, model.height * scaleY * sceneScale)
+                    width: max(1, model.width * scaleX * sceneScaleX),
+                    height: max(1, model.height * scaleY * sceneScaleY)
                 )
                 let originX = model.origin.first ?? canvasWidth * 0.5
                 let originY = model.origin.dropFirst().first ?? canvasHeight * 0.5
                 imageLayer.position = CGPoint(
-                    x: bounds.midX + (originX - canvasWidth * 0.5) * sceneScale,
-                    y: bounds.midY - (originY - canvasHeight * 0.5) * sceneScale
+                    x: bounds.midX + (originX - canvasWidth * 0.5) * sceneScaleX,
+                    y: bounds.midY - (originY - canvasHeight * 0.5) * sceneScaleY
                 )
             }
 
@@ -310,6 +348,17 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
             renderedLayers[index].basePosition = imageLayer.position
         }
         CATransaction.commit()
+    }
+
+    private func contentsGravity(
+        for automaticGravity: CALayerContentsGravity
+    ) -> CALayerContentsGravity {
+        switch fitMode {
+        case .automatic: automaticGravity
+        case .fill: .resizeAspectFill
+        case .fit: .resizeAspect
+        case .stretch: .resize
+        }
     }
 
     private func addSpriteAnimation(

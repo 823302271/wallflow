@@ -1,6 +1,10 @@
 import AppKit
 
 final class WallpaperPropertiesWindowController: NSWindowController {
+    private final class FlippedView: NSView {
+        override var isFlipped: Bool { true }
+    }
+
     private final class ActionTarget: NSObject {
         let handler: (Any?) -> Void
 
@@ -16,27 +20,39 @@ final class WallpaperPropertiesWindowController: NSWindowController {
     private var actionTargets: [ActionTarget] = []
     private var notificationTokens: [NSObjectProtocol] = []
     private let onChange: (String, JSONValue) -> Void
+    private let onFitModeChange: (WallpaperFitMode) -> Void
     private let onReset: () -> Void
 
     init(
         title: String,
         properties: JSONValue,
+        fitMode: WallpaperFitMode,
         onChange: @escaping (String, JSONValue) -> Void,
+        onFitModeChange: @escaping (WallpaperFitMode) -> Void,
         onReset: @escaping () -> Void
     ) {
         self.onChange = onChange
+        self.onFitModeChange = onFitModeChange
         self.onReset = onReset
 
+        let propertyCount = properties.objectValue?.keys.filter {
+            $0.caseInsensitiveCompare("schemecolor") != .orderedSame
+        }.count ?? 0
+        let preferredHeight = min(
+            560,
+            max(200, CGFloat((propertyCount + 1) * 48 + 110))
+        )
+
         let window = NSWindow(
-            contentRect: CGRect(x: 0, y: 0, width: 520, height: 560),
+            contentRect: CGRect(x: 0, y: 0, width: 520, height: preferredHeight),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = L10n.propertiesWindowTitle(title)
-        window.minSize = NSSize(width: 440, height: 320)
+        window.minSize = NSSize(width: 440, height: 200)
         super.init(window: window)
-        window.contentView = makeContentView(properties: properties)
+        window.contentView = makeContentView(properties: properties, fitMode: fitMode)
     }
 
     @available(*, unavailable)
@@ -48,14 +64,17 @@ final class WallpaperPropertiesWindowController: NSWindowController {
         notificationTokens.forEach(NotificationCenter.default.removeObserver)
     }
 
-    private func makeContentView(properties: JSONValue) -> NSView {
+    private func makeContentView(
+        properties: JSONValue,
+        fitMode: WallpaperFitMode
+    ) -> NSView {
         let contentView = NSView()
         let scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
         scrollView.drawsBackground = false
 
-        let documentView = NSView()
+        let documentView = FlippedView()
         documentView.translatesAutoresizingMaskIntoConstraints = false
         let stack = NSStackView()
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -63,12 +82,28 @@ final class WallpaperPropertiesWindowController: NSWindowController {
         stack.alignment = .leading
         stack.spacing = 10
 
-        let sortedProperties = (properties.objectValue ?? [:]).sorted { left, right in
-            let leftOrder = left.value.objectValue?["order"]?.numberValue ?? .greatestFiniteMagnitude
-            let rightOrder = right.value.objectValue?["order"]?.numberValue ?? .greatestFiniteMagnitude
-            if leftOrder == rightOrder { return left.key < right.key }
-            return leftOrder < rightOrder
+        let sortedProperties = (properties.objectValue ?? [:])
+            .filter { key, _ in
+                key.caseInsensitiveCompare("schemecolor") != .orderedSame
+            }
+            .sorted { left, right in
+                let leftOrder = left.value.objectValue?["order"]?.numberValue
+                    ?? .greatestFiniteMagnitude
+                let rightOrder = right.value.objectValue?["order"]?.numberValue
+                    ?? .greatestFiniteMagnitude
+                if leftOrder == rightOrder { return left.key < right.key }
+                return leftOrder < rightOrder
+            }
+
+        stack.addArrangedSubview(makeFitModeRow(fitMode: fitMode))
+
+        if !sortedProperties.isEmpty {
+            let separator = NSBox()
+            separator.boxType = .separator
+            separator.widthAnchor.constraint(greaterThanOrEqualToConstant: 440).isActive = true
+            stack.addArrangedSubview(separator)
         }
+
         for (key, definition) in sortedProperties {
             stack.addArrangedSubview(makeRow(key: key, definition: definition))
         }
@@ -102,6 +137,42 @@ final class WallpaperPropertiesWindowController: NSWindowController {
             stack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor, constant: -4)
         ])
         return contentView
+    }
+
+    private func makeFitModeRow(fitMode: WallpaperFitMode) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 12
+
+        let label = NSTextField(labelWithString: L10n.text(.fitMode))
+        label.widthAnchor.constraint(equalToConstant: 170).isActive = true
+
+        let modes = WallpaperFitMode.allCases
+        let control = NSSegmentedControl(
+            labels: modes.map(L10n.fitModeTitle),
+            trackingMode: .selectOne,
+            target: nil,
+            action: nil
+        )
+        control.selectedSegment = modes.firstIndex(of: fitMode) ?? 0
+        control.segmentStyle = .rounded
+        control.widthAnchor.constraint(greaterThanOrEqualToConstant: 270).isActive = true
+        let target = ActionTarget { [weak self, weak control] _ in
+            guard let control,
+                  modes.indices.contains(control.selectedSegment) else {
+                return
+            }
+            self?.onFitModeChange(modes[control.selectedSegment])
+        }
+        control.target = target
+        control.action = #selector(ActionTarget.invoke(_:))
+        actionTargets.append(target)
+
+        row.addArrangedSubview(label)
+        row.addArrangedSubview(control)
+        row.widthAnchor.constraint(greaterThanOrEqualToConstant: 440).isActive = true
+        return row
     }
 
     private func makeRow(key: String, definition: JSONValue) -> NSView {

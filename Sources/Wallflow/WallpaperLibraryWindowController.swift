@@ -23,6 +23,7 @@ final class WallpaperLibraryWindowController: NSWindowController,
     private let revealButton = NSButton()
     private var rows: [Row] = []
     private let onUse: (WallpaperLibraryEntry?) -> Void
+    private let onLocateUnavailable: (WallpaperLibraryEntry) -> Void
     private let onRemove: (WallpaperLibraryEntry) -> Void
     private let onReveal: (WallpaperLibraryEntry) -> Void
     private let onImportFile: () -> Void
@@ -33,12 +34,14 @@ final class WallpaperLibraryWindowController: NSWindowController,
         currentEntryID: UUID?,
         isBuiltInCurrent: Bool,
         onUse: @escaping (WallpaperLibraryEntry?) -> Void,
+        onLocateUnavailable: @escaping (WallpaperLibraryEntry) -> Void,
         onRemove: @escaping (WallpaperLibraryEntry) -> Void,
         onReveal: @escaping (WallpaperLibraryEntry) -> Void,
         onImportFile: @escaping () -> Void,
         onImportURL: @escaping () -> Void
     ) {
         self.onUse = onUse
+        self.onLocateUnavailable = onLocateUnavailable
         self.onRemove = onRemove
         self.onReveal = onReveal
         self.onImportFile = onImportFile
@@ -150,8 +153,12 @@ final class WallpaperLibraryWindowController: NSWindowController,
     }
 
     @objc private func useSelectedWallpaper() {
-        guard let row = selectedRow, row.isAvailable, !row.isCurrent else { return }
-        onUse(row.entry)
+        guard let row = selectedRow, !row.isCurrent else { return }
+        if row.isAvailable {
+            onUse(row.entry)
+        } else if let entry = row.entry {
+            onLocateUnavailable(entry)
+        }
     }
 
     @objc private func removeSelectedWallpaper() {
@@ -249,11 +256,6 @@ final class WallpaperLibraryWindowController: NSWindowController,
             action: #selector(removeSelectedWallpaper)
         )
 
-        useButton.title = L10n.text(.libraryUse)
-        useButton.image = NSImage(
-            systemSymbolName: "play.fill",
-            accessibilityDescription: L10n.text(.libraryUse)
-        )
         useButton.imagePosition = .imageLeading
         useButton.bezelStyle = .rounded
         useButton.target = self
@@ -381,7 +383,13 @@ final class WallpaperLibraryWindowController: NSWindowController,
             revealButton.isEnabled = false
             return
         }
-        useButton.isEnabled = row.isAvailable && !row.isCurrent
+        let primaryAction = row.isAvailable ? L10n.text(.libraryUse) : L10n.text(.libraryLocate)
+        useButton.title = primaryAction
+        useButton.image = NSImage(
+            systemSymbolName: row.isAvailable ? "play.fill" : "folder.badge.questionmark",
+            accessibilityDescription: primaryAction
+        )
+        useButton.isEnabled = !row.isCurrent && (row.isAvailable || row.entry != nil)
         removeButton.isEnabled = row.entry != nil
         revealButton.isEnabled = row.entry?.sourceURL.isFileURL == true && row.isAvailable
     }

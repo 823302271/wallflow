@@ -35,6 +35,7 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
     private var latestFrame: CanvasMetalFrame?
     private var frameTimer: Timer?
     private var globalMouseMonitor: Any?
+    private var desktopPressedMouseButtons = 0
     private var virtualTimeMilliseconds = 0.0
     private var lastMouseLocation = CGPoint(x: -.greatestFiniteMagnitude, y: 0)
     private var mouseWasInside = false
@@ -154,6 +155,46 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
         draw()
     }
 
+    func captureFrame(completion: @escaping (NSImage?) -> Void) {
+        guard let frame = latestFrame else {
+            completion(nil)
+            return
+        }
+        let width = max(1, Int(drawableSize.width.rounded()))
+        let height = max(1, Int(drawableSize.height.rounded()))
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: colorPixelFormat,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        textureDescriptor.usage = [.renderTarget]
+        textureDescriptor.storageMode = .shared
+        guard let texture = metalContext.device.makeTexture(descriptor: textureDescriptor),
+              let commandBuffer = metalContext.commandQueue.makeCommandBuffer() else {
+            completion(nil)
+            return
+        }
+        let descriptor = MTLRenderPassDescriptor()
+        descriptor.colorAttachments[0].texture = texture
+        descriptor.colorAttachments[0].storeAction = .store
+        guard encode(frame, descriptor: descriptor, commandBuffer: commandBuffer) else {
+            completion(nil)
+            return
+        }
+        commandBuffer.addCompletedHandler { commandBuffer in
+            guard commandBuffer.status == .completed,
+                  let image = WallpaperSnapshot.image(fromBGRA8: texture) else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            DispatchQueue.main.async {
+                completion(image)
+            }
+        }
+        commandBuffer.commit()
+    }
+
     func setAudioMuted(_ muted: Bool) {}
     func setPlaysAudio(_ enabled: Bool) {}
 
@@ -163,6 +204,12 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
 
     func dispatchMouseForTesting(type: String, x: CGFloat, y: CGFloat) {
         runtime.dispatchMouse(type: type, x: x, y: y)
+    }
+
+    func dispatchMouseButtonForTesting(button: Int, x: CGFloat, y: CGFloat) {
+        let point = CGPoint(x: x, y: y)
+        dispatchMouseButton(button: button, isDown: true, point: point)
+        dispatchMouseButton(button: button, isDown: false, point: point)
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -230,7 +277,7 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
     private func startInputBridge() {
         guard isRenderingEnabled, globalMouseMonitor == nil else { return }
         globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.leftMouseDown, .leftMouseUp]
+            matching: [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp]
         ) { [weak self] event in
             DispatchQueue.main.async {
                 self?.handleMouseButton(event)
@@ -243,6 +290,7 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
             NSEvent.removeMonitor(globalMouseMonitor)
             self.globalMouseMonitor = nil
         }
+        desktopPressedMouseButtons = 0
     }
 
     private func dispatchMouseMovement() {
@@ -268,18 +316,66 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
     }
 
     private func handleMouseButton(_ event: NSEvent) {
-        let global = NSEvent.mouseLocation
-        guard desktopFrame.contains(global) else { return }
-        let point = localPoint(for: global)
+        let button: Int
+        let isDown: Bool
         switch event.type {
         case .leftMouseDown:
-            runtime.dispatchMouse(type: "mousedown", x: point.x, y: point.y)
+            button = 0
+            isDown = true
         case .leftMouseUp:
-            runtime.dispatchMouse(type: "mouseup", x: point.x, y: point.y)
-            runtime.dispatchMouse(type: "click", x: point.x, y: point.y)
+            button = 0
+            isDown = false
+        case .rightMouseDown:
+            button = 2
+            isDown = true
+        case .rightMouseUp:
+            button = 2
+            isDown = false
         default:
-            break
+            return
         }
+        let mask = button == 0 ? 1 : 2
+        let global = NSEvent.mouseLocation
+        if isDown {
+            guard desktopFrame.contains(global),
+                  let quartzPoint = event.cgEvent?.location,
+                  DesktopVisibility.isDesktopExposed(at: quartzPoint) else {
+                return
+            }
+            desktopPressedMouseButtons |= mask
+        } else {
+            guard desktopPressedMouseButtons & mask != 0 else { return }
+            desktopPressedMouseButtons &= ~mask
+        }
+        let point = localPoint(for: global)
+        dispatchMouseButton(button: button, isDown: isDown, point: point)
+    }
+
+    private func dispatchMouseButton(button: Int, isDown: Bool, point: CGPoint) {
+        runtime.dispatchMouse(
+            type: isDown ? "mousedown" : "mouseup",
+            x: point.x,
+            y: point.y,
+            button: button,
+            buttons: isDown ? (button == 2 ? 2 : 1) : 0
+        )
+        guard !isDown else { return }
+        if button == 2 {
+            runtime.dispatchMouse(
+                type: "contextmenu",
+                x: point.x,
+                y: point.y,
+                button: button,
+                buttons: 0
+            )
+        }
+        runtime.dispatchMouse(
+            type: "click",
+            x: point.x,
+            y: point.y,
+            button: button,
+            buttons: 0
+        )
     }
 
     private func localPoint(for global: CGPoint) -> CGPoint {
@@ -301,10 +397,26 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
         guard bounds.width > 0,
               bounds.height > 0,
               let descriptor = currentRenderPassDescriptor,
-              let drawable = currentDrawable else {
+              let drawable = currentDrawable,
+              let commandBuffer = metalContext.commandQueue.makeCommandBuffer(),
+              encode(
+                frame,
+                descriptor: descriptor,
+                commandBuffer: commandBuffer
+              ) else {
             return
         }
 
+        commandBuffer.present(drawable)
+        commandBuffer.commit()
+        renderSubmissionCount += 1
+    }
+
+    private func encode(
+        _ frame: CanvasMetalFrame,
+        descriptor: MTLRenderPassDescriptor,
+        commandBuffer: MTLCommandBuffer
+    ) -> Bool {
         descriptor.colorAttachments[0].loadAction = .clear
         descriptor.colorAttachments[0].clearColor = MTLClearColor(
             red: Double(frame.background.x),
@@ -312,9 +424,8 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
             blue: Double(frame.background.z),
             alpha: Double(frame.background.w)
         )
-        guard let commandBuffer = metalContext.commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
-            return
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+            return false
         }
 
         let (instances, batches) = makeInstances(frame.commands)
@@ -358,9 +469,7 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
         }
 
         encoder.endEncoding()
-        commandBuffer.present(drawable)
-        commandBuffer.commit()
-        renderSubmissionCount += 1
+        return true
     }
 
     private func makeInstances(

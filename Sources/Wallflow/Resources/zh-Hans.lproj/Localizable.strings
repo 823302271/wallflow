@@ -26,6 +26,7 @@
 "library.column.type" = "类型";
 "library.column.source" = "来源";
 "library.use" = "使用壁纸";
+"library.locate" = "重新定位壁纸...";
 "library.remove" = "移除";
 "library.reveal" = "在 Finder 中显示";
 "library.import" = "导入壁纸";
@@ -46,6 +47,11 @@
 "properties.option" = "选项";
 "properties.scheme_color" = "主题颜色";
 "properties.window_title" = "%@ 属性";
+"properties.fit_mode" = "显示方式";
+"properties.fit_mode.automatic" = "自动";
+"properties.fit_mode.fill" = "填充裁切";
+"properties.fit_mode.fit" = "完整显示";
+"properties.fit_mode.stretch" = "拉伸";
 "error.unsupported_selection" = "在 %@ 中没有找到受支持的 Wallpaper Engine 项目。";
 "error.malformed_manifest" = "无法读取 %@：%@";
 "error.unsupported_type" = "暂不支持“%@”类型的壁纸。";

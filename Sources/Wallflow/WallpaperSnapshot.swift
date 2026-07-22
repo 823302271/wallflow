@@ -1,8 +1,7 @@
 import AppKit
+import Metal
 
 enum WallpaperSnapshot {
-    private static let maximumPixelSize = CGSize(width: 1920, height: 1080)
-
     static func preparedImage(from image: NSImage) -> NSImage? {
         var sourceRect = CGRect(origin: .zero, size: image.size)
         guard let source = image.cgImage(
@@ -12,31 +11,9 @@ enum WallpaperSnapshot {
         ) else {
             return nil
         }
-
-        let scale = min(
-            1,
-            maximumPixelSize.width / CGFloat(source.width),
-            maximumPixelSize.height / CGFloat(source.height)
-        )
-        let width = max(1, Int((CGFloat(source.width) * scale).rounded()))
-        let height = max(1, Int((CGFloat(source.height) * scale).rounded()))
-        guard let context = CGContext(
-            data: nil,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            return nil
-        }
-        context.interpolationQuality = .high
-        context.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
-        guard let result = context.makeImage() else { return nil }
         return NSImage(
-            cgImage: result,
-            size: NSSize(width: width, height: height)
+            cgImage: source,
+            size: NSSize(width: source.width, height: source.height)
         )
     }
 
@@ -49,9 +26,52 @@ enum WallpaperSnapshot {
         ) else {
             return nil
         }
+        return pngData(from: cgImage)
+    }
+
+    static func pngData(from cgImage: CGImage) -> Data? {
         return NSBitmapImageRep(cgImage: cgImage).representation(
             using: .png,
             properties: [:]
+        )
+    }
+
+    static func image(fromBGRA8 texture: MTLTexture) -> NSImage? {
+        let width = texture.width
+        let height = texture.height
+        let bytesPerRow = width * 4
+        var pixels = Data(count: bytesPerRow * height)
+        pixels.withUnsafeMutableBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return }
+            texture.getBytes(
+                baseAddress,
+                bytesPerRow: bytesPerRow,
+                from: MTLRegionMake2D(0, 0, width, height),
+                mipmapLevel: 0
+            )
+        }
+        guard let provider = CGDataProvider(data: pixels as CFData),
+              let image = CGImage(
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: bytesPerRow,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: [
+                    CGBitmapInfo.byteOrder32Little,
+                    CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue)
+                ],
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ) else {
+            return nil
+        }
+        return NSImage(
+            cgImage: image,
+            size: NSSize(width: width, height: height)
         )
     }
 }

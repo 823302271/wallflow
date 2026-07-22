@@ -9,10 +9,16 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
     private var renderingEnabled = true
     private var playsAudio: Bool
     private var audioMuted = false
+    private var fitMode: WallpaperFitMode
 
     var contentView: NSView { self }
 
-    init(frame: CGRect, project: WallpaperProject, playsAudio: Bool) {
+    init(
+        frame: CGRect,
+        project: WallpaperProject,
+        playsAudio: Bool,
+        fitMode: WallpaperFitMode = .automatic
+    ) {
         guard let entryURL = project.entryURL else {
             preconditionFailure("Video wallpaper requires an entry URL")
         }
@@ -22,6 +28,7 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
         item.preferredForwardBufferDuration = 3
         item.preferredMaximumResolution = CGSize(width: 1920, height: 1080)
         self.playsAudio = playsAudio
+        self.fitMode = fitMode
         looper = AVPlayerLooper(player: player, templateItem: item)
 
         super.init(frame: frame)
@@ -29,7 +36,7 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
         playerLayer.player = player
-        playerLayer.videoGravity = .resizeAspectFill
+        applyFitMode()
         layer?.addSublayer(playerLayer)
 
         player.actionAtItemEnd = .none
@@ -65,6 +72,12 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
     func setPlaysAudio(_ enabled: Bool) {
         playsAudio = enabled
         updateAudioState()
+    }
+
+    func setFitMode(_ fitMode: WallpaperFitMode) {
+        guard fitMode != self.fitMode else { return }
+        self.fitMode = fitMode
+        applyFitMode()
     }
 
     func updateDesktopFrame(_ frame: CGRect) {}
@@ -105,5 +118,17 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
 
     private func updateAudioState() {
         player.isMuted = audioMuted || !playsAudio
+    }
+
+    private func applyFitMode() {
+        playerLayer.videoGravity = switch fitMode {
+        case .automatic, .fill: .resizeAspectFill
+        case .fit: .resizeAspect
+        case .stretch: .resize
+        }
+    }
+
+    var videoGravityForTesting: AVLayerVideoGravity {
+        playerLayer.videoGravity
     }
 }

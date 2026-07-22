@@ -15,7 +15,9 @@ enum WallflowSelfTestError: Error, CustomStringConvertible {
 enum WallflowSelfTest {
     static func run() throws {
         try testLocalizationResources()
+        try testWallpaperSnapshotPreservesResolution()
         try testDesktopVisibilityRules()
+        try testLocalWallpaperImportIsPersistent()
         try testWallpaperLibrary()
         try testWebManifest()
         try testCanvasMetalSelection()
@@ -56,6 +58,39 @@ enum WallflowSelfTest {
                 "Koi Pond"
             ) == "Koi Pond 属性",
             "Localized format string was not resolved"
+        )
+    }
+
+    private static func testWallpaperSnapshotPreservesResolution() throws {
+        let width = 2560
+        let height = 1600
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ), let source = context.makeImage() else {
+            throw WallflowSelfTestError.failed("Could not create snapshot fixture")
+        }
+        let image = NSImage(
+            cgImage: source,
+            size: NSSize(width: width, height: height)
+        )
+        guard let prepared = WallpaperSnapshot.preparedImage(from: image) else {
+            throw WallflowSelfTestError.failed("Wallpaper snapshot preparation failed")
+        }
+        var proposedRect = CGRect(origin: .zero, size: prepared.size)
+        let preparedImage = prepared.cgImage(
+            forProposedRect: &proposedRect,
+            context: nil,
+            hints: nil
+        )
+        try expect(
+            preparedImage?.width == width && preparedImage?.height == height,
+            "Wallpaper snapshot resolution was reduced"
         )
     }
 
@@ -115,6 +150,44 @@ enum WallflowSelfTest {
         )
     }
 
+    private static func testLocalWallpaperImportIsPersistent() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceRoot = directory.appendingPathComponent("Source", isDirectory: true)
+        let importedRoot = directory.appendingPathComponent("Imported", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: sourceRoot,
+            withIntermediateDirectories: true
+        )
+        try "<!doctype html><title>Persistent</title>".write(
+            to: sourceRoot.appendingPathComponent("index.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try """
+        { "file": "index.html", "type": "web", "title": "Persistent Import" }
+        """.write(
+            to: sourceRoot.appendingPathComponent("project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let service = WallpaperImportService(importedRootURL: importedRoot)
+        let installedURL = try service.installLocalProject(sourceRoot)
+        try expect(
+            installedURL.standardizedFileURL.path.hasPrefix(
+                importedRoot.standardizedFileURL.path + "/"
+            ),
+            "Local wallpaper was not copied into Wallflow storage"
+        )
+        try FileManager.default.removeItem(at: sourceRoot)
+        let project = try WallpaperProjectLoader.load(installedURL)
+        try expect(
+            project.displayTitle == "Persistent Import",
+            "Installed wallpaper depended on its deleted source"
+        )
+    }
+
     private static func testWallpaperLibrary() throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -154,12 +227,42 @@ enum WallflowSelfTest {
         )
         try expect(entry.title == "Library Fixture", "Wallpaper title was not persisted")
         try expect(library.isManaged(entry), "Managed wallpaper was classified as external")
+        try expect(entry.fitMode == .automatic, "New wallpaper did not default to automatic fit")
+
+        try expect(
+            library.setFitMode(.fit, for: try WallpaperProjectLoader.load(installRoot)),
+            "Wallpaper fit mode could not be updated"
+        )
 
         let reloaded = WallpaperLibrary(
             defaults: defaults,
             importedRootURL: importedRoot
         )
         try expect(reloaded.entries.count == 1, "Wallpaper library entry was duplicated")
+        try expect(
+            reloaded.entries.first?.fitMode == .fit,
+            "Wallpaper fit mode was not persisted"
+        )
+
+        let legacyData = Data(
+            """
+            {
+              "id": "\(UUID().uuidString)",
+              "source": "/tmp/legacy/project.json",
+              "title": "Legacy",
+              "kind": "web",
+              "addedAt": 0
+            }
+            """.utf8
+        )
+        let legacyEntry = try JSONDecoder().decode(
+            WallpaperLibraryEntry.self,
+            from: legacyData
+        )
+        try expect(
+            legacyEntry.fitMode == .automatic,
+            "Legacy wallpaper entry did not migrate to automatic fit"
+        )
         try reloaded.remove(entry, deleteManagedFiles: true)
         try expect(
             !FileManager.default.fileExists(atPath: installRoot.path),

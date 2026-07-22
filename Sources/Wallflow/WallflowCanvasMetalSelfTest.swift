@@ -75,6 +75,16 @@ final class WallflowCanvasMetalSelfTest {
             )
             view.dispatchMouseForTesting(type: "mousemove", x: 120, y: 90)
             view.dispatchMouseForTesting(type: "click", x: 120, y: 90)
+            let foodCountBeforeRightClick = try integer(
+                from: view.evaluateJavaScriptForTesting("foods.length")
+            )
+            view.dispatchMouseButtonForTesting(button: 2, x: 180, y: 120)
+            let foodCountAfterRightClick = try integer(
+                from: view.evaluateJavaScriptForTesting("foods.length")
+            )
+            guard foodCountAfterRightClick > foodCountBeforeRightClick else {
+                throw WallflowSelfTestError.failed("Canvas Metal right click did not feed Koi")
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
                 self?.verifyPropertiesAndInput()
             }
@@ -105,14 +115,64 @@ final class WallflowCanvasMetalSelfTest {
                         + "ripple=\(rippleCount)"
                 )
             }
-            view.setRenderingEnabled(false)
-            pausedTime = view.virtualTimeForTesting
-            pausedSubmissionCount = view.renderSubmissionCountForTesting
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-                self?.verifyPausedState()
+            var completedSynchronously = false
+            view.captureFrame { [weak self, weak view] image in
+                guard let self, let view else { return }
+                do {
+                    guard completedSynchronously else {
+                        throw WallflowSelfTestError.failed(
+                            "Canvas Metal snapshot blocked the main thread"
+                        )
+                    }
+                    try self.verifySnapshot(image, view: view)
+                    view.setRenderingEnabled(false)
+                    self.pausedTime = view.virtualTimeForTesting
+                    self.pausedSubmissionCount = view.renderSubmissionCountForTesting
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                        self?.verifyPausedState()
+                    }
+                } catch {
+                    self.finish(.failure(error))
+                }
             }
+            completedSynchronously = true
         } catch {
             finish(.failure(error))
+        }
+    }
+
+    private func verifySnapshot(
+        _ image: NSImage?,
+        view: CanvasMetalWallpaperView
+    ) throws {
+        guard let image else {
+            throw WallflowSelfTestError.failed("Canvas Metal snapshot was missing")
+        }
+        var rect = CGRect(origin: .zero, size: image.size)
+        guard let cgImage = image.cgImage(
+            forProposedRect: &rect,
+            context: nil,
+            hints: nil
+        ), cgImage.width == Int(view.drawableSize.width.rounded()),
+           cgImage.height == Int(view.drawableSize.height.rounded()),
+           let data = cgImage.dataProvider?.data as Data? else {
+            throw WallflowSelfTestError.failed(
+                "Canvas Metal snapshot did not preserve the drawable"
+            )
+        }
+        let containsVisibleColor = data.withUnsafeBytes { bytes in
+            let pixels = bytes.bindMemory(to: UInt8.self)
+            guard pixels.count >= 4 else { return false }
+            let stride = max(4, (pixels.count / 2048 / 4) * 4)
+            for offset in Swift.stride(from: 0, to: pixels.count - 3, by: stride) {
+                if pixels[offset] > 2 || pixels[offset + 1] > 2 || pixels[offset + 2] > 2 {
+                    return true
+                }
+            }
+            return false
+        }
+        guard containsVisibleColor else {
+            throw WallflowSelfTestError.failed("Canvas Metal snapshot was black")
         }
     }
 
@@ -139,9 +199,14 @@ final class WallflowCanvasMetalSelfTest {
     private func verifyResumedState() {
         guard let view = wallpaperView,
               view.schedulerActiveForTesting,
-              view.virtualTimeForTesting > pausedTime else {
+              view.virtualTimeForTesting > pausedTime,
+              view.virtualTimeForTesting - pausedTime < 400 else {
             finish(
-                .failure(WallflowSelfTestError.failed("Canvas Metal resume did not advance time"))
+                .failure(
+                    WallflowSelfTestError.failed(
+                        "Canvas Metal resume jumped to a future frame"
+                    )
+                )
             )
             return
         }
