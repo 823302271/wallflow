@@ -2,7 +2,9 @@ import AppKit
 
 protocol WallpaperRenderer: AnyObject {
     var contentView: NSView { get }
-    func setRenderingEnabled(_ enabled: Bool)
+    /// Enable/disable rendering. When enabling, `completion` runs once the
+    /// surface is ready to show (e.g. after a precise video seek).
+    func setRenderingEnabled(_ enabled: Bool, completion: (() -> Void)?)
     func setAudioMuted(_ muted: Bool)
     func setPlaysAudio(_ enabled: Bool)
     func setFitMode(_ fitMode: WallpaperFitMode)
@@ -13,6 +15,10 @@ protocol WallpaperRenderer: AnyObject {
 }
 
 extension WallpaperRenderer {
+    func setRenderingEnabled(_ enabled: Bool) {
+        setRenderingEnabled(enabled, completion: nil)
+    }
+
     func setAudioMuted(_ muted: Bool) {}
     func setPlaysAudio(_ enabled: Bool) {}
     func setFitMode(_ fitMode: WallpaperFitMode) {}
@@ -38,6 +44,12 @@ extension WallpaperRenderer {
 
 extension WallpaperMetalView: WallpaperRenderer {
     var contentView: NSView { self }
+
+    func setRenderingEnabled(_ enabled: Bool, completion: (() -> Void)?) {
+        // Built-in view pauses its display link via the existing Bool API.
+        setRenderingEnabled(enabled)
+        completion?()
+    }
 
     func prepareForPresentation() {
         displayIfNeeded()

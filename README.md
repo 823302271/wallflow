@@ -30,7 +30,7 @@ Wallpaper Engine web and scene compatibility.
 - Rendering suspension when visible app windows collectively hide a display's desktop
 - Automatic suspension during sleep and inactive login sessions
 - Incremental display reconciliation without restarting retained-screen renderers
-- A paused last frame retained by the same renderer during Space transitions
+- Per-display Space handling: only the hidden display pauses and keeps its last frame; other displays keep playing
 - Menu bar pause and resume controls
 - Default-on pause only when a display's desktop is fully hidden
 - Persistent wallpaper library with switching, reveal, and uninstall actions
@@ -65,7 +65,7 @@ Implemented:
 - `window.wallpaperPropertyListener.applyUserProperties`
 - `applyGeneralProperties` with the host FPS target
 - `setPaused` plus a frozen frame while rendering is suspended
-- Synthetic DOM mouse move, pointer move, left click, and right click events
+- Synthetic DOM mouse move, pointer move, and left click events; right clicks are left to the system desktop menu
 - Media autoplay and remote web content access
 - Registration shims for audio and media listeners
 - Native property editor for checkbox, slider, color, combo, text, file, and directory values

@@ -87,8 +87,11 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         stopInputBridge()
     }
 
-    func setRenderingEnabled(_ enabled: Bool) {
-        guard enabled != isRenderingEnabled else { return }
+    func setRenderingEnabled(_ enabled: Bool, completion: (() -> Void)?) {
+        if enabled == isRenderingEnabled {
+            completion?()
+            return
+        }
         isRenderingEnabled = enabled
         presentationGeneration += 1
         let generation = presentationGeneration
@@ -108,6 +111,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
                     }
                     self.callPropertyListener("setPaused", argument: "false")
                     self.startInputBridge()
+                    completion?()
                 }
             }
         } else {
@@ -115,6 +119,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
             callPropertyListener("setPaused", argument: "true")
             webView.setAllMediaPlaybackSuspended(true, completionHandler: nil)
             setHostAnimationPaused(true)
+            completion?()
         }
     }
 
@@ -259,11 +264,11 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         }
 
         if globalMouseMonitor == nil {
+            // Only left-click is bridged into the wallpaper. Right-click is left to the
+            // system (Finder desktop menu / apps) and must never be obstructed.
             let eventMask: NSEvent.EventTypeMask = [
                 .leftMouseDown,
-                .leftMouseUp,
-                .rightMouseDown,
-                .rightMouseUp
+                .leftMouseUp
             ]
             globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: eventMask) {
                 [weak self] event in
@@ -316,25 +321,16 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
     }
 
     private func handleMonitoredMouseButton(_ event: NSEvent) {
-        let button: Int
         let isDown: Bool
         switch event.type {
         case .leftMouseDown:
-            button = 0
             isDown = true
         case .leftMouseUp:
-            button = 0
-            isDown = false
-        case .rightMouseDown:
-            button = 2
-            isDown = true
-        case .rightMouseUp:
-            button = 2
             isDown = false
         default:
             return
         }
-        let mask = button == 0 ? 1 : 2
+        let mask = 1
         let stateAlreadyHandled = (lastPressedMouseButtons & mask != 0) == isDown
         if isDown {
             lastPressedMouseButtons |= mask
@@ -344,7 +340,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         guard !stateAlreadyHandled else { return }
 
         dispatchDesktopMouseButtonIfNeeded(
-            button: button,
+            button: 0,
             isDown: isDown,
             globalLocation: NSEvent.mouseLocation,
             quartzPoint: event.cgEvent?.location
@@ -352,27 +348,19 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
     }
 
     private func pollMouseButtons(globalLocation: CGPoint) {
-        let current = NSEvent.pressedMouseButtons
-        let changed = current ^ lastPressedMouseButtons
-        lastPressedMouseButtons = current
+        // Only track the primary button so secondary/right clicks stay with the system.
+        let current = NSEvent.pressedMouseButtons & 1
+        let previous = lastPressedMouseButtons & 1
+        let changed = current ^ previous
+        lastPressedMouseButtons = (lastPressedMouseButtons & ~1) | current
         guard changed != 0 else { return }
         let quartzPoint = CGEvent(source: nil)?.location
-        if changed & 1 != 0 {
-            dispatchDesktopMouseButtonIfNeeded(
-                button: 0,
-                isDown: current & 1 != 0,
-                globalLocation: globalLocation,
-                quartzPoint: quartzPoint
-            )
-        }
-        if changed & 2 != 0 {
-            dispatchDesktopMouseButtonIfNeeded(
-                button: 2,
-                isDown: current & 2 != 0,
-                globalLocation: globalLocation,
-                quartzPoint: quartzPoint
-            )
-        }
+        dispatchDesktopMouseButtonIfNeeded(
+            button: 0,
+            isDown: current != 0,
+            globalLocation: globalLocation,
+            quartzPoint: quartzPoint
+        )
     }
 
     private func dispatchDesktopMouseButtonIfNeeded(
@@ -620,10 +608,8 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         };
         const target = document.elementFromPoint(x, y) || document;
         target.dispatchEvent(new MouseEvent(type, options));
+        // Left-click only. Right-click / contextmenu stay with macOS (desktop icons).
         if (type === 'mouseup' && button === 0) {
-          target.dispatchEvent(new MouseEvent('click', options));
-        } else if (type === 'mouseup' && button === 2) {
-          target.dispatchEvent(new MouseEvent('contextmenu', options));
           target.dispatchEvent(new MouseEvent('click', options));
         }
         if (type === 'mousemove' && typeof PointerEvent !== 'undefined') {

@@ -70,8 +70,11 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
         layoutSceneLayers()
     }
 
-    func setRenderingEnabled(_ enabled: Bool) {
-        guard enabled != isRenderingEnabled else { return }
+    func setRenderingEnabled(_ enabled: Bool, completion: (() -> Void)?) {
+        if enabled == isRenderingEnabled {
+            completion?()
+            return
+        }
         isRenderingEnabled = enabled
         if enabled {
             resumeLayerAnimations()
@@ -83,6 +86,7 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
             pauseLayerAnimations()
             audioController?.setRenderingEnabled(false)
         }
+        completion?()
     }
 
     func setAudioMuted(_ muted: Bool) {

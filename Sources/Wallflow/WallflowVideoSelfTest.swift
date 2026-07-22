@@ -74,15 +74,31 @@ final class WallflowVideoSelfTest {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             guard let self, let view = self.wallpaperView else { return }
             let movement = abs(view.playbackTimeForTesting - pausedTime)
-            guard movement < 0.08 else {
+            guard movement < 0.08, view.isPlaybackPausedForTesting else {
                 self.finish(
                     .failure(WallflowSelfTestError.failed("Video continued while paused"))
                 )
                 return
             }
+            // Resume must continue from the paused time, not a future keyframe.
             view.setRenderingEnabled(true)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-                self?.verifyResumeAndSnapshot(previousTime: pausedTime)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                guard let self, let view = self.wallpaperView else { return }
+                let resumeTime = view.playbackTimeForTesting
+                guard resumeTime + 0.05 >= pausedTime,
+                      resumeTime <= pausedTime + 0.35 else {
+                    self.finish(
+                        .failure(
+                            WallflowSelfTestError.failed(
+                                "Video resumed from a future frame (\(resumeTime) vs \(pausedTime))"
+                            )
+                        )
+                    )
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    self?.verifyResumeAndSnapshot(previousTime: pausedTime)
+                }
             }
         }
     }
@@ -93,6 +109,8 @@ final class WallflowVideoSelfTest {
             finish(.failure(WallflowSelfTestError.failed("Video did not resume")))
             return
         }
+        view.setRenderingEnabled(false)
+        let secondPause = view.playbackTimeForTesting
         view.captureFrame { [weak self] image in
             guard let self else { return }
             guard let image, image.size.width > 0, image.size.height > 0 else {
@@ -101,7 +119,21 @@ final class WallflowVideoSelfTest {
                 )
                 return
             }
-            self.finish(.success(()))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                guard let self, let view = self.wallpaperView else { return }
+                let drift = abs(view.playbackTimeForTesting - secondPause)
+                guard drift < 0.08 else {
+                    self.finish(
+                        .failure(
+                            WallflowSelfTestError.failed(
+                                "Video advanced after pause while capturing desktop frame"
+                            )
+                        )
+                    )
+                    return
+                }
+                self.finish(.success(()))
+            }
         }
     }
 

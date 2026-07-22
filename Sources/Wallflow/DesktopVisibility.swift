@@ -1,7 +1,10 @@
+import AppKit
 import CoreGraphics
 import Foundation
 
 enum DesktopVisibility {
+    /// Application windows that can cover the desktop wallpaper.
+    /// Uses Quartz global coordinates (same as `CGDisplayBounds` / `CGWindowList`).
     static func visibleApplicationWindowBounds() -> [CGRect] {
         let options: CGWindowListOption = [
             .optionOnScreenOnly,
@@ -15,24 +18,62 @@ enum DesktopVisibility {
         }
 
         let ownPID = ProcessInfo.processInfo.processIdentifier
+        // Layer 0 is normal app content. Full-screen and some utility windows can sit
+        // slightly above 0 but still fully cover the desktop; ignore menu bar / dock
+        // (typically 20+) and screensaver layers.
+        let maxCoveringLayer = 15
         return windowInfo.compactMap { info in
             let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
             let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue
             let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
             guard ownerPID != ownPID,
-                  layer == 0,
+                  let layer,
+                  layer >= 0,
+                  layer <= maxCoveringLayer,
                   alpha > 0.01,
-                  let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary else {
+                  let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(
+                      dictionaryRepresentation: boundsDictionary as CFDictionary
+                  ),
+                  bounds.width > 1,
+                  bounds.height > 1 else {
                 return nil
             }
-            return CGRect(dictionaryRepresentation: boundsDictionary as CFDictionary)
+            return bounds
         }
+    }
+
+    /// Quartz bounds of the usable desktop on a display (menu bar / dock excluded when present).
+    static func desktopQuartzBounds(
+        displayID: CGDirectDisplayID,
+        screen: NSScreen
+    ) -> CGRect {
+        let displayBounds = CGDisplayBounds(displayID)
+        // Prefer converting the Cocoa visibleFrame into Quartz space so multi-monitor
+        // layouts (above/below/primary offset) stay correct on secondary displays.
+        let visible = quartzRect(fromCocoaRect: screen.visibleFrame)
+        let intersection = visible.intersection(displayBounds)
+        if intersection.isNull || intersection.width < 8 || intersection.height < 8 {
+            return displayBounds
+        }
+        return intersection
+    }
+
+    /// Convert a Cocoa global rect (bottom-left origin) to Quartz global rect (top-left origin).
+    static func quartzRect(fromCocoaRect rect: CGRect) -> CGRect {
+        let mainHeight = CGDisplayBounds(CGMainDisplayID()).height
+        return CGRect(
+            x: rect.origin.x,
+            y: mainHeight - rect.origin.y - rect.size.height,
+            width: rect.size.width,
+            height: rect.size.height
+        )
     }
 
     static func isDisplayHidden(
         _ screenBounds: CGRect,
         by windowBounds: [CGRect],
-        coverageThreshold: CGFloat = 0.999
+        coverageThreshold: CGFloat = 0.985
     ) -> Bool {
         let screenArea = screenBounds.width * screenBounds.height
         guard screenArea > 0 else { return false }

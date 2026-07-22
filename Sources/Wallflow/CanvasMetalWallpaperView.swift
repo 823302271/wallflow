@@ -123,8 +123,11 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
         updateDrawableSize()
     }
 
-    func setRenderingEnabled(_ enabled: Bool) {
-        guard enabled != isRenderingEnabled else { return }
+    func setRenderingEnabled(_ enabled: Bool, completion: (() -> Void)?) {
+        if enabled == isRenderingEnabled {
+            completion?()
+            return
+        }
         isRenderingEnabled = enabled
         if enabled {
             startScheduler()
@@ -133,6 +136,7 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
             stopScheduler()
             stopInputBridge()
         }
+        completion?()
     }
 
     func updateDesktopFrame(_ frame: CGRect) {
@@ -276,8 +280,9 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
 
     private func startInputBridge() {
         guard isRenderingEnabled, globalMouseMonitor == nil else { return }
+        // Left-click only so Finder desktop right-click menus are never obstructed.
         globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp]
+            matching: [.leftMouseDown, .leftMouseUp]
         ) { [weak self] event in
             DispatchQueue.main.async {
                 self?.handleMouseButton(event)
@@ -316,25 +321,16 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
     }
 
     private func handleMouseButton(_ event: NSEvent) {
-        let button: Int
         let isDown: Bool
         switch event.type {
         case .leftMouseDown:
-            button = 0
             isDown = true
         case .leftMouseUp:
-            button = 0
-            isDown = false
-        case .rightMouseDown:
-            button = 2
-            isDown = true
-        case .rightMouseUp:
-            button = 2
             isDown = false
         default:
             return
         }
-        let mask = button == 0 ? 1 : 2
+        let mask = 1
         let global = NSEvent.mouseLocation
         if isDown {
             guard desktopFrame.contains(global),
@@ -348,7 +344,7 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
             desktopPressedMouseButtons &= ~mask
         }
         let point = localPoint(for: global)
-        dispatchMouseButton(button: button, isDown: isDown, point: point)
+        dispatchMouseButton(button: 0, isDown: isDown, point: point)
     }
 
     private func dispatchMouseButton(button: Int, isDown: Bool, point: CGPoint) {
@@ -357,18 +353,9 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
             x: point.x,
             y: point.y,
             button: button,
-            buttons: isDown ? (button == 2 ? 2 : 1) : 0
+            buttons: isDown ? 1 : 0
         )
         guard !isDown else { return }
-        if button == 2 {
-            runtime.dispatchMouse(
-                type: "contextmenu",
-                x: point.x,
-                y: point.y,
-                button: button,
-                buttons: 0
-            )
-        }
         runtime.dispatchMouse(
             type: "click",
             x: point.x,

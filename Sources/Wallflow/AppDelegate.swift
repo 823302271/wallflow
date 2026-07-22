@@ -21,9 +21,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var displayConfigurationSignature = ""
     private var coverageEvaluationGeneration = 0
     private var coverageWatchdog: Timer?
-    private var displaysAwaitingSpaceCompletion: Set<CGDirectDisplayID> = []
-    private var spaceCompletionFallbackGeneration: [CGDirectDisplayID: Int] = [:]
     private var fallbackRefreshGeneration = 0
+    /// Per-display resume debounce so brief Space-transition "visible" blips
+    /// cannot start the playhead and produce a future-frame jump.
+    private var resumeDebounceGeneration: [CGDirectDisplayID: Int] = [:]
     private var didFinishLaunching = false
     private var pendingOpenURLs: [URL] = []
     private let importService = WallpaperImportService()
@@ -220,7 +221,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func screenConfigurationChanged(_ notification: Notification) {
         let signature = Self.currentDisplayConfigurationSignature()
         guard signature != displayConfigurationSignature else {
-            prepareWallpaperWindowsForPresentation()
+            // Geometry-only change: re-layer each window without pausing others.
+            wallpaperControllers.forEach { $0.ensureDesktopLayering() }
             return
         }
         reconcileWallpaperWindows()
@@ -232,12 +234,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func activeSpaceChanged(_ notification: Notification) {
+        // Space changes are global notifications, but visibility must be applied
+        // per display. Never freeze/resume every screen when only one Space moved.
         NSLog("Wallflow active Space changed")
-        prepareWallpaperWindowsForPresentation()
-        displaysAwaitingSpaceCompletion.removeAll()
-        evaluateForegroundCoverage(allowResume: true)
-        scheduleForegroundCoverageEvaluation(after: 0.25)
-        scheduleFallbackRefresh(delay: 0.8)
+        evaluateForegroundCoverage()
+        scheduleForegroundCoverageEvaluation(after: 0.2)
+        scheduleForegroundCoverageEvaluation(after: 0.6)
     }
 
     @objc private func wallpaperWindowOcclusionChanged(_ notification: Notification) {
@@ -249,11 +251,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               }) else {
             return
         }
+        // Occlusion is already per-window / per-display.
         if window.occlusionState.contains(.visible) {
-            evaluateForegroundCoverage()
+            evaluateForegroundCoverage(for: controller)
         } else {
-            displaysAwaitingSpaceCompletion.remove(controller.displayID)
-            applyDesktopHidden(true, to: controller)
+            requestDesktopHidden(true, for: controller)
         }
     }
 
@@ -283,8 +285,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func systemDidResume(_ notification: Notification) {
         isSystemSuspended = false
-        prepareWallpaperWindowsForPresentation()
+        wallpaperControllers.forEach { $0.ensureDesktopLayering() }
         applyRenderingState()
+        evaluateForegroundCoverage()
         scheduleFallbackRefresh(delay: 0.8)
     }
 
@@ -481,12 +484,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         displayConfigurationSignature = Self.currentDisplayConfigurationSignature()
         let previousControllers = wallpaperControllers
         let newControllers = NSScreen.screens.enumerated().map { index, screen in
-            DesktopWindowController(
-                screen: screen,
-                project: currentProject,
-                playsAudio: index == 0,
-                fitMode: currentFitMode
-            )
+            makeDesktopController(screen: screen, playsAudio: index == 0)
         }
         wallpaperControllers = newControllers
         applyRenderingState()
@@ -495,6 +493,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wallpaperControllers.forEach { $0.prepareForPresentation() }
         previousControllers.forEach { $0.close() }
         evaluateForegroundCoverage()
+        // Seed a desktop still for each screen after first paint.
         scheduleFallbackRefresh()
     }
 
@@ -518,12 +517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 reusedCount += 1
             } else {
                 nextControllers.append(
-                    DesktopWindowController(
-                        screen: screen,
-                        project: currentProject,
-                        playsAudio: index == 0,
-                        fitMode: currentFitMode
-                    )
+                    makeDesktopController(screen: screen, playsAudio: index == 0)
                 )
             }
         }
@@ -546,8 +540,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    private func prepareWallpaperWindowsForPresentation() {
-        wallpaperControllers.forEach { $0.prepareForSpacePresentation() }
+    private func makeDesktopController(
+        screen: NSScreen,
+        playsAudio: Bool
+    ) -> DesktopWindowController {
+        let controller = DesktopWindowController(
+            screen: screen,
+            project: currentProject,
+            playsAudio: playsAudio,
+            fitMode: currentFitMode
+        )
+        bindPausedFrameHandler(to: controller)
+        return controller
+    }
+
+    private func bindPausedFrameHandler(to controller: DesktopWindowController) {
+        controller.onPausedFrameCaptured = { [weak self, weak controller] image in
+            guard let self, let controller else { return }
+            self.desktopFallbackManager.update(
+                image: image,
+                for: controller.screen,
+                displayID: controller.displayID
+            )
+        }
     }
 
     private func applyRenderingState() {
@@ -564,40 +579,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         muteMenuItem?.title = isAudioMuted ? L10n.text(.unmuteAudio) : L10n.text(.muteAudio)
     }
 
-    private func evaluateForegroundCoverage(allowResume: Bool = false) {
+    /// Recompute desktop visibility. When `target` is set, only that display is updated.
+    private func evaluateForegroundCoverage(
+        for target: DesktopWindowController? = nil
+    ) {
+        let controllers = target.map { [$0] } ?? wallpaperControllers
         guard automaticallyPauseCoveredDisplays, pauseWhenDesktopHidden else {
-            displaysAwaitingSpaceCompletion.removeAll()
-            wallpaperControllers.forEach { $0.setDesktopHidden(false) }
+            controllers.forEach { requestDesktopHidden(false, for: $0) }
             return
         }
         let windowBounds = DesktopVisibility.visibleApplicationWindowBounds()
-        for controller in wallpaperControllers {
-            let screenBounds = controller.desktopVisibilityBounds
-            let isDesktopHidden = DesktopVisibility.isDisplayHidden(
+        for controller in controllers {
+            // Refresh Quartz bounds in case the display layout moved.
+            let screenBounds = DesktopVisibility.desktopQuartzBounds(
+                displayID: controller.displayID,
+                screen: controller.screen
+            )
+            let coveredByWindows = DesktopVisibility.isDisplayHidden(
                 screenBounds,
                 by: windowBounds
             )
-            if !isDesktopHidden, controller.isDesktopHidden, !allowResume {
-                controller.prepareForPresentation()
-                holdResumeUntilSpaceCompletion(for: controller.displayID)
-                continue
-            }
-            applyDesktopHidden(isDesktopHidden, to: controller)
+            // Occluded (full-screen Space, or window not on this Space) => hidden.
+            let isDesktopHidden = coveredByWindows || !controller.isWindowVisible
+            requestDesktopHidden(isDesktopHidden, for: controller)
         }
     }
 
-    private func holdResumeUntilSpaceCompletion(for displayID: CGDirectDisplayID) {
-        guard displaysAwaitingSpaceCompletion.insert(displayID).inserted else { return }
-        let generation = (spaceCompletionFallbackGeneration[displayID] ?? 0) + 1
-        spaceCompletionFallbackGeneration[displayID] = generation
-        NSLog("Wallflow display %u waiting for Space completion", displayID)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+    /// Pause immediately; resume only after a short per-display stable period.
+    private func requestDesktopHidden(
+        _ hidden: Bool,
+        for controller: DesktopWindowController
+    ) {
+        let displayID = controller.displayID
+        if hidden {
+            // Cancel any pending resume and pause right away so the playhead freezes.
+            resumeDebounceGeneration[displayID, default: 0] += 1
+            applyDesktopHidden(true, to: controller)
+            return
+        }
+
+        // Already live — nothing to do.
+        if !controller.isDesktopHidden {
+            return
+        }
+
+        let generation = (resumeDebounceGeneration[displayID] ?? 0) + 1
+        resumeDebounceGeneration[displayID] = generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) { [weak self, weak controller] in
             guard let self,
-                  self.spaceCompletionFallbackGeneration[displayID] == generation,
-                  self.displaysAwaitingSpaceCompletion.remove(displayID) != nil else {
+                  let controller,
+                  self.resumeDebounceGeneration[displayID] == generation else {
                 return
             }
-            self.evaluateForegroundCoverage(allowResume: true)
+            // Re-check this display only — do not let a stale resume fire after re-hide.
+            let windowBounds = DesktopVisibility.visibleApplicationWindowBounds()
+            let screenBounds = DesktopVisibility.desktopQuartzBounds(
+                displayID: controller.displayID,
+                screen: controller.screen
+            )
+            let stillHidden = DesktopVisibility.isDisplayHidden(
+                screenBounds,
+                by: windowBounds
+            ) || !controller.isWindowVisible
+            guard !stillHidden else {
+                self.applyDesktopHidden(true, to: controller)
+                return
+            }
+            self.applyDesktopHidden(false, to: controller)
         }
     }
 

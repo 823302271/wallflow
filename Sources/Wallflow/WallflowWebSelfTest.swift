@@ -280,8 +280,6 @@ final class WallflowWebSelfTest {
         window.__wallflowDispatchMouse('mousemove', 41, 73, 0, 0);
         window.__wallflowDispatchMouse('mousedown', 41, 73, 0, 1);
         window.__wallflowDispatchMouse('mouseup', 41, 73, 0, 0);
-        window.__wallflowDispatchMouse('mousedown', 41, 73, 2, 2);
-        window.__wallflowDispatchMouse('mouseup', 41, 73, 2, 0);
         JSON.stringify({ mouse: window.__wallflowProbe.mouse, clicks: window.__wallflowProbe.clicks, contextmenus: window.__wallflowProbe.contextmenus });
         """
         wallpaperView?.evaluateJavaScriptForTesting(script) { [weak self] value, error in
@@ -296,8 +294,8 @@ final class WallflowWebSelfTest {
                   let mouse = result["mouse"] as? [String: Any],
                   (mouse["x"] as? NSNumber)?.intValue == 41,
                   (mouse["y"] as? NSNumber)?.intValue == 73,
-                  (result["clicks"] as? NSNumber)?.intValue == 2,
-                  (result["contextmenus"] as? NSNumber)?.intValue == 1 else {
+                  (result["clicks"] as? NSNumber)?.intValue == 1,
+                  (result["contextmenus"] as? NSNumber)?.intValue == 0 else {
                 self.finish(
                     .failure(
                         WallflowSelfTestError.failed(

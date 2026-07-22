@@ -47,6 +47,10 @@ private final class DesktopPresentationView: NSView {
     func hideFrozenFrame() {
         frozenImageView.isHidden = true
     }
+
+    var isShowingFrozenFrame: Bool {
+        !frozenImageView.isHidden && frozenImageView.image != nil
+    }
 }
 
 final class DesktopWindowController {
@@ -57,6 +61,9 @@ final class DesktopWindowController {
     private let wallpaperRenderer: WallpaperRenderer
     private let presentationView: DesktopPresentationView
     private var requestedRenderingEnabled = true
+    /// Live surface (video/canvas) only runs when this is true.
+    /// Kept false under the freeze overlay so playhead cannot advance ahead of the still.
+    private var isLiveSurfaceEnabled = true
     private var frozenFrame: NSImage?
     private var presentationGeneration = 0
     private var frameCaptureGeneration = 0
@@ -65,6 +72,9 @@ final class DesktopWindowController {
     let displayID: CGDirectDisplayID
     private(set) var displayBounds: CGRect
     private(set) var desktopVisibilityBounds: CGRect
+
+    /// Invoked when this display pauses and a fresh still frame is available.
+    var onPausedFrameCaptured: ((NSImage) -> Void)?
 
     init(
         screen: NSScreen,
@@ -96,10 +106,10 @@ final class DesktopWindowController {
         self.presentationView = presentationView
         self.screen = screen
         self.displayID = displayID
-        displayBounds = displayID == 0 ? screen.frame : CGDisplayBounds(displayID)
-        desktopVisibilityBounds = Self.desktopVisibilityBounds(
-            for: screen,
-            displayBounds: displayBounds
+        displayBounds = CGDisplayBounds(displayID)
+        desktopVisibilityBounds = DesktopVisibility.desktopQuartzBounds(
+            displayID: displayID,
+            screen: screen
         )
 
         window.title = "Wallflow Renderer"
@@ -113,15 +123,17 @@ final class DesktopWindowController {
         window.isOpaque = true
         window.hasShadow = false
         window.ignoresMouseEvents = true
+        window.acceptsMouseMovedEvents = false
         window.isReleasedWhenClosed = false
         window.animationBehavior = .none
         window.hidesOnDeactivate = false
         window.canHide = false
         window.level = Self.wallpaperLevel
+        // Do NOT use .fullScreenAuxiliary — that keeps the wallpaper alive on
+        // full-screen Spaces (especially secondary displays) so it never pauses.
         window.collectionBehavior = [
             .canJoinAllSpaces,
             .canJoinAllApplications,
-            .fullScreenAuxiliary,
             .ignoresCycle,
             .stationary
         ]
@@ -135,33 +147,26 @@ final class DesktopWindowController {
         return CGDirectDisplayID(number?.uint32Value ?? 0)
     }
 
-    private static func desktopVisibilityBounds(
-        for screen: NSScreen,
-        displayBounds: CGRect
-    ) -> CGRect {
-        let visibleFrame = screen.visibleFrame
-        return CGRect(
-            x: displayBounds.minX + visibleFrame.minX - screen.frame.minX,
-            y: displayBounds.minY + screen.frame.maxY - visibleFrame.maxY,
-            width: visibleFrame.width,
-            height: visibleFrame.height
-        )
+    var isWindowVisible: Bool {
+        window.occlusionState.contains(.visible)
     }
 
     func setRenderingEnabled(_ enabled: Bool) {
         guard requestedRenderingEnabled != enabled else { return }
         requestedRenderingEnabled = enabled
         presentationGeneration += 1
+        let generation = presentationGeneration
         if enabled {
-            applyRenderingState()
             if !isDesktopHidden {
-                prepareForPresentation()
-                scheduleLiveFrameReveal(generation: presentationGeneration)
+                beginLiveReveal(generation: generation)
+            } else {
+                isLiveSurfaceEnabled = false
+                applyRenderingState()
             }
         } else {
-            showCachedFrozenFrame()
-            refreshFrozenFrame()
+            isLiveSurfaceEnabled = false
             applyRenderingState()
+            capturePausedFrame(generation: generation, publishDesktopFallback: true)
         }
     }
 
@@ -172,15 +177,20 @@ final class DesktopWindowController {
         presentationGeneration += 1
         let generation = presentationGeneration
         if hidden {
-            showCachedFrozenFrame()
-            refreshFrozenFrame()
+            // Freeze first, pause immediately — playhead must not advance while hidden.
+            isLiveSurfaceEnabled = false
             applyRenderingState()
+            capturePausedFrame(generation: generation, publishDesktopFallback: true)
         } else {
+            // Show the paused still and only re-enable the live surface when revealing
+            // so resume does not play "under" the freeze (which looked like a jump to
+            // a future frame).
             showCachedFrozenFrame()
+            isLiveSurfaceEnabled = false
             applyRenderingState()
             prepareForPresentation()
             if requestedRenderingEnabled {
-                scheduleLiveFrameReveal(generation: generation)
+                beginLiveReveal(generation: generation)
             }
         }
         return true
@@ -196,10 +206,10 @@ final class DesktopWindowController {
 
     func update(screen: NSScreen, playsAudio: Bool) {
         self.screen = screen
-        displayBounds = displayID == 0 ? screen.frame : CGDisplayBounds(displayID)
-        desktopVisibilityBounds = Self.desktopVisibilityBounds(
-            for: screen,
-            displayBounds: displayBounds
+        displayBounds = CGDisplayBounds(displayID)
+        desktopVisibilityBounds = DesktopVisibility.desktopQuartzBounds(
+            displayID: displayID,
+            screen: screen
         )
         wallpaperRenderer.setPlaysAudio(playsAudio)
         wallpaperRenderer.updateDesktopFrame(screen.frame)
@@ -208,6 +218,7 @@ final class DesktopWindowController {
             size: screen.frame.size
         )
         wallpaperRenderer.contentView.frame = presentationView.bounds
+        window.ignoresMouseEvents = true
         window.setFrame(screen.frame, display: true)
         prepareForPresentation()
     }
@@ -217,27 +228,24 @@ final class DesktopWindowController {
     }
 
     func captureFrame(completion: @escaping (NSImage?) -> Void) {
-        if (isDesktopHidden || !requestedRenderingEnabled), let frozenFrame {
+        if (isDesktopHidden || !requestedRenderingEnabled || !isLiveSurfaceEnabled),
+           let frozenFrame {
             completion(frozenFrame)
             return
         }
-        refreshFrozenFrame(completion: completion)
+        captureLiveFrame(completion: completion)
     }
 
     func prepareForPresentation() {
+        window.ignoresMouseEvents = true
         window.orderFrontRegardless()
         window.displayIfNeeded()
         wallpaperRenderer.prepareForPresentation()
     }
 
-    func prepareForSpacePresentation() {
-        presentationGeneration += 1
-        let generation = presentationGeneration
-        showCachedFrozenFrame()
-        prepareForPresentation()
-        if !isDesktopHidden, requestedRenderingEnabled {
-            scheduleLiveFrameReveal(generation: generation)
-        }
+    func ensureDesktopLayering() {
+        window.ignoresMouseEvents = true
+        window.orderFrontRegardless()
     }
 
     func manages(window candidate: NSWindow) -> Bool {
@@ -256,42 +264,68 @@ final class DesktopWindowController {
         presentationView.showFrozenFrame(frozenFrame)
     }
 
-    private func refreshFrozenFrame(
-        completion: ((NSImage?) -> Void)? = nil
-    ) {
+    private func capturePausedFrame(generation: Int, publishDesktopFallback: Bool) {
+        showCachedFrozenFrame()
+        captureLiveFrame { [weak self] image in
+            guard let self, generation == self.presentationGeneration else { return }
+            guard let image else { return }
+            self.frozenFrame = image
+            self.presentationView.showFrozenFrame(image)
+            if publishDesktopFallback {
+                self.onPausedFrameCaptured?(image)
+            }
+        }
+    }
+
+    private func captureLiveFrame(completion: ((NSImage?) -> Void)? = nil) {
         frameCaptureGeneration += 1
         let generation = frameCaptureGeneration
         wallpaperRenderer.captureFrame { [weak self] image in
             guard let self,
-                  generation == self.frameCaptureGeneration,
-                  let image,
-                  let snapshot = WallpaperSnapshot.preparedImage(from: image) else {
+                  generation == self.frameCaptureGeneration else {
                 completion?(nil)
                 return
             }
-            self.frozenFrame = snapshot
-            if self.isDesktopHidden || !self.requestedRenderingEnabled {
-                self.presentationView.showFrozenFrame(snapshot)
+            guard let image,
+                  let snapshot = WallpaperSnapshot.preparedImage(from: image) else {
+                completion?(nil)
+                return
             }
             completion?(snapshot)
         }
     }
 
-    private func scheduleLiveFrameReveal(generation: Int) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+    /// Enable live rendering only at the reveal moment, then drop the freeze.
+    private func beginLiveReveal(generation: Int) {
+        showCachedFrozenFrame()
+        isLiveSurfaceEnabled = true
+        wallpaperRenderer.setRenderingEnabled(
+            requestedRenderingEnabled && !isDesktopHidden && isLiveSurfaceEnabled
+        ) { [weak self] in
             guard let self,
                   generation == self.presentationGeneration,
                   !self.isDesktopHidden,
-                  self.requestedRenderingEnabled else {
+                  self.requestedRenderingEnabled,
+                  self.isLiveSurfaceEnabled else {
                 return
             }
-            self.presentationView.hideFrozenFrame()
+            // One run-loop turn lets the first resumed frame composite before
+            // removing the still, avoiding a one-frame black/future flash.
+            DispatchQueue.main.async {
+                guard generation == self.presentationGeneration,
+                      !self.isDesktopHidden,
+                      self.requestedRenderingEnabled,
+                      self.isLiveSurfaceEnabled else {
+                    return
+                }
+                self.presentationView.hideFrozenFrame()
+            }
         }
     }
 
     private func applyRenderingState() {
         wallpaperRenderer.setRenderingEnabled(
-            requestedRenderingEnabled && !isDesktopHidden
+            requestedRenderingEnabled && !isDesktopHidden && isLiveSurfaceEnabled
         )
     }
 }

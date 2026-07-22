@@ -75,15 +75,13 @@ final class WallflowCanvasMetalSelfTest {
             )
             view.dispatchMouseForTesting(type: "mousemove", x: 120, y: 90)
             view.dispatchMouseForTesting(type: "click", x: 120, y: 90)
-            let foodCountBeforeRightClick = try integer(
-                from: view.evaluateJavaScriptForTesting("foods.length")
+            // Right-click is intentionally not bridged (system desktop menu ownership).
+            // Left-click still drives interactive canvas input (e.g. ripples).
+            let rippleCount = try integer(
+                from: view.evaluateJavaScriptForTesting("ripples.length")
             )
-            view.dispatchMouseButtonForTesting(button: 2, x: 180, y: 120)
-            let foodCountAfterRightClick = try integer(
-                from: view.evaluateJavaScriptForTesting("foods.length")
-            )
-            guard foodCountAfterRightClick > foodCountBeforeRightClick else {
-                throw WallflowSelfTestError.failed("Canvas Metal right click did not feed Koi")
+            guard rippleCount > 0 else {
+                throw WallflowSelfTestError.failed("Canvas Metal left click did not create ripples")
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
                 self?.verifyPropertiesAndInput()
