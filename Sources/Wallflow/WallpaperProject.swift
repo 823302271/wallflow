@@ -183,7 +183,14 @@ enum WallpaperProjectLoader {
 
         let rootURL = manifestURL.deletingLastPathComponent().resolvingSymlinksInPath()
         let relativePath = manifest.file.replacingOccurrences(of: "\\", with: "/")
-        let entryURL = rootURL.appendingPathComponent(relativePath).resolvingSymlinksInPath()
+        let declaredEntryURL = rootURL
+            .appendingPathComponent(relativePath)
+            .resolvingSymlinksInPath()
+        let entryURL = try resolveEntryURL(
+            kind: kind,
+            rootURL: rootURL,
+            declaredEntryURL: declaredEntryURL
+        )
         let rootPath = rootURL.standardizedFileURL.path
         let entryPath = entryURL.standardizedFileURL.path
         guard entryPath == rootPath || entryPath.hasPrefix(rootPath + "/") else {
@@ -201,6 +208,37 @@ enum WallpaperProjectLoader {
             manifest: manifest,
             displayTitle: manifest.title ?? rootURL.lastPathComponent
         )
+    }
+
+    /// Wallpaper Engine scene projects often declare `"file": "scene.json"` while the
+    /// bytes live inside `scene.pkg`. Resolve the on-disk entry the renderer can open.
+    private static func resolveEntryURL(
+        kind: WallpaperProject.Kind,
+        rootURL: URL,
+        declaredEntryURL: URL
+    ) throws -> URL {
+        if FileManager.default.fileExists(atPath: declaredEntryURL.path) {
+            return declaredEntryURL
+        }
+        guard kind == .scene else {
+            return declaredEntryURL
+        }
+
+        let packageCandidates = [
+            rootURL.appendingPathComponent("scene.pkg"),
+            declaredEntryURL
+                .deletingPathExtension()
+                .appendingPathExtension("pkg"),
+            rootURL.appendingPathComponent(
+                declaredEntryURL.deletingPathExtension().lastPathComponent + ".pkg"
+            )
+        ]
+        if let packageURL = packageCandidates.first(where: {
+            FileManager.default.fileExists(atPath: $0.path)
+        }) {
+            return packageURL.resolvingSymlinksInPath()
+        }
+        return declaredEntryURL
     }
 
     private static let videoExtensions = Set(["mp4", "m4v", "mov"])

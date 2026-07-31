@@ -33,14 +33,20 @@ final class WallflowLibrarySelfTest {
         ]
         let controller = WallpaperLibraryWindowController(
             entries: entries,
-            currentEntryID: entries[1].id,
-            isBuiltInCurrent: false,
-            onUse: { _ in },
+            activeAssignments: [1: entries[1].source],
+            displayOptions: [
+                (.all, "All Displays"),
+                (.display(1), "Display 1"),
+                (.display(2), "Display 2")
+            ],
+            enginePackInstalled: false,
+            onUse: { _, _ in },
             onLocateUnavailable: { _ in },
             onRemove: { _ in },
             onReveal: { _ in },
             onImportFile: {},
-            onImportURL: {}
+            onImportURL: {},
+            onImportEnginePack: {}
         )
         self.controller = controller
         controller.showWindow(nil)

@@ -229,5 +229,91 @@ enum MetalShader {
         if (alpha < 0.001) discard_fragment();
         return float4(input.color.rgb * alpha, alpha);
     }
+
+    // MARK: - Scene particles (instanced quads, config-driven)
+
+    struct ParticleUniforms {
+        float2 viewportSize;
+        float2 _pad;
+    };
+
+    // Packed tightly as 3 x float4 (48 bytes) — must match Swift ParticleGPUInstance.
+    struct ParticleInstance {
+        float4 center_halfSize;   // xy = center (points), zw = halfSize
+        float4 rot_alpha_frame;   // x = rotation, y = alpha, z = frameIndex, w = unused
+        float4 color;             // rgb multiply, a unused
+    };
+
+    struct ParticleVertexOut {
+        float4 position [[position]];
+        float2 uv;
+        float4 color;
+        float alpha;
+        uint frameIndex [[flat]];
+    };
+
+    vertex ParticleVertexOut particleVertex(
+        uint vertexID [[vertex_id]],
+        uint instanceID [[instance_id]],
+        constant ParticleUniforms &uniforms [[buffer(0)]],
+        const device ParticleInstance *instances [[buffer(1)]]
+    ) {
+        const float2 corners[6] = {
+            float2(-1.0, -1.0), float2(1.0, -1.0), float2(-1.0, 1.0),
+            float2(-1.0, 1.0), float2(1.0, -1.0), float2(1.0, 1.0)
+        };
+        // Metal texture origin is top-left.
+        const float2 uvs[6] = {
+            float2(0.0, 1.0), float2(1.0, 1.0), float2(0.0, 0.0),
+            float2(0.0, 0.0), float2(1.0, 1.0), float2(1.0, 0.0)
+        };
+
+        ParticleInstance instance = instances[instanceID];
+        float2 center = instance.center_halfSize.xy;
+        float2 halfSize = instance.center_halfSize.zw;
+        float rotation = instance.rot_alpha_frame.x;
+        float alpha = instance.rot_alpha_frame.y;
+        uint frameIndex = uint(instance.rot_alpha_frame.z);
+
+        float2 local = corners[vertexID] * halfSize;
+        float c = cos(rotation);
+        float s = sin(rotation);
+        float2 rotated = float2(
+            local.x * c - local.y * s,
+            local.x * s + local.y * c
+        );
+        float2 pixel = center + rotated;
+        // AppKit points: origin bottom-left, y-up. Metal NDC: y-up, origin center.
+        float2 ndc = float2(
+            pixel.x / max(uniforms.viewportSize.x, 1.0) * 2.0 - 1.0,
+            pixel.y / max(uniforms.viewportSize.y, 1.0) * 2.0 - 1.0
+        );
+
+        ParticleVertexOut out;
+        out.position = float4(ndc, 0.0, 1.0);
+        out.uv = uvs[vertexID];
+        out.color = instance.color;
+        out.alpha = alpha;
+        out.frameIndex = frameIndex;
+        return out;
+    }
+
+    fragment float4 particleFragment(
+        ParticleVertexOut in [[stage_in]],
+        texture2d_array<float> spriteAtlas [[texture(0)]]
+    ) {
+        constexpr sampler linearSampler(
+            address::clamp_to_edge,
+            filter::linear
+        );
+        uint layers = spriteAtlas.get_array_size();
+        uint frame = layers == 0 ? 0 : min(in.frameIndex, layers - 1);
+        float4 tex = spriteAtlas.sample(linearSampler, in.uv, frame);
+        // tex is premultiplied RGBA from CPU upload.
+        float a = tex.a * in.alpha;
+        if (a < 0.001) discard_fragment();
+        float3 rgb = tex.rgb * in.color.rgb * in.alpha;
+        return float4(rgb, a);
+    }
     """#
 }

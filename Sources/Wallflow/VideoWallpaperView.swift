@@ -44,6 +44,7 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
     private var audioMuted = false
     private var fitMode: WallpaperFitMode
     /// Written on pause; resume always restores from this data.
+    /// Stays locked until the host calls `commitPauseSession()` after stable play.
     private var checkpoint: VideoPlaybackCheckpoint?
     private var resumeGeneration = 0
 
@@ -105,7 +106,12 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
 
     func setRenderingEnabled(_ enabled: Bool, completion: (() -> Void)? = nil) {
         if enabled == renderingEnabled {
-            completion?()
+            if !enabled {
+                // Already paused: still pin playhead to the session checkpoint.
+                pinToPauseSession(completion: completion)
+            } else {
+                completion?()
+            }
             return
         }
         renderingEnabled = enabled
@@ -115,6 +121,18 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
             writeCheckpointAndPause()
             completion?()
         }
+    }
+
+    func pinToPauseSession(completion: (() -> Void)?) {
+        renderingEnabled = false
+        writeCheckpointAndPause()
+        completion?()
+    }
+
+    func commitPauseSession() {
+        // Only the host may release the lock after a Space-quiet stable resume.
+        guard renderingEnabled, player.rate > 0 else { return }
+        checkpoint = nil
     }
 
     func setAudioMuted(_ muted: Bool) {
@@ -152,7 +170,12 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
             return
         }
 
-        if let image = copyDisplayedFrameImage(at: time) {
+        // While paused, never prefer the live host-time buffer — it can lag the
+        // checkpoint by a frame or two and produce a freeze that does not match seek.
+        if let image = copyDisplayedFrameImage(
+            at: time,
+            preferCheckpointOnly: checkpoint != nil && !renderingEnabled
+        ) {
             completion(image)
             return
         }
@@ -197,41 +220,68 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
         !renderingEnabled && player.rate == 0
     }
 
-    // MARK: - Checkpoint pause / restore
-
-    /// Pause = write resume data once, then stop the player.
-    /// Do not keep re-seeking while paused; the checkpoint is the source of truth.
-    private func writeCheckpointAndPause() {
-        resumeGeneration += 1
-        if checkpoint == nil {
-            checkpoint = VideoPlaybackCheckpoint.capture(from: player)
-        }
-        player.pause()
-        player.rate = 0
-        // Optional: drop the item from the player to free decoder resources during
-        // long Space absences. Resume rebuilds from checkpoint + asset.
-        // Keeping the item is fine for short pauses; long absences are handled by
-        // restoreFromCheckpointAndPlay seeking from data either way.
+    var playerRateForTesting: Float {
+        player.rate
     }
 
-    /// Resume = read checkpoint data and seek there, then play.
-    /// Duration paused does not matter; we never "continue from wherever the
-    /// player happened to be" after a long system teardown.
+    // MARK: - Checkpoint pause / restore
+
+    /// Pause = lock resume data once for this hide-session, then stop the player.
+    /// Re-pauses during a flaky Space transition keep the same checkpoint and snap
+    /// the playhead back — they must never capture a "future" media time.
+    private func writeCheckpointAndPause() {
+        resumeGeneration += 1
+        if let existing = checkpoint {
+            player.pause()
+            player.rate = 0
+            // Snap back immediately so a brief false resume cannot leave the
+            // decoder parked ahead of the locked pause frame.
+            player.seek(
+                to: existing.time,
+                toleranceBefore: .zero,
+                toleranceAfter: .zero,
+                completionHandler: { _ in }
+            )
+            return
+        }
+        checkpoint = VideoPlaybackCheckpoint.capture(from: player)
+        player.pause()
+        player.rate = 0
+    }
+
+    /// Resume = seek to checkpoint while still paused, hand the matching frame to
+    /// the host (so the freeze overlay can drop), then start playback.
+    /// The checkpoint stays locked until continuous play has been committed so a
+    /// Space-transition re-pause cannot rewrite it to a future frame.
     private func restoreFromCheckpointAndPlay(completion: (() -> Void)?) {
         resumeGeneration += 1
         let generation = resumeGeneration
 
-        let finish: () -> Void = { [weak self] in
+        let revealReady: () -> Void = { [weak self] in
             guard let self, generation == self.resumeGeneration, self.renderingEnabled else {
                 return
             }
+            // Host hides the freeze while we are still paused at the checkpoint.
             completion?()
+            // One run-loop turn after reveal: only then advance the playhead.
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      generation == self.resumeGeneration,
+                      self.renderingEnabled else {
+                    return
+                }
+                self.player.play()
+                // Checkpoint stays until host `commitPauseSession()` — Space hops
+                // after a brief intermediate resume must still snap back here.
+            }
         }
 
         guard let checkpoint else {
             ensurePlayerItemReady()
-            player.play()
-            finish()
+            // No checkpoint: still delay play until after the host can reveal.
+            player.pause()
+            player.rate = 0
+            revealReady()
             return
         }
 
@@ -242,12 +292,10 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
             guard let self, generation == self.resumeGeneration, self.renderingEnabled else {
                 return
             }
-            self.player.play()
-            // Clear after play starts so the next pause writes a fresh checkpoint.
-            self.checkpoint = nil
-            DispatchQueue.main.async {
-                finish()
-            }
+            // Stay paused at the seeked frame so the freeze overlay matches.
+            self.player.pause()
+            self.player.rate = 0
+            revealReady()
             if !ok {
                 NSLog(
                     "Wallflow video restore seek was approximate at %.3fs",
@@ -368,15 +416,23 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
         videoOutput = output
     }
 
-    private func copyDisplayedFrameImage(at time: CMTime) -> NSImage? {
+    private func copyDisplayedFrameImage(
+        at time: CMTime,
+        preferCheckpointOnly: Bool = false
+    ) -> NSImage? {
         if let item = player.currentItem {
             attachVideoOutput(to: item)
         }
         guard let videoOutput else { return nil }
         var displayTime = CMTime.invalid
-        let hostTime = CACurrentMediaTime()
-        let itemTime = videoOutput.itemTime(forHostTime: hostTime)
-        let candidates: [CMTime] = [itemTime, time, player.currentTime()]
+        let candidates: [CMTime]
+        if preferCheckpointOnly {
+            candidates = [time]
+        } else {
+            let hostTime = CACurrentMediaTime()
+            let itemTime = videoOutput.itemTime(forHostTime: hostTime)
+            candidates = [itemTime, time, player.currentTime()]
+        }
         for candidate in candidates where candidate.isValid && candidate.isNumeric {
             if let buffer = videoOutput.copyPixelBuffer(
                 forItemTime: candidate,

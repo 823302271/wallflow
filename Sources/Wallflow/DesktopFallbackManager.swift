@@ -36,7 +36,14 @@ final class DesktopFallbackManager {
         }
         let generation = (generations[displayID] ?? 0) + 1
         generations[displayID] = generation
-        let options = workspace.desktopImageOptions(for: screen) ?? [:]
+        // Force aspect-fill (scale + clip) so the system desktop still matches
+        // Wallflow's freeze/live fill presentation — do not inherit a user stretch
+        // mode that makes Space return look like a re-layout.
+        var options = workspace.desktopImageOptions(for: screen) ?? [:]
+        options[.imageScaling] = NSNumber(
+            value: NSImageScaling.scaleProportionallyUpOrDown.rawValue
+        )
+        options[.allowClipping] = true
         let fallbackURL = directory.appendingPathComponent(
             "display-\(displayID)-\(UUID().uuidString).png"
         )

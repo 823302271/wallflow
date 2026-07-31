@@ -14,6 +14,24 @@ if CommandLine.arguments.contains("--self-test") {
         fputs("Wallflow self-test failed: \(error)\n", stderr)
         exit(EXIT_FAILURE)
     }
+} else if let dumpIndex = CommandLine.arguments.firstIndex(of: "--particle-dump"),
+          CommandLine.arguments.indices.contains(dumpIndex + 1) {
+    let projectPath = CommandLine.arguments[dumpIndex + 1]
+    let outputPath: String
+    if CommandLine.arguments.indices.contains(dumpIndex + 2) {
+        outputPath = CommandLine.arguments[dumpIndex + 2]
+    } else {
+        outputPath = "/tmp/wallflow-particle-dump.png"
+    }
+    let application = NSApplication.shared
+    application.setActivationPolicy(.prohibited)
+    do {
+        try WallflowParticleDumpTest.run(projectPath: projectPath, outputPath: outputPath)
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Wallflow particle dump failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
 } else if CommandLine.arguments.contains("--library-self-test") {
     let application = NSApplication.shared
     let runner = WallflowLibrarySelfTest()

@@ -37,6 +37,8 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
     private var globalMouseMonitor: Any?
     private var desktopPressedMouseButtons = 0
     private var virtualTimeMilliseconds = 0.0
+    /// Locked for a pause session so flaky Space resumes cannot advance the clock.
+    private var sessionVirtualTimeMilliseconds: Double?
     private var lastMouseLocation = CGPoint(x: -.greatestFiniteMagnitude, y: 0)
     private var mouseWasInside = false
     private var isRenderingEnabled = true
@@ -125,18 +127,47 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
 
     func setRenderingEnabled(_ enabled: Bool, completion: (() -> Void)?) {
         if enabled == isRenderingEnabled {
-            completion?()
+            if !enabled {
+                pinToPauseSession(completion: completion)
+            } else {
+                completion?()
+            }
             return
         }
         isRenderingEnabled = enabled
         if enabled {
-            startScheduler()
-            startInputBridge()
+            if let locked = sessionVirtualTimeMilliseconds {
+                virtualTimeMilliseconds = locked
+                renderNextFrame()
+            }
+            // Reveal while still on the last drawn frame, then start the clock.
+            completion?()
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isRenderingEnabled else { return }
+                self.startScheduler()
+                self.startInputBridge()
+            }
         } else {
-            stopScheduler()
-            stopInputBridge()
+            pinToPauseSession(completion: completion)
+        }
+    }
+
+    func pinToPauseSession(completion: (() -> Void)?) {
+        isRenderingEnabled = false
+        stopScheduler()
+        stopInputBridge()
+        if sessionVirtualTimeMilliseconds == nil {
+            sessionVirtualTimeMilliseconds = virtualTimeMilliseconds
+        } else if let locked = sessionVirtualTimeMilliseconds {
+            virtualTimeMilliseconds = locked
+            renderNextFrame()
         }
         completion?()
+    }
+
+    func commitPauseSession() {
+        guard isRenderingEnabled else { return }
+        sessionVirtualTimeMilliseconds = nil
     }
 
     func updateDesktopFrame(_ frame: CGRect) {
@@ -333,8 +364,9 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
         let mask = 1
         let global = NSEvent.mouseLocation
         if isDown {
+            let quartzPoint = event.cgEvent?.location
+                ?? DesktopVisibility.quartzPoint(fromAppKit: global)
             guard desktopFrame.contains(global),
-                  let quartzPoint = event.cgEvent?.location,
                   DesktopVisibility.isDesktopExposed(at: quartzPoint) else {
                 return
             }

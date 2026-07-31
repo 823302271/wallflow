@@ -22,6 +22,8 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
     private var configuredFPS = 0
     private var frozenElapsedTime: Float?
     private var frozenActivity: Float?
+    /// Locked for a pause session so flaky Space resumes cannot advance time.
+    private var sessionFrozenElapsedTime: Float?
     private var isRenderingEnabled = true
     private let renderScale: CGFloat = 0.75
 
@@ -47,25 +49,65 @@ final class WallpaperMetalView: MTKView, MTKViewDelegate {
     }
 
     func setRenderingEnabled(_ enabled: Bool) {
-        guard enabled != isRenderingEnabled else { return }
-        isRenderingEnabled = enabled
-        if enabled {
-            let now = CACurrentMediaTime()
-            if let frozenElapsedTime {
-                timelineOrigin = now - Double(frozenElapsedTime)
+        setRenderingEnabled(enabled, completion: nil)
+    }
+
+    /// On enable: call `completion` while still showing the frozen frame, then
+    /// unpause the display link on the next run-loop so the host can drop its
+    /// overlay without a one-frame timeline jump.
+    func setRenderingEnabled(_ enabled: Bool, completion: (() -> Void)?) {
+        if enabled == isRenderingEnabled {
+            if !enabled {
+                pinToPauseSession(completion: completion)
+            } else {
+                completion?()
             }
-            frozenElapsedTime = nil
-            frozenActivity = nil
-            lastInteractionTime = now
-            setPreferredFPS(60)
-            isPaused = false
-        } else {
-            let now = CACurrentMediaTime()
-            frozenElapsedTime = Float(now - timelineOrigin)
-            frozenActivity = updateMouseState(now: now).activity
-            draw()
-            isPaused = true
+            return
         }
+        if enabled {
+            // Keep frozenElapsedTime / isPaused until after the host reveals.
+            isRenderingEnabled = true
+            if let locked = sessionFrozenElapsedTime {
+                frozenElapsedTime = locked
+            }
+            completion?()
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isRenderingEnabled else { return }
+                let now = CACurrentMediaTime()
+                let elapsed = self.sessionFrozenElapsedTime ?? self.frozenElapsedTime
+                if let elapsed {
+                    self.timelineOrigin = now - Double(elapsed)
+                }
+                self.frozenElapsedTime = nil
+                self.frozenActivity = nil
+                self.lastInteractionTime = now
+                self.setPreferredFPS(60)
+                self.isPaused = false
+            }
+        } else {
+            pinToPauseSession(completion: completion)
+        }
+    }
+
+    func pinToPauseSession(completion: (() -> Void)?) {
+        isRenderingEnabled = false
+        let now = CACurrentMediaTime()
+        if sessionFrozenElapsedTime == nil {
+            sessionFrozenElapsedTime = Float(now - timelineOrigin)
+        }
+        frozenElapsedTime = sessionFrozenElapsedTime
+        frozenActivity = updateMouseState(now: now).activity
+        if let locked = sessionFrozenElapsedTime {
+            timelineOrigin = now - Double(locked)
+        }
+        draw()
+        isPaused = true
+        completion?()
+    }
+
+    func commitPauseSession() {
+        guard isRenderingEnabled else { return }
+        sessionFrozenElapsedTime = nil
     }
 
     func updateDesktopFrame(_ frame: CGRect) {

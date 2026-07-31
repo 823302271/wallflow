@@ -5,6 +5,12 @@ protocol WallpaperRenderer: AnyObject {
     /// Enable/disable rendering. When enabling, `completion` runs once the
     /// surface is ready to show (e.g. after a precise video seek).
     func setRenderingEnabled(_ enabled: Bool, completion: (() -> Void)?)
+    /// Re-assert the pause-session lock (seek/snap back even if already paused).
+    /// Used on every Space hop so a stuck or half-resumed surface cannot drift.
+    func pinToPauseSession(completion: (() -> Void)?)
+    /// Host-only: release the pause-session lock after stable live playback.
+    /// Renderers must not clear their own session locks on a timer.
+    func commitPauseSession()
     func setAudioMuted(_ muted: Bool)
     func setPlaysAudio(_ enabled: Bool)
     func setFitMode(_ fitMode: WallpaperFitMode)
@@ -12,6 +18,9 @@ protocol WallpaperRenderer: AnyObject {
     func applyUserProperties(_ properties: JSONValue)
     func prepareForPresentation()
     func captureFrame(completion: @escaping (NSImage?) -> Void)
+    /// Particles (scene effects) are independent of video/scene freeze checkpoints.
+    /// Host pauses them only when the desktop is truly not visible (CPU).
+    func setParticlesActive(_ active: Bool)
 }
 
 extension WallpaperRenderer {
@@ -19,11 +28,18 @@ extension WallpaperRenderer {
         setRenderingEnabled(enabled, completion: nil)
     }
 
+    func pinToPauseSession(completion: (() -> Void)?) {
+        setRenderingEnabled(false, completion: completion)
+    }
+
+    func commitPauseSession() {}
+
     func setAudioMuted(_ muted: Bool) {}
     func setPlaysAudio(_ enabled: Bool) {}
     func setFitMode(_ fitMode: WallpaperFitMode) {}
     func updateDesktopFrame(_ frame: CGRect) {}
     func applyUserProperties(_ properties: JSONValue) {}
+    func setParticlesActive(_ active: Bool) {}
     func prepareForPresentation() {
         contentView.displayIfNeeded()
     }
@@ -44,12 +60,6 @@ extension WallpaperRenderer {
 
 extension WallpaperMetalView: WallpaperRenderer {
     var contentView: NSView { self }
-
-    func setRenderingEnabled(_ enabled: Bool, completion: (() -> Void)?) {
-        // Built-in view pauses its display link via the existing Bool API.
-        setRenderingEnabled(enabled)
-        completion?()
-    }
 
     func prepareForPresentation() {
         displayIfNeeded()

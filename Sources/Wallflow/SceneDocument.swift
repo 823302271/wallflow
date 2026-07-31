@@ -55,6 +55,7 @@ struct SceneDocument: Equatable {
     let general: SceneGeneral
     let compatibility: SceneCompatibilityReport
     let imageLayers: [SceneImageLayer]
+    let particleSystems: [SceneParticleSystem]
     let sounds: [SceneSoundObject]
 
     init(package: ScenePackage) throws {
@@ -76,6 +77,7 @@ struct SceneDocument: Equatable {
         var unknownObjects = 0
         var imageDescriptors: [String] = []
         var parsedImageLayers: [SceneImageLayer] = []
+        var parsedParticles: [SceneParticleSystem] = []
         var parsedSounds: [SceneSoundObject] = []
 
         for case let object as [String: Any] in root["objects"] as? [Any] ?? [] {
@@ -95,6 +97,9 @@ struct SceneDocument: Equatable {
                 }
             } else if object["particle"] != nil {
                 particleObjects += 1
+                if let particle = SceneParticleParser.parse(object: object, package: package) {
+                    parsedParticles.append(particle)
+                }
             } else if object["sound"] != nil {
                 soundObjects += 1
                 if let sound = Self.parseSoundObject(object) {
@@ -136,6 +141,7 @@ struct SceneDocument: Equatable {
             imageDescriptors: imageDescriptors
         )
         imageLayers = parsedImageLayers
+        particleSystems = parsedParticles
         sounds = parsedSounds
     }
 
@@ -144,13 +150,30 @@ struct SceneDocument: Equatable {
     }
 
     private static func double(_ value: Any?, fallback: Double) -> Double {
-        (value as? NSNumber)?.doubleValue ?? fallback
+        if let number = value as? NSNumber {
+            return number.doubleValue
+        }
+        if let string = value as? String,
+           let parsed = Double(string.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return parsed
+        }
+        return fallback
     }
 
+    /// Wallpaper Engine writes vectors as either JSON arrays or space-separated strings
+    /// (`"2560.0 1440.0 0.0"`). Accept both.
     private static func doubleArray(_ value: Any?, fallback: [Double]) -> [Double] {
-        guard let values = value as? [Any] else { return fallback }
-        let result = values.compactMap { ($0 as? NSNumber)?.doubleValue }
-        return result.isEmpty ? fallback : result
+        if let values = value as? [Any] {
+            let result = values.map { double($0, fallback: .nan) }.filter { !$0.isNaN }
+            if !result.isEmpty { return result }
+        }
+        if let string = value as? String {
+            let parts = string
+                .split(whereSeparator: { $0 == " " || $0 == "," || $0 == "\t" })
+                .compactMap { Double($0) }
+            if !parts.isEmpty { return parts }
+        }
+        return fallback
     }
 
     private static func parseImageLayer(
@@ -163,30 +186,19 @@ struct SceneDocument: Equatable {
             return nil
         }
 
+        let objectSize = doubleArray(object["size"], fallback: [])
         let fullscreen = bool(descriptor["fullscreen"], fallback: false)
+            || bool(object["fullscreen"], fallback: false)
         let width = double(
             descriptor["width"],
-            fallback: doubleArray(object["size"], fallback: [0, 0]).first ?? 0
+            fallback: objectSize.first ?? 0
         )
         let height = double(
             descriptor["height"],
-            fallback: doubleArray(object["size"], fallback: [0, 0]).dropFirst().first ?? 0
+            fallback: objectSize.dropFirst().first ?? 0
         )
 
-        var texturePath: String?
-        if let materialPath = descriptor["material"] as? String,
-           let material = jsonDictionary(package: package, path: materialPath),
-           let textureName = (material["textures"] as? [Any])?.first as? String,
-           !textureName.hasPrefix("_rt_") {
-            var path = textureName.replacingOccurrences(of: "\\", with: "/")
-            if !path.hasPrefix("materials/") {
-                path = "materials/" + path
-            }
-            if URL(fileURLWithPath: path).pathExtension.isEmpty {
-                path += ".tex"
-            }
-            texturePath = "/" + path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        }
+        let texturePath = resolveTexturePath(descriptor: descriptor, package: package)
 
         return SceneImageLayer(
             id: (object["id"] as? NSNumber)?.intValue ?? 0,
@@ -200,8 +212,51 @@ struct SceneDocument: Equatable {
             height: max(height, 1),
             fullscreen: fullscreen,
             alpha: double(object["alpha"], fallback: 1),
-            parallaxDepth: double(object["parallaxDepth"], fallback: 0)
+            parallaxDepth: double(
+                object["parallaxDepth"] ?? object["parallaxdepth"],
+                fallback: 0
+            )
         )
+    }
+
+    /// Resolve the first non-render-target texture from legacy or passes-based materials.
+    private static func resolveTexturePath(
+        descriptor: [String: Any],
+        package: ScenePackage
+    ) -> String? {
+        guard let materialPath = descriptor["material"] as? String,
+              let material = jsonDictionary(package: package, path: materialPath) else {
+            return nil
+        }
+
+        let textureNames: [String]
+        if let topLevel = material["textures"] as? [Any] {
+            textureNames = topLevel.compactMap { $0 as? String }
+        } else if let passes = material["passes"] as? [[String: Any]] {
+            textureNames = passes.flatMap { pass in
+                (pass["textures"] as? [Any])?.compactMap { $0 as? String } ?? []
+            }
+        } else {
+            textureNames = []
+        }
+
+        guard let textureName = textureNames.first(where: {
+            !$0.isEmpty && !$0.hasPrefix("_rt_")
+        }) else {
+            return nil
+        }
+
+        var path = textureName.replacingOccurrences(of: "\\", with: "/")
+        if !path.hasPrefix("materials/") {
+            path = "materials/" + path
+        }
+        if URL(fileURLWithPath: path).pathExtension.isEmpty {
+            path += ".tex"
+        }
+        let normalized = "/" + path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        // Prefer the resolved path when the package contains it; otherwise still return
+        // it so callers can log a missing texture consistently.
+        return normalized
     }
 
     private static func parseSoundObject(_ object: [String: Any]) -> SceneSoundObject? {

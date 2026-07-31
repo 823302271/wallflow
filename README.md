@@ -31,7 +31,8 @@ Wallpaper Engine web and scene compatibility.
 - Automatic suspension during sleep and inactive login sessions
 - Incremental display reconciliation without restarting retained-screen renderers
 - Per-display Space handling: only the hidden display pauses and keeps its last frame; other displays keep playing
-- Video pause writes a playback checkpoint and resume seeks to that time (smooth even after long Space absences)
+- Wallpaper windows do not join every Space (avoids multi-hop 1→2→3→Desktop resume jumps)
+- Video pause writes a playback checkpoint and resume seeks to that time; the host commits the pause session only after stable play
 - On pause, the current frame is captured and set as that display's system desktop wallpaper
 - Menu bar pause and resume controls
 - Default-on pause only when a display's desktop is fully hidden

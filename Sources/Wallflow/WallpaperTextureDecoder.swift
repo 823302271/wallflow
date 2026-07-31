@@ -227,16 +227,21 @@ enum WallpaperTextureDecoder {
             guard images.indices.contains(imageIndex) else {
                 continue
             }
-            let frame = try makeSpriteFrame(
-                source: images[imageIndex],
-                x: values[0],
-                y: values[1],
-                widthX: values[2],
-                widthY: values[3],
-                heightX: values[4],
-                heightY: values[5]
-            )
-            frames.append(WallpaperAnimationFrame(image: frame, duration: duration))
+            do {
+                let frame = try makeSpriteFrame(
+                    source: images[imageIndex],
+                    x: values[0],
+                    y: values[1],
+                    widthX: values[2],
+                    widthY: values[3],
+                    heightX: values[4],
+                    heightY: values[5]
+                )
+                frames.append(WallpaperAnimationFrame(image: frame, duration: duration))
+            } catch {
+                // Skip invalid / out-of-atlas frames instead of aborting the sheet.
+                continue
+            }
         }
         return frames
     }
@@ -260,16 +265,30 @@ enum WallpaperTextureDecoder {
             throw WallpaperTextureError.invalidValue("sprite frame bounds")
         }
 
+        // Reject frames whose authoring rect lies outside the atlas. Clamping them
+        // would re-crop frame 0 (e.g. rosepetals frame y=128 on a 128-tall atlas)
+        // and make randomframe look stuck on one petal.
+        let atlasW = Double(source.width)
+        let atlasH = Double(source.height)
+        guard cropX < atlasW,
+              cropYFromTop < atlasH,
+              cropX + cropWidth > 0.5,
+              cropYFromTop + cropHeight > 0.5 else {
+            throw WallpaperTextureError.invalidValue("sprite frame outside atlas")
+        }
+
         let cropRect = CGRect(
             x: max(0, cropX),
-            y: max(0, Double(source.height) - cropYFromTop - cropHeight),
-            width: min(cropWidth, Double(source.width) - max(0, cropX)),
+            y: max(0, atlasH - cropYFromTop - cropHeight),
+            width: min(cropWidth, atlasW - max(0, cropX)),
             height: min(
                 cropHeight,
-                Double(source.height) - max(0, Double(source.height) - cropYFromTop - cropHeight)
+                atlasH - max(0, atlasH - cropYFromTop - cropHeight)
             )
         ).integral
-        guard cropRect.width >= 1, cropRect.height >= 1,
+        // Require most of the authored rect to survive clamping (not a sliver).
+        guard cropRect.width >= cropWidth * 0.75,
+              cropRect.height >= cropHeight * 0.75,
               let cropped = source.cropping(to: cropRect) else {
             throw WallpaperTextureError.imageDecodeFailed
         }

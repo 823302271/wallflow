@@ -89,7 +89,11 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
 
     func setRenderingEnabled(_ enabled: Bool, completion: (() -> Void)?) {
         if enabled == isRenderingEnabled {
-            completion?()
+            if !enabled {
+                pinToPauseSession(completion: completion)
+            } else {
+                completion?()
+            }
             return
         }
         isRenderingEnabled = enabled
@@ -97,30 +101,59 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         let generation = presentationGeneration
 
         if enabled {
-            setHostAnimationPaused(false) { [weak self] in
+            // Reveal first while still frozen at the pause frame, then unpause.
+            // Otherwise rAF / CSS / media advance under the host freeze overlay and
+            // the first live frame jumps past the still the user just saw.
+            completion?()
+            DispatchQueue.main.async { [weak self] in
                 guard let self,
                       self.isRenderingEnabled,
                       self.presentationGeneration == generation else {
                     return
                 }
-                self.webView.setAllMediaPlaybackSuspended(false) { [weak self] in
+                self.setHostAnimationPaused(false) { [weak self] in
                     guard let self,
                           self.isRenderingEnabled,
                           self.presentationGeneration == generation else {
                         return
                     }
-                    self.callPropertyListener("setPaused", argument: "false")
-                    self.startInputBridge()
-                    completion?()
+                    self.webView.setAllMediaPlaybackSuspended(false) { [weak self] in
+                        guard let self,
+                              self.isRenderingEnabled,
+                              self.presentationGeneration == generation else {
+                            return
+                        }
+                        self.callPropertyListener("setPaused", argument: "false")
+                        self.startInputBridge()
+                    }
                 }
             }
         } else {
-            stopInputBridge()
-            callPropertyListener("setPaused", argument: "true")
-            webView.setAllMediaPlaybackSuspended(true, completionHandler: nil)
-            setHostAnimationPaused(true)
+            pinToPauseSession(completion: completion)
+        }
+    }
+
+    func pinToPauseSession(completion: (() -> Void)?) {
+        presentationGeneration += 1
+        let generation = presentationGeneration
+        isRenderingEnabled = false
+        stopInputBridge()
+        callPropertyListener("setPaused", argument: "true")
+        webView.setAllMediaPlaybackSuspended(true, completionHandler: nil)
+        setHostAnimationPaused(true) { [weak self] in
+            guard let self, self.presentationGeneration == generation else {
+                return
+            }
             completion?()
         }
+    }
+
+    func commitPauseSession() {
+        guard isRenderingEnabled else { return }
+        webView.evaluateJavaScript(
+            "window.__wallflowCommitTimeline && window.__wallflowCommitTimeline();",
+            completionHandler: nil
+        )
     }
 
     func prepareForPresentation() {
@@ -260,7 +293,8 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         lastMouseMovementTime = CACurrentMediaTime()
         lastPressedMouseButtons = NSEvent.pressedMouseButtons
         if mouseTimer == nil {
-            scheduleMouseTimer(fps: 60)
+            // Idle desktop: 30 Hz location poll is enough; ramp to 60 on motion.
+            scheduleMouseTimer(fps: 30)
         }
 
         if globalMouseMonitor == nil {
@@ -339,11 +373,14 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         }
         guard !stateAlreadyHandled else { return }
 
+        let global = NSEvent.mouseLocation
+        let quartz = event.cgEvent?.location
+            ?? DesktopVisibility.quartzPoint(fromAppKit: global)
         dispatchDesktopMouseButtonIfNeeded(
             button: 0,
             isDown: isDown,
-            globalLocation: NSEvent.mouseLocation,
-            quartzPoint: event.cgEvent?.location
+            globalLocation: global,
+            quartzPoint: quartz
         )
     }
 
@@ -355,6 +392,7 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         lastPressedMouseButtons = (lastPressedMouseButtons & ~1) | current
         guard changed != 0 else { return }
         let quartzPoint = CGEvent(source: nil)?.location
+            ?? DesktopVisibility.quartzPoint(fromAppKit: globalLocation)
         dispatchDesktopMouseButtonIfNeeded(
             button: 0,
             isDown: current != 0,
@@ -367,17 +405,18 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         button: Int,
         isDown: Bool,
         globalLocation: CGPoint,
-        quartzPoint: CGPoint?
+        quartzPoint: CGPoint
     ) {
         let mask = button == 0 ? 1 : 2
         if isDown {
             guard desktopFrame.contains(globalLocation),
-                  let quartzPoint,
                   DesktopVisibility.isDesktopExposed(at: quartzPoint) else {
                 return
             }
             desktopPressedMouseButtons |= mask
         } else {
+            // Always complete a press that we started, even if the cursor moved
+            // slightly off the exposed desktop before mouseup.
             guard desktopPressedMouseButtons & mask != 0 else { return }
             desktopPressedMouseButtons &= ~mask
         }
@@ -411,8 +450,10 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         button: Int,
         buttons: Int
     ) {
+        // CSS client coordinates: origin top-left of this display's desktop frame.
         let x = globalLocation.x - desktopFrame.minX
         let y = desktopFrame.maxY - globalLocation.y
+        guard x.isFinite, y.isFinite else { return }
         mouseDispatchPending = true
         let script = "window.__wallflowDispatchMouse('\(type)', \(x), \(y), \(button), \(buttons));"
         webView.evaluateJavaScript(script) { [weak self] _, _ in
@@ -453,9 +494,45 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
       let isPumping = false;
       let hostPaused = false;
       let virtualFrameTime = null;
+      // Locked for a pause session so brief false resumes cannot permanently
+      // advance the host rAF clock (future-frame jump after Space flaps).
+      let sessionVirtualFrameTime = null;
       const frameCallbacks = new Map();
       const hostPausedAnimations = new Set();
+      const sessionAnimationTimes = new Map();
+      const sessionMediaTimes = new Map();
       let animationSyncScheduled = false;
+
+      function lockMediaElements() {
+        document.querySelectorAll('audio, video').forEach(element => {
+          try {
+            if (!sessionMediaTimes.has(element)) {
+              sessionMediaTimes.set(element, element.currentTime);
+            } else {
+              const locked = sessionMediaTimes.get(element);
+              if (Number.isFinite(locked) && Math.abs(element.currentTime - locked) > 0.01) {
+                element.currentTime = locked;
+              }
+            }
+          } catch (_) {}
+        });
+      }
+
+      function restoreMediaElements() {
+        sessionMediaTimes.forEach((time, element) => {
+          try {
+            if (element.isConnected && Number.isFinite(time)) {
+              element.currentTime = time;
+            }
+          } catch (_) {}
+        });
+      }
+
+      function clearSessionTimelineLocks() {
+        sessionVirtualFrameTime = null;
+        sessionAnimationTimes.clear();
+        sessionMediaTimes.clear();
+      }
 
       function syncDocumentAnimations() {
         animationSyncScheduled = false;
@@ -463,19 +540,30 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         if (typeof document.getAnimations !== 'function') return;
         if (hostPaused) {
           document.getAnimations().forEach(animation => {
-            if (animation.playState !== 'running') return;
             try {
-              animation.pause();
-              hostPausedAnimations.add(animation);
+              if (!sessionAnimationTimes.has(animation) && animation.currentTime != null) {
+                sessionAnimationTimes.set(animation, animation.currentTime);
+              } else if (sessionAnimationTimes.has(animation)) {
+                animation.currentTime = sessionAnimationTimes.get(animation);
+              }
+              if (animation.playState === 'running' || animation.playState === 'paused') {
+                animation.pause();
+                hostPausedAnimations.add(animation);
+              }
             } catch (_) {}
           });
+          lockMediaElements();
         } else {
           hostPausedAnimations.forEach(animation => {
             try {
+              if (sessionAnimationTimes.has(animation)) {
+                animation.currentTime = sessionAnimationTimes.get(animation);
+              }
               if (animation.playState === 'paused') animation.play();
             } catch (_) {}
           });
           hostPausedAnimations.clear();
+          restoreMediaElements();
         }
       }
 
@@ -548,6 +636,11 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         hostPaused = Boolean(paused);
         scheduleDocumentAnimationSync();
         if (hostPaused) {
+          if (sessionVirtualFrameTime === null) {
+            sessionVirtualFrameTime = virtualFrameTime;
+          } else {
+            virtualFrameTime = sessionVirtualFrameTime;
+          }
           if (nativePumpId !== null) {
             nativeCancelAnimationFrame(nativePumpId);
             nativePumpId = null;
@@ -557,14 +650,24 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
             timerId = null;
           }
         } else {
+          if (sessionVirtualFrameTime !== null) {
+            virtualFrameTime = sessionVirtualFrameTime;
+          }
           lastFrameTime = performance.now();
           scheduleAnimationPump();
+          // Timeline unlock is host-driven via __wallflowCommitTimeline so a
+          // multi-Space hop cannot clear the lock after a brief intermediate play.
         }
+      };
+      window.__wallflowCommitTimeline = function() {
+        clearSessionTimelineLocks();
       };
 
       document.addEventListener('DOMContentLoaded', () => {
+        // While paused, do NOT re-sync on every DOM mutation — that burns CPU
+        // under freeze (wallpaper "background" cost higher than foreground).
         new MutationObserver(() => {
-          if (hostPaused) scheduleDocumentAnimationSync();
+          if (!hostPaused) scheduleDocumentAnimationSync();
         }).observe(document.documentElement, {
           attributes: true,
           childList: true,
@@ -598,22 +701,45 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
         const options = {
           bubbles: true,
           cancelable: true,
+          composed: true,
           clientX: x,
           clientY: y,
+          pageX: x,
+          pageY: y,
           screenX: x,
           screenY: y,
           button: button,
           buttons: buttons,
           view: window
         };
-        const target = document.elementFromPoint(x, y) || document;
-        target.dispatchEvent(new MouseEvent(type, options));
+        // Prefer the painted element, but always also notify window/document so
+        // wallpapers that listen on window (e.g. koi pond click-to-feed) receive it.
+        const target = document.elementFromPoint(x, y) || document.body || document.documentElement || document;
+        try { target.dispatchEvent(new MouseEvent(type, options)); } catch (_) {}
+        if (target !== document) {
+          try { document.dispatchEvent(new MouseEvent(type, options)); } catch (_) {}
+        }
+        try { window.dispatchEvent(new MouseEvent(type, options)); } catch (_) {}
         // Left-click only. Right-click / contextmenu stay with macOS (desktop icons).
         if (type === 'mouseup' && button === 0) {
-          target.dispatchEvent(new MouseEvent('click', options));
+          try { target.dispatchEvent(new MouseEvent('click', options)); } catch (_) {}
+          if (target !== window) {
+            try { window.dispatchEvent(new MouseEvent('click', options)); } catch (_) {}
+          }
         }
-        if (type === 'mousemove' && typeof PointerEvent !== 'undefined') {
-          target.dispatchEvent(new PointerEvent('pointermove', options));
+        if (typeof PointerEvent !== 'undefined') {
+          const pointerType = type === 'mousedown' ? 'pointerdown'
+            : type === 'mouseup' ? 'pointerup'
+            : type === 'mousemove' ? 'pointermove' : null;
+          if (pointerType) {
+            const pointerOptions = Object.assign({
+              pointerId: 1,
+              pointerType: 'mouse',
+              isPrimary: true
+            }, options);
+            try { target.dispatchEvent(new PointerEvent(pointerType, pointerOptions)); } catch (_) {}
+            try { window.dispatchEvent(new PointerEvent(pointerType, pointerOptions)); } catch (_) {}
+          }
         }
       };
       window.__wallflowMuted = false;
@@ -810,10 +936,15 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
       };
 
       const scheduleFit = () => {
+        // While the host freeze overlay is up, do not re-measure / re-apply fit.
+        // Space returns fire resize/mutation; re-fitting under the still looks like
+        // the wallpaper "re-stretching" when the overlay drops.
+        if (document.documentElement.hasAttribute('data-wallflow-host-paused')) return;
         if (scheduled) return;
         scheduled = true;
         setTimeout(() => {
           scheduled = false;
+          if (document.documentElement.hasAttribute('data-wallflow-host-paused')) return;
           applyFitMode();
         }, 0);
       };

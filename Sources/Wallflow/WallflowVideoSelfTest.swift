@@ -94,20 +94,59 @@ final class WallflowVideoSelfTest {
             view.setRenderingEnabled(true) { [weak self] in
                 guard let self, let view = self.wallpaperView else { return }
                 let resumeTime = view.playbackTimeForTesting
-                guard resumeTime + 0.05 >= pausedTime,
-                      resumeTime <= pausedTime + 0.35 else {
+                // Completion must fire while still on the checkpoint frame (rate 0),
+                // so the host freeze overlay can drop without a jump.
+                guard view.playerRateForTesting == 0,
+                      resumeTime + 0.05 >= pausedTime,
+                      resumeTime <= pausedTime + 0.12 else {
                     self.finish(
                         .failure(
                             WallflowSelfTestError.failed(
-                                "Video resumed from a future frame (\(resumeTime) vs \(pausedTime))"
+                                "Video reveal was not frozen at the checkpoint (\(resumeTime) vs \(pausedTime), rate=\(view.playerRateForTesting))"
                             )
                         )
                     )
                     return
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-                    self?.verifyLongPauseHold()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                    self?.verifyFlakyResumeKeepsCheckpoint(originalTime: pausedTime)
                 }
+            }
+        }
+    }
+
+    /// Simulate a Space-transition false resume: play briefly, re-pause, checkpoint
+    /// must stay at the original pause time (not a future frame).
+    private func verifyFlakyResumeKeepsCheckpoint(originalTime: TimeInterval) {
+        guard let view = wallpaperView else { return }
+        view.setRenderingEnabled(false, completion: nil)
+        guard let held = view.checkpointMediaSecondsForTesting,
+              abs(held - originalTime) < 0.08 else {
+            finish(
+                .failure(
+                    WallflowSelfTestError.failed(
+                        "Flaky re-pause rewrote checkpoint (\(String(describing: view.checkpointMediaSecondsForTesting)) vs \(originalTime))"
+                    )
+                )
+            )
+            return
+        }
+        view.setRenderingEnabled(true) { [weak self] in
+            guard let self, let view = self.wallpaperView else { return }
+            let resumeTime = view.playbackTimeForTesting
+            guard resumeTime + 0.05 >= originalTime,
+                  resumeTime <= originalTime + 0.12 else {
+                self.finish(
+                    .failure(
+                        WallflowSelfTestError.failed(
+                            "Flaky resume seek missed checkpoint (\(resumeTime) vs \(originalTime))"
+                        )
+                    )
+                )
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.verifyLongPauseHold()
             }
         }
     }
@@ -134,18 +173,20 @@ final class WallflowVideoSelfTest {
             view.setRenderingEnabled(true) { [weak self] in
                 guard let self, let view = self.wallpaperView else { return }
                 let resumeTime = view.playbackTimeForTesting
-                guard resumeTime + 0.05 >= pausedTime,
-                      resumeTime <= pausedTime + 0.4 else {
+                guard view.playerRateForTesting == 0,
+                      resumeTime + 0.05 >= pausedTime,
+                      resumeTime <= pausedTime + 0.12 else {
                     self.finish(
                         .failure(
                             WallflowSelfTestError.failed(
-                                "Long-pause resume jumped (\(resumeTime) vs \(pausedTime))"
+                                "Long-pause reveal jumped (\(resumeTime) vs \(pausedTime), rate=\(view.playerRateForTesting))"
                             )
                         )
                     )
                     return
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                // Wait past checkpoint commit delay so the next pause records a fresh time.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                     self?.verifyResumeAndSnapshot(previousTime: pausedTime)
                 }
             }

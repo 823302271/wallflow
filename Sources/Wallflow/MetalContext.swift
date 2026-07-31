@@ -32,6 +32,7 @@ final class MetalContext {
     let pipeline: MTLRenderPipelineState
     let canvasSourcePipeline: MTLRenderPipelineState
     let canvasOverlayPipeline: MTLRenderPipelineState
+    let particlePipeline: MTLRenderPipelineState
 
     private init() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -82,5 +83,27 @@ final class MetalContext {
         let canvasPipeline = try device.makeRenderPipelineState(descriptor: canvasDescriptor)
         canvasSourcePipeline = canvasPipeline
         canvasOverlayPipeline = canvasPipeline
+
+        guard let particleVertex = library.makeFunction(name: "particleVertex") else {
+            throw MetalContextError.shaderFunctionMissing("particleVertex")
+        }
+        guard let particleFragment = library.makeFunction(name: "particleFragment") else {
+            throw MetalContextError.shaderFunctionMissing("particleFragment")
+        }
+        let particleDescriptor = MTLRenderPipelineDescriptor()
+        particleDescriptor.label = "Wallflow Particles"
+        particleDescriptor.vertexFunction = particleVertex
+        particleDescriptor.fragmentFunction = particleFragment
+        particleDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        let particleAttachment = particleDescriptor.colorAttachments[0]!
+        particleAttachment.isBlendingEnabled = true
+        particleAttachment.rgbBlendOperation = .add
+        particleAttachment.alphaBlendOperation = .add
+        // Premultiplied alpha blending
+        particleAttachment.sourceRGBBlendFactor = .one
+        particleAttachment.sourceAlphaBlendFactor = .one
+        particleAttachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        particleAttachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        particlePipeline = try device.makeRenderPipelineState(descriptor: particleDescriptor)
     }
 }

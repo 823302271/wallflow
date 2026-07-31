@@ -14,8 +14,11 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
     private var playsAudio: Bool
     private let previewLayer = CALayer()
     private var renderedLayers: [RenderedLayer] = []
+    private var particleRuntimes: [SceneParticleRuntime] = []
     private var mouseTimer: Timer?
+    private var particleTimer: Timer?
     private var lastMouseLocation = CGPoint(x: -.greatestFiniteMagnitude, y: 0)
+    private var lastParticleTick = CACurrentMediaTime()
     private var sceneDocument: SceneDocument?
     private var isRenderingEnabled = true
     private var isAudioMuted = false
@@ -23,6 +26,9 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
     private var sceneSounds: [SceneSoundObject] = []
     private var audioController: SceneAudioController?
     private var fitMode: WallpaperFitMode
+    private var userProperties: JSONValue
+    /// Locked layer time for the current pause session (Space flap safe).
+    private var sessionPausedLayerTime: CFTimeInterval?
 
     var contentView: NSView { self }
 
@@ -37,6 +43,7 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
         self.project = project
         self.playsAudio = playsAudio
         self.fitMode = fitMode
+        self.userProperties = project.userProperties
         super.init(frame: frame)
 
         wantsLayer = true
@@ -48,6 +55,7 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
 
         loadScene()
         startMouseTracking()
+        startParticleSimulation()
     }
 
     @available(*, unavailable)
@@ -57,6 +65,7 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
 
     deinit {
         mouseTimer?.invalidate()
+        particleTimer?.invalidate()
     }
 
     override func layout() {
@@ -72,21 +81,64 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
 
     func setRenderingEnabled(_ enabled: Bool, completion: (() -> Void)?) {
         if enabled == isRenderingEnabled {
-            completion?()
+            if !enabled {
+                pinToPauseSession(completion: completion)
+            } else {
+                completion?()
+            }
             return
         }
         isRenderingEnabled = enabled
         if enabled {
-            resumeLayerAnimations()
-            startMouseTracking()
-            audioController?.setRenderingEnabled(true)
+            // Freeze-frame path only freezes scene layers / audio — particles keep
+            // their own active flag (setParticlesActive).
+            completion?()
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isRenderingEnabled else { return }
+                self.resumeLayerAnimations()
+                self.startMouseTracking()
+                self.startParticleSimulation()
+                self.audioController?.setRenderingEnabled(true)
+            }
         } else {
-            mouseTimer?.invalidate()
-            mouseTimer = nil
-            pauseLayerAnimations()
-            audioController?.setRenderingEnabled(false)
+            pinToPauseSession(completion: completion)
         }
+    }
+
+    func pinToPauseSession(completion: (() -> Void)?) {
+        // Scene freeze for video-like checkpoint: pause image layers + audio only.
+        // Particles are independent and keep simulating unless setParticlesActive(false).
+        isRenderingEnabled = false
+        pauseLayerAnimations()
+        audioController?.setRenderingEnabled(false)
         completion?()
+    }
+
+    func commitPauseSession() {
+        guard isRenderingEnabled else { return }
+        sessionPausedLayerTime = nil
+    }
+
+    func setParticlesActive(_ active: Bool) {
+        if active {
+            particleRuntimes.forEach { $0.setEnabled(true) }
+            startMouseTracking()
+            startParticleSimulation()
+        } else {
+            // Desktop not visible: stop particle CPU work, clear particles so
+            // resume starts clean (not a frozen mid-air trail under freeze still).
+            particleTimer?.invalidate()
+            particleTimer = nil
+            // Keep mouse timer if parallax needs it; stop only when no particles need it.
+            if sceneDocument?.general.cameraParallax != true {
+                mouseTimer?.invalidate()
+                mouseTimer = nil
+            }
+            particleRuntimes.forEach {
+                $0.setEnabled(false)
+                $0.clearParticles()
+            }
+        }
     }
 
     func setAudioMuted(_ muted: Bool) {
@@ -118,6 +170,16 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
         layoutSubtreeIfNeeded()
     }
 
+    func applyUserProperties(_ properties: JSONValue) {
+        guard let changed = properties.objectValue else { return }
+        var all = userProperties.objectValue ?? [:]
+        for (key, value) in changed {
+            all[key] = value
+        }
+        userProperties = .object(all)
+        applyParticleVisibilityFromUserProperties()
+    }
+
     func updateDesktopFrame(_ frame: CGRect) {
         desktopFrame = frame
         lastMouseLocation = CGPoint(x: -.greatestFiniteMagnitude, y: 0)
@@ -133,15 +195,17 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
             sceneDocument = document
             applyClearColor(document.general.clearColor)
             loadSceneLayers(package: package, document: document)
+            loadParticleSystems(package: package, document: document)
             configureAudioIfNeeded()
             if renderedLayers.isEmpty {
                 loadPreviewImage(package: package)
             }
             NSLog(
-                "Wallflow loaded %@: %d/%d image layers, %d particles, %d sounds, %d lights",
+                "Wallflow loaded %@: %d/%d image layers, %d/%d particles, %d sounds, %d lights",
                 package.version,
                 renderedLayers.count,
                 document.compatibility.imageObjects,
+                particleRuntimes.count,
                 document.compatibility.particleObjects,
                 document.compatibility.soundObjects,
                 document.compatibility.lightObjects
@@ -205,6 +269,47 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
         needsLayout = true
     }
 
+    private func loadParticleSystems(package: ScenePackage, document: SceneDocument) {
+        particleRuntimes.forEach { $0.layer.removeFromSuperlayer() }
+        particleRuntimes.removeAll()
+        for model in document.particleSystems {
+            let runtime = SceneParticleRuntime(
+                model: model,
+                package: package,
+                rootURL: project.rootURL
+            )
+            // Metal renders offscreen; present via CALayer on the scene layer tree.
+            layer?.addSublayer(runtime.layer)
+            particleRuntimes.append(runtime)
+        }
+        applyParticleVisibilityFromUserProperties()
+        needsLayout = true
+    }
+
+    private func applyParticleVisibilityFromUserProperties() {
+        let properties = userProperties.objectValue ?? [:]
+        guard let document = sceneDocument else { return }
+        for (index, model) in document.particleSystems.enumerated() {
+            guard index < particleRuntimes.count else { break }
+            let visible: Bool
+            if let key = model.visibility.userPropertyKey,
+               let definition = properties[key]?.objectValue,
+               let value = definition["value"] {
+                switch value {
+                case .bool(let flag):
+                    visible = flag
+                case .number(let number):
+                    visible = number != 0
+                default:
+                    visible = model.visibility.defaultValue
+                }
+            } else {
+                visible = model.visibility.defaultValue
+            }
+            particleRuntimes[index].setVisible(visible)
+        }
+    }
+
     private func loadPreviewImage(package: ScenePackage) {
         if let rootURL = project.rootURL {
             let previewName = project.manifest?.preview ?? "preview.jpg"
@@ -244,23 +349,131 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
     }
 
     private func startMouseTracking() {
-        guard mouseTimer == nil, sceneDocument?.general.cameraParallax == true else { return }
+        guard mouseTimer == nil else { return }
+        let needsMouse = sceneDocument?.general.cameraParallax == true
+            || !(sceneDocument?.particleSystems.isEmpty ?? true)
+        guard needsMouse else { return }
         let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            self?.updateParallax()
+            self?.updateMouseDrivenEffects()
         }
         timer.tolerance = 1.0 / 240.0
         RunLoop.main.add(timer, forMode: .common)
         mouseTimer = timer
     }
 
-    private func updateParallax() {
-        guard let document = sceneDocument,
-              document.general.cameraParallax else {
-            return
+    private func startParticleSimulation() {
+        guard particleTimer == nil, !particleRuntimes.isEmpty else { return }
+        lastParticleTick = CACurrentMediaTime()
+        // 12 FPS is enough for soft petals; lower than scene freeze path.
+        let timer = Timer(timeInterval: 1.0 / 12.0, repeats: true) { [weak self] _ in
+            self?.tickParticles()
+        }
+        timer.tolerance = 1.0 / 24.0
+        RunLoop.main.add(timer, forMode: .common)
+        particleTimer = timer
+    }
+
+    private func tickParticles() {
+        // Independent of scene freeze (isRenderingEnabled): only runtimes that
+        // are enabled tick. Desktop-hidden path calls setParticlesActive(false).
+        let now = CACurrentMediaTime()
+        let delta = min(max(now - lastParticleTick, 1.0 / 30.0), 0.15)
+        lastParticleTick = now
+        for runtime in particleRuntimes {
+            runtime.tick(delta: delta)
+        }
+    }
+
+    /// Test/debug: drive particle systems with a synthetic cursor sample.
+    func debugDriveParticles(point: CGPoint, inDesktop: Bool, delta: TimeInterval) {
+        isRenderingEnabled = true
+        for runtime in particleRuntimes {
+            runtime.setEnabled(true)
+            runtime.setVisible(true)
+            runtime.debugBypassStartTime()
+            runtime.updateMouse(desktopPoint: point, inDesktop: inDesktop)
+            runtime.tick(delta: delta)
+        }
+    }
+
+    func debugParticleCount() -> Int {
+        particleRuntimes.reduce(0) { $0 + $1.debugParticleCount() }
+    }
+
+    func debugExportSpriteFrames(toDirectory directory: String) {
+        particleRuntimes.first?.debugExportFrames(toDirectory: directory)
+    }
+
+    /// Snapshot only particle host layers (transparent background).
+    func debugSnapshotParticlesOnly() -> NSImage? {
+        layoutSubtreeIfNeeded()
+        // Force particle hosts on top.
+        for runtime in particleRuntimes {
+            runtime.layer.zPosition = 10_000
+        }
+        guard let host = particleRuntimes.first?.layer else { return nil }
+        let bounds = host.bounds
+        guard bounds.width > 1, bounds.height > 1 else {
+            // Fall back to view bounds if host not laid out.
+            let b = self.bounds
+            guard let rep = bitmapImageRepForCachingDisplay(in: b) else { return nil }
+            // Hide image layers temporarily
+            let hidden = renderedLayers.map(\.layer.isHidden)
+            renderedLayers.forEach { $0.layer.isHidden = true }
+            previewLayer.isHidden = true
+            cacheDisplay(in: b, to: rep)
+            for (i, layer) in renderedLayers.map(\.layer).enumerated() {
+                layer.isHidden = hidden[i]
+            }
+            previewLayer.isHidden = renderedLayers.isEmpty ? false : true
+            let image = NSImage(size: b.size)
+            image.addRepresentation(rep)
+            return image
+        }
+        let scale = window?.backingScaleFactor ?? 2
+        let pixels = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        guard let ctx = CGContext(
+            data: nil,
+            width: Int(pixels.width),
+            height: Int(pixels.height),
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return nil
+        }
+        ctx.scaleBy(x: scale, y: scale)
+        host.render(in: ctx)
+        guard let cg = ctx.makeImage() else { return nil }
+        return NSImage(cgImage: cg, size: bounds.size)
+    }
+
+    private func updateMouseDrivenEffects() {
+        let global = NSEvent.mouseLocation
+        let inDesktop = desktopFrame.contains(global)
+        // Map desktop global point into this view's coordinates.
+        let viewPoint: CGPoint?
+        if inDesktop, let window {
+            let windowPoint = window.convertPoint(fromScreen: global)
+            viewPoint = convert(windowPoint, from: nil)
+        } else if inDesktop {
+            // Borderless desktop window: global ≈ window base coords for primary layouts.
+            viewPoint = CGPoint(
+                x: global.x - desktopFrame.minX,
+                y: global.y - desktopFrame.minY
+            )
+        } else {
+            viewPoint = nil
         }
 
-        let global = NSEvent.mouseLocation
-        guard desktopFrame.contains(global),
+        for runtime in particleRuntimes {
+            runtime.updateMouse(desktopPoint: viewPoint, inDesktop: inDesktop)
+        }
+
+        guard let document = sceneDocument,
+              document.general.cameraParallax,
+              inDesktop,
               hypot(global.x - lastMouseLocation.x, global.y - lastMouseLocation.y) >= 0.25 else {
             return
         }
@@ -351,6 +564,17 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
             imageLayer.setAffineTransform(CGAffineTransform(rotationAngle: -angle))
             renderedLayers[index].basePosition = imageLayer.position
         }
+        let uniformScale = (sceneScaleX + sceneScaleY) * 0.5
+        for runtime in particleRuntimes {
+            if runtime.layer.superlayer !== layer {
+                layer?.addSublayer(runtime.layer)
+            }
+            runtime.updateLayout(
+                viewBounds: bounds,
+                canvasSize: CGSize(width: canvasWidth, height: canvasHeight),
+                sceneScale: uniformScale
+            )
+        }
         CATransaction.commit()
     }
 
@@ -393,15 +617,28 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
     }
 
     private func pauseLayerAnimations() {
-        guard let layer, layer.speed != 0 else { return }
-        let pausedTime = layer.convertTime(CACurrentMediaTime(), from: nil)
-        layer.speed = 0
-        layer.timeOffset = pausedTime
+        guard let layer else { return }
+        if layer.speed != 0 {
+            let pausedTime = sessionPausedLayerTime
+                ?? layer.convertTime(CACurrentMediaTime(), from: nil)
+            if sessionPausedLayerTime == nil {
+                sessionPausedLayerTime = pausedTime
+            }
+            layer.speed = 0
+            layer.timeOffset = sessionPausedLayerTime ?? pausedTime
+            return
+        }
+        // Already paused: snap back to the session lock if a false resume advanced time.
+        if let locked = sessionPausedLayerTime {
+            layer.timeOffset = locked
+        } else {
+            sessionPausedLayerTime = layer.timeOffset
+        }
     }
 
     private func resumeLayerAnimations() {
         guard let layer, layer.speed == 0 else { return }
-        let pausedTime = layer.timeOffset
+        let pausedTime = sessionPausedLayerTime ?? layer.timeOffset
         layer.speed = 1
         layer.timeOffset = 0
         layer.beginTime = 0

@@ -125,6 +125,9 @@ enum DesktopVisibility {
         return false
     }
 
+    /// Whether a wallpaper click/feed should be delivered at this Quartz point.
+    /// Ignores desktop chrome (Finder desktop shell, Dock, menu extras) that would
+    /// otherwise make the entire desktop look "covered" and block left-click feeds.
     static func isDesktopExposed(at quartzPoint: CGPoint) -> Bool {
         let options: CGWindowListOption = [
             .optionOnScreenOnly,
@@ -134,22 +137,35 @@ enum DesktopVisibility {
             options,
             kCGNullWindowID
         ) as? [[String: Any]] else {
-            return false
+            // Fail open: better to deliver a feed click than never receive one.
+            return true
         }
 
         let ownPID = ProcessInfo.processInfo.processIdentifier
+        let screenBounds = NSScreen.screens.map { desktopQuartzBounds(for: $0) }
         let coveringBounds = windowInfo.compactMap { info -> CGRect? in
             let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
             let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue
             let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
+            let owner = (info[kCGWindowOwnerName as String] as? String) ?? ""
             guard ownerPID != ownPID,
                   let layer,
                   layer >= 0,
-                  alpha > 0.01,
+                  // Menus / Dock / overlays sit above normal app content.
+                  layer <= 15,
+                  alpha > 0.05,
+                  !isWallpaperInputIgnoredOwner(owner),
                   let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
                   let bounds = CGRect(
                       dictionaryRepresentation: boundsDictionary as CFDictionary
-                  ) else {
+                  ),
+                  bounds.width > 2,
+                  bounds.height > 2 else {
+                return nil
+            }
+            // Finder (and similar) keep a full-display shell window for icons.
+            // It covers empty desktop pixels too and must not block wallpaper clicks.
+            if isLikelyDesktopShellWindow(owner: owner, bounds: bounds, screens: screenBounds) {
                 return nil
             }
             return bounds
@@ -162,5 +178,54 @@ enum DesktopVisibility {
         coveredBy windowBounds: [CGRect]
     ) -> Bool {
         !windowBounds.contains { $0.contains(point) }
+    }
+
+    /// AppKit global (bottom-left) → Quartz global (top-left of primary).
+    static func quartzPoint(fromAppKit point: CGPoint) -> CGPoint {
+        let primaryHeight = NSScreen.screens.first(where: {
+            $0.frame.origin == .zero
+        })?.frame.height
+            ?? NSScreen.main?.frame.height
+            ?? 0
+        return CGPoint(x: point.x, y: primaryHeight - point.y)
+    }
+
+    private static func desktopQuartzBounds(for screen: NSScreen) -> CGRect {
+        let id = (screen.deviceDescription[
+            NSDeviceDescriptionKey("NSScreenNumber")
+        ] as? NSNumber)?.uint32Value ?? 0
+        return desktopQuartzBounds(displayID: CGDirectDisplayID(id), screen: screen)
+    }
+
+    private static func isWallpaperInputIgnoredOwner(_ owner: String) -> Bool {
+        let ignored: Set<String> = [
+            "Dock",
+            "Control Center",
+            "Notification Center",
+            "SystemUIServer",
+            "Window Server",
+            "Spotlight",
+            "TextInputMenuAgent",
+            "TextInputSwitcher",
+            "loginwindow",
+            "Wallpaper",
+            "Wallpapers"
+        ]
+        return ignored.contains(owner)
+    }
+
+    private static func isLikelyDesktopShellWindow(
+        owner: String,
+        bounds: CGRect,
+        screens: [CGRect]
+    ) -> Bool {
+        // Full-display Finder windows are the desktop/icon surface, not apps.
+        guard owner == "Finder" else { return false }
+        return screens.contains { screen in
+            abs(bounds.width - screen.width) < 4
+                && abs(bounds.height - screen.height) < 80
+                && abs(bounds.minX - screen.minX) < 4
+                && abs(bounds.minY - screen.minY) < 80
+        }
     }
 }

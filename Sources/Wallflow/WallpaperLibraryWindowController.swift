@@ -1,4 +1,5 @@
 import AppKit
+import CoreGraphics
 
 final class WallpaperLibraryWindowController: NSWindowController,
     NSTableViewDataSource,
@@ -8,37 +9,48 @@ final class WallpaperLibraryWindowController: NSWindowController,
         let title: String
         let kind: String
         let source: String
-        let isCurrent: Bool
+        /// Normalized source token for assignment comparison.
+        let sourceToken: String
         let isAvailable: Bool
+        /// Displays currently showing this wallpaper (localized names).
+        let activeDisplayNames: [String]
     }
 
     private enum ImportAction: Int {
         case file = 1
         case url = 2
+        case enginePack = 3
     }
 
     private let tableView = NSTableView()
     private let useButton = NSButton()
     private let removeButton = NSButton()
     private let revealButton = NSButton()
+    private let targetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private var rows: [Row] = []
-    private let onUse: (WallpaperLibraryEntry?) -> Void
+    private var displayOptions: [(target: DisplayWallpaperTarget, title: String)] = []
+    private var activeAssignments: [CGDirectDisplayID: String] = [:]
+    private let onUse: (WallpaperLibraryEntry?, DisplayWallpaperTarget) -> Void
     private let onLocateUnavailable: (WallpaperLibraryEntry) -> Void
     private let onRemove: (WallpaperLibraryEntry) -> Void
     private let onReveal: (WallpaperLibraryEntry) -> Void
     private let onImportFile: () -> Void
     private let onImportURL: () -> Void
+    private let onImportEnginePack: () -> Void
+    private let enginePackStatusLabel = NSTextField(labelWithString: "")
 
     init(
         entries: [WallpaperLibraryEntry],
-        currentEntryID: UUID?,
-        isBuiltInCurrent: Bool,
-        onUse: @escaping (WallpaperLibraryEntry?) -> Void,
+        activeAssignments: [CGDirectDisplayID: String],
+        displayOptions: [(target: DisplayWallpaperTarget, title: String)],
+        enginePackInstalled: Bool,
+        onUse: @escaping (WallpaperLibraryEntry?, DisplayWallpaperTarget) -> Void,
         onLocateUnavailable: @escaping (WallpaperLibraryEntry) -> Void,
         onRemove: @escaping (WallpaperLibraryEntry) -> Void,
         onReveal: @escaping (WallpaperLibraryEntry) -> Void,
         onImportFile: @escaping () -> Void,
-        onImportURL: @escaping () -> Void
+        onImportURL: @escaping () -> Void,
+        onImportEnginePack: @escaping () -> Void
     ) {
         self.onUse = onUse
         self.onLocateUnavailable = onLocateUnavailable
@@ -46,22 +58,24 @@ final class WallpaperLibraryWindowController: NSWindowController,
         self.onReveal = onReveal
         self.onImportFile = onImportFile
         self.onImportURL = onImportURL
+        self.onImportEnginePack = onImportEnginePack
 
         let window = NSWindow(
-            contentRect: CGRect(x: 0, y: 0, width: 760, height: 460),
+            contentRect: CGRect(x: 0, y: 0, width: 820, height: 480),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = L10n.text(.libraryWindowTitle)
-        window.minSize = NSSize(width: 620, height: 340)
+        window.minSize = NSSize(width: 680, height: 360)
         window.isReleasedWhenClosed = false
         super.init(window: window)
         window.contentView = makeContentView()
         update(
             entries: entries,
-            currentEntryID: currentEntryID,
-            isBuiltInCurrent: isBuiltInCurrent
+            activeAssignments: activeAssignments,
+            displayOptions: displayOptions,
+            enginePackInstalled: enginePackInstalled
         )
     }
 
@@ -72,29 +86,56 @@ final class WallpaperLibraryWindowController: NSWindowController,
 
     func update(
         entries: [WallpaperLibraryEntry],
-        currentEntryID: UUID?,
-        isBuiltInCurrent: Bool
+        activeAssignments: [CGDirectDisplayID: String],
+        displayOptions: [(target: DisplayWallpaperTarget, title: String)],
+        enginePackInstalled: Bool
     ) {
+        self.activeAssignments = activeAssignments
+        self.displayOptions = displayOptions
+        enginePackStatusLabel.stringValue = enginePackInstalled
+            ? L10n.text(.libraryEnginePackInstalled)
+            : L10n.text(.libraryEnginePackMissing)
+        enginePackStatusLabel.textColor = enginePackInstalled
+            ? .secondaryLabelColor
+            : .systemOrange
+        rebuildTargetPopup()
+
+        let nameByDisplay = Dictionary(
+            uniqueKeysWithValues: displayOptions.compactMap { option -> (CGDirectDisplayID, String)? in
+                guard case .display(let id) = option.target else { return nil }
+                return (id, option.title)
+            }
+        )
+
+        let builtInNames = activeAssignments.compactMap { id, token -> String? in
+            token == DisplayWallpaperStore.builtInToken ? nameByDisplay[id] : nil
+        }
         let builtIn = Row(
             entry: nil,
             title: L10n.text(.nativeScene),
             kind: L10n.text(.libraryTypeBuiltIn),
             source: L10n.text(.libraryBuiltInSource),
-            isCurrent: isBuiltInCurrent,
-            isAvailable: true
+            sourceToken: DisplayWallpaperStore.builtInToken,
+            isAvailable: true,
+            activeDisplayNames: builtInNames
         )
         rows = [builtIn] + entries.map { entry in
-            Row(
+            let token = Self.normalizedSource(entry.sourceURL)
+            let names = activeAssignments.compactMap { id, assigned -> String? in
+                assigned == token ? nameByDisplay[id] : nil
+            }
+            return Row(
                 entry: entry,
                 title: entry.title,
                 kind: localizedKind(entry.kind),
                 source: displaySource(entry),
-                isCurrent: entry.id == currentEntryID,
-                isAvailable: entry.isAvailable
+                sourceToken: token,
+                isAvailable: entry.isAvailable,
+                activeDisplayNames: names
             )
         }
         tableView.reloadData()
-        if let currentRow = rows.firstIndex(where: \Row.isCurrent) {
+        if let currentRow = rows.firstIndex(where: { !$0.activeDisplayNames.isEmpty }) {
             tableView.selectRowIndexes(IndexSet(integer: currentRow), byExtendingSelection: false)
             tableView.scrollRowToVisible(currentRow)
         } else if !rows.isEmpty {
@@ -117,19 +158,30 @@ final class WallpaperLibraryWindowController: NSWindowController,
         switch tableColumn.identifier.rawValue {
         case "current":
             let cell = imageCell(identifier: tableColumn.identifier)
-            cell.imageView?.image = model.isCurrent
-                ? NSImage(
+            cell.imageView?.image = model.activeDisplayNames.isEmpty
+                ? nil
+                : NSImage(
                     systemSymbolName: "checkmark.circle.fill",
                     accessibilityDescription: L10n.text(.libraryCurrent)
                 )
-                : nil
-            cell.toolTip = model.isCurrent ? L10n.text(.libraryCurrent) : nil
+            cell.toolTip = model.activeDisplayNames.isEmpty
+                ? nil
+                : model.activeDisplayNames.joined(separator: ", ")
             return cell
         case "type":
             return textCell(
                 identifier: tableColumn.identifier,
                 value: model.kind,
                 color: .secondaryLabelColor
+            )
+        case "displays":
+            let value = model.activeDisplayNames.isEmpty
+                ? "—"
+                : model.activeDisplayNames.joined(separator: ", ")
+            return textCell(
+                identifier: tableColumn.identifier,
+                value: value,
+                color: model.activeDisplayNames.isEmpty ? .tertiaryLabelColor : .secondaryLabelColor
             )
         case "source":
             return textCell(
@@ -153,9 +205,11 @@ final class WallpaperLibraryWindowController: NSWindowController,
     }
 
     @objc private func useSelectedWallpaper() {
-        guard let row = selectedRow, !row.isCurrent else { return }
+        guard let row = selectedRow else { return }
+        let target = selectedTarget()
+        if isAssigned(row, to: target) { return }
         if row.isAvailable {
-            onUse(row.entry)
+            onUse(row.entry, target)
         } else if let entry = row.entry {
             onLocateUnavailable(entry)
         }
@@ -179,6 +233,7 @@ final class WallpaperLibraryWindowController: NSWindowController,
         switch ImportAction(rawValue: sender.tag) {
         case .file: onImportFile()
         case .url: onImportURL()
+        case .enginePack: onImportEnginePack()
         case nil: break
         }
     }
@@ -202,6 +257,17 @@ final class WallpaperLibraryWindowController: NSWindowController,
         urlItem.target = self
         urlItem.tag = ImportAction.url.rawValue
         menu.addItem(urlItem)
+
+        menu.addItem(.separator())
+        let packItem = NSMenuItem(
+            title: L10n.text(.libraryImportEnginePack),
+            action: #selector(importSelected(_:)),
+            keyEquivalent: ""
+        )
+        packItem.target = self
+        packItem.tag = ImportAction.enginePack.rawValue
+        menu.addItem(packItem)
+
         menu.popUp(
             positioning: nil,
             at: NSPoint(x: 0, y: sender.bounds.maxY + 4),
@@ -213,9 +279,29 @@ final class WallpaperLibraryWindowController: NSWindowController,
         useSelectedWallpaper()
     }
 
+    @objc private func targetChanged() {
+        updateActions()
+    }
+
     private var selectedRow: Row? {
         guard rows.indices.contains(tableView.selectedRow) else { return nil }
         return rows[tableView.selectedRow]
+    }
+
+    private func selectedTarget() -> DisplayWallpaperTarget {
+        let index = targetPopup.indexOfSelectedItem
+        guard displayOptions.indices.contains(index) else { return .all }
+        return displayOptions[index].target
+    }
+
+    private func isAssigned(_ row: Row, to target: DisplayWallpaperTarget) -> Bool {
+        switch target {
+        case .all:
+            guard !activeAssignments.isEmpty else { return false }
+            return activeAssignments.values.allSatisfy { $0 == row.sourceToken }
+        case .display(let id):
+            return activeAssignments[id] == row.sourceToken
+        }
     }
 
     private func makeContentView() -> NSView {
@@ -237,9 +323,15 @@ final class WallpaperLibraryWindowController: NSWindowController,
         tableView.doubleAction = #selector(tableDoubleClicked)
 
         addColumn(identifier: "current", title: "", width: 36, minWidth: 36, maxWidth: 36)
-        addColumn(identifier: "title", title: L10n.text(.libraryColumnName), width: 220)
-        addColumn(identifier: "type", title: L10n.text(.libraryColumnType), width: 92, minWidth: 76)
-        addColumn(identifier: "source", title: L10n.text(.libraryColumnSource), width: 360)
+        addColumn(identifier: "title", title: L10n.text(.libraryColumnName), width: 200)
+        addColumn(identifier: "type", title: L10n.text(.libraryColumnType), width: 80, minWidth: 70)
+        addColumn(
+            identifier: "displays",
+            title: L10n.text(.libraryColumnDisplays),
+            width: 140,
+            minWidth: 100
+        )
+        addColumn(identifier: "source", title: L10n.text(.libraryColumnSource), width: 300)
         scrollView.documentView = tableView
 
         let importButton = makeImportButton()
@@ -261,14 +353,33 @@ final class WallpaperLibraryWindowController: NSWindowController,
         useButton.target = self
         useButton.action = #selector(useSelectedWallpaper)
 
-        let buttonBar = NSStackView(views: [importButton, revealButton, removeButton])
+        let targetLabel = NSTextField(labelWithString: L10n.text(.libraryApplyTo))
+        targetLabel.translatesAutoresizingMaskIntoConstraints = false
+        targetPopup.translatesAutoresizingMaskIntoConstraints = false
+        targetPopup.target = self
+        targetPopup.action = #selector(targetChanged)
+        targetPopup.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let buttonBar = NSStackView(views: [
+            importButton,
+            revealButton,
+            removeButton,
+            targetLabel,
+            targetPopup
+        ])
         buttonBar.translatesAutoresizingMaskIntoConstraints = false
         buttonBar.orientation = .horizontal
         buttonBar.alignment = .centerY
         buttonBar.spacing = 8
 
+        enginePackStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+        enginePackStatusLabel.font = NSFont.systemFont(ofSize: 11)
+        enginePackStatusLabel.lineBreakMode = .byTruncatingMiddle
+        enginePackStatusLabel.toolTip = EngineAssetStore.shared.particleRootURL.path
+
         contentView.addSubview(scrollView)
         contentView.addSubview(buttonBar)
+        contentView.addSubview(enginePackStatusLabel)
         contentView.addSubview(useButton)
         useButton.translatesAutoresizingMaskIntoConstraints = false
 
@@ -278,12 +389,39 @@ final class WallpaperLibraryWindowController: NSWindowController,
             scrollView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
             scrollView.bottomAnchor.constraint(equalTo: buttonBar.topAnchor, constant: -12),
             buttonBar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
-            buttonBar.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -14),
+            buttonBar.bottomAnchor.constraint(equalTo: enginePackStatusLabel.topAnchor, constant: -8),
+            enginePackStatusLabel.leadingAnchor.constraint(
+                equalTo: contentView.leadingAnchor,
+                constant: 16
+            ),
+            enginePackStatusLabel.trailingAnchor.constraint(
+                lessThanOrEqualTo: useButton.leadingAnchor,
+                constant: -12
+            ),
+            enginePackStatusLabel.bottomAnchor.constraint(
+                equalTo: contentView.bottomAnchor,
+                constant: -12
+            ),
+            targetPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
+            targetPopup.widthAnchor.constraint(lessThanOrEqualToConstant: 260),
             useButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
             useButton.centerYAnchor.constraint(equalTo: buttonBar.centerYAnchor),
             useButton.leadingAnchor.constraint(greaterThanOrEqualTo: buttonBar.trailingAnchor, constant: 12)
         ])
         return contentView
+    }
+
+    private func rebuildTargetPopup() {
+        let previous = targetPopup.indexOfSelectedItem
+        targetPopup.removeAllItems()
+        for option in displayOptions {
+            targetPopup.addItem(withTitle: option.title)
+        }
+        if displayOptions.indices.contains(previous) {
+            targetPopup.selectItem(at: previous)
+        } else if !displayOptions.isEmpty {
+            targetPopup.selectItem(at: 0)
+        }
     }
 
     private func makeImportButton() -> NSButton {
@@ -383,13 +521,15 @@ final class WallpaperLibraryWindowController: NSWindowController,
             revealButton.isEnabled = false
             return
         }
+        let target = selectedTarget()
+        let alreadyAssigned = isAssigned(row, to: target)
         let primaryAction = row.isAvailable ? L10n.text(.libraryUse) : L10n.text(.libraryLocate)
         useButton.title = primaryAction
         useButton.image = NSImage(
             systemSymbolName: row.isAvailable ? "play.fill" : "folder.badge.questionmark",
             accessibilityDescription: primaryAction
         )
-        useButton.isEnabled = !row.isCurrent && (row.isAvailable || row.entry != nil)
+        useButton.isEnabled = !alreadyAssigned && (row.isAvailable || row.entry != nil)
         removeButton.isEnabled = row.entry != nil
         revealButton.isEnabled = row.entry?.sourceURL.isFileURL == true && row.isAvailable
     }
@@ -404,9 +544,14 @@ final class WallpaperLibraryWindowController: NSWindowController,
     }
 
     private func displaySource(_ entry: WallpaperLibraryEntry) -> String {
-        if entry.sourceURL.isFileURL {
-            return (entry.sourceURL.path as NSString).abbreviatingWithTildeInPath
+        let url = entry.sourceURL
+        if url.isFileURL {
+            return url.path
         }
-        return entry.sourceURL.absoluteString
+        return url.absoluteString
+    }
+
+    private static func normalizedSource(_ url: URL) -> String {
+        url.isFileURL ? url.standardizedFileURL.path : url.absoluteString
     }
 }

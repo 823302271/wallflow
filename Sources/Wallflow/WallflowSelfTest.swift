@@ -17,6 +17,7 @@ enum WallflowSelfTest {
         try testLocalizationResources()
         try testWallpaperSnapshotPreservesResolution()
         try testDesktopVisibilityRules()
+        try testDisplaySpaceTransitionIsolation()
         try testLocalWallpaperImportIsPersistent()
         try testWallpaperLibrary()
         try testWebManifest()
@@ -147,6 +148,54 @@ enum WallflowSelfTest {
                 coveredBy: [applicationWindow]
             ),
             "A click on exposed desktop was incorrectly blocked"
+        )
+        // Full-display shell windows (Finder desktop) must not block wallpaper feeds.
+        try expect(
+            DesktopVisibility.isDesktopExposed(
+                at: CGPoint(x: 100, y: 100),
+                coveredBy: []
+            ),
+            "Empty cover list should expose the desktop"
+        )
+    }
+
+    private static func testDisplaySpaceTransitionIsolation() throws {
+        let mainDisplay: CGDirectDisplayID = 101
+        let secondaryDisplay: CGDirectDisplayID = 202
+        var state = DisplaySpaceTransitionState()
+
+        let firstGeneration = state.begin(
+            for: secondaryDisplay,
+            now: 10,
+            quietPeriod: 0.85
+        )
+        try expect(firstGeneration == 1, "Secondary display generation did not start")
+        try expect(
+            state.isQuiet(for: secondaryDisplay, now: 10.5),
+            "Secondary display Space hold was not active"
+        )
+        try expect(
+            !state.isQuiet(for: mainDisplay, now: 10.5),
+            "Secondary display Space hold leaked to the main display"
+        )
+        try expect(
+            state.generation(for: mainDisplay) == 0,
+            "Secondary display navigation changed the main display generation"
+        )
+
+        let secondGeneration = state.begin(
+            for: secondaryDisplay,
+            now: 10.4,
+            quietPeriod: 0.85
+        )
+        try expect(secondGeneration == 2, "A repeated hop did not advance its display")
+        try expect(
+            state.isQuiet(for: secondaryDisplay, now: 11.2),
+            "A repeated hop did not extend its display hold"
+        )
+        try expect(
+            !state.isQuiet(for: secondaryDisplay, now: 11.3),
+            "Display hold remained active after its quiet period"
         )
     }
 
@@ -498,6 +547,135 @@ enum WallflowSelfTest {
             document.imageLayers.first?.texturePath == "/materials/background.tex",
             "Scene material texture path was not resolved"
         )
+
+        // Workshop-style packaging: string vectors + material.passes textures.
+        let workshopScene = Data(
+            """
+            {
+              "general": {
+                "clearcolor": "0.7 0.7 0.7",
+                "orthogonalprojection": { "width": 5120, "height": 2880 }
+              },
+              "objects": [
+                {
+                  "id": 16,
+                  "image": "models/pc.json",
+                  "origin": "2560.0 1440.0 0.0",
+                  "size": "5120.0 2880.0",
+                  "scale": "1 1 1"
+                }
+              ]
+            }
+            """.utf8
+        )
+        let workshopModel = Data(
+            """
+            { "autosize": true, "material": "materials/pc.json" }
+            """.utf8
+        )
+        let workshopMaterial = Data(
+            """
+            {
+              "passes": [
+                { "shader": "genericimage4", "textures": ["pc"] }
+              ]
+            }
+            """.utf8
+        )
+        let workshopPackage = try ScenePackage(
+            data: makePackage(
+                version: "PKGV0021",
+                entries: [
+                    ("scene.json", workshopScene),
+                    ("models/pc.json", workshopModel),
+                    ("materials/pc.json", workshopMaterial),
+                    ("materials/pc.tex", textureData)
+                ]
+            )
+        )
+        let workshopDocument = try SceneDocument(package: workshopPackage)
+        try expect(
+            workshopDocument.imageLayers.count == 1,
+            "Workshop-style scene image layer was not resolved"
+        )
+        try expect(
+            abs((workshopDocument.imageLayers.first?.width ?? 0) - 5120) < 0.1,
+            "Workshop scene object size string was not parsed"
+        )
+        try expect(
+            workshopDocument.imageLayers.first?.texturePath == "/materials/pc.tex",
+            "Workshop material passes texture was not resolved"
+        )
+        try expect(
+            abs((workshopDocument.general.clearColor.first ?? 0) - 0.7) < 0.01,
+            "Workshop clearcolor string was not parsed"
+        )
+
+        // Mouse-petal style particle system (control-point flags + passes material).
+        let petalScene = Data(
+            """
+            {
+              "general": { "orthogonalprojection": { "width": 1000, "height": 1000 } },
+              "objects": [
+                {
+                  "id": 71,
+                  "particle": "particles/petals.json",
+                  "origin": "500 500 0",
+                  "visible": { "user": "newproperty", "value": true }
+                }
+              ]
+            }
+            """.utf8
+        )
+        let petalSystem = Data(
+            """
+            {
+              "controlpoint": [{ "flags": 1, "id": 0, "offset": "0 0 0" }],
+              "emitter": [{ "name": "sphererandom", "rate": 20, "distancemax": 32, "distancemin": 0 }],
+              "initializer": [
+                { "name": "lifetimerandom", "min": 2, "max": 4 },
+                { "name": "sizerandom", "min": 36, "max": 72 },
+                { "name": "velocityrandom", "min": "-100 -100 0", "max": "50 50 0" },
+                { "name": "colorrandom", "min": "255 132 241", "max": "255 255 255" }
+              ],
+              "material": "materials/particle/halo_3.json",
+              "maxcount": 100,
+              "operator": [
+                { "name": "movement", "drag": 0.4 },
+                { "name": "alphafade", "fadeintime": 0.1, "fadeouttime": 0.1 }
+              ],
+              "starttime": 0
+            }
+            """.utf8
+        )
+        let petalMaterial = Data(
+            """
+            { "passes": [{ "shader": "genericparticle", "textures": ["particle/nature/rosepetals"] }] }
+            """.utf8
+        )
+        let petalPackage = try ScenePackage(
+            data: makePackage(
+                version: "PKGV0021",
+                entries: [
+                    ("scene.json", petalScene),
+                    ("particles/petals.json", petalSystem),
+                    ("materials/particle/halo_3.json", petalMaterial)
+                ]
+            )
+        )
+        let petalDocument = try SceneDocument(package: petalPackage)
+        try expect(
+            petalDocument.particleSystems.count == 1,
+            "Mouse petal particle system was not parsed"
+        )
+        try expect(
+            petalDocument.particleSystems[0].followMouse,
+            "Particle control-point flags did not enable mouse follow"
+        )
+        try expect(
+            petalDocument.particleSystems[0].visibility.userPropertyKey == "newproperty",
+            "Particle user-property visibility was not parsed"
+        )
     }
 
     private static func testUnsafePackagePath() throws {
@@ -699,8 +877,10 @@ enum WallflowSelfTest {
             ]
         )
         try package.write(to: directory.appendingPathComponent("scene.pkg"))
+        // Wallpaper Engine workshop projects declare scene.json while the bytes
+        // live in scene.pkg — the loader must resolve that packaging layout.
         try """
-        { "file": "scene.pkg", "type": "scene", "title": "Scene Fixture" }
+        { "file": "scene.json", "type": "Scene", "title": "Scene Fixture" }
         """.write(
             to: directory.appendingPathComponent("project.json"),
             atomically: true,
@@ -708,6 +888,14 @@ enum WallflowSelfTest {
         )
 
         let project = try WallpaperProjectLoader.load(directory)
+        try expect(
+            project.kind == .scene,
+            "Scene project with capitalised type was not recognised"
+        )
+        try expect(
+            project.entryURL?.lastPathComponent == "scene.pkg",
+            "Scene project did not resolve scene.json to scene.pkg"
+        )
         let view = SceneWallpaperView(
             frame: CGRect(x: 0, y: 0, width: 320, height: 180),
             desktopFrame: CGRect(x: 0, y: 0, width: 320, height: 180),
@@ -728,6 +916,12 @@ enum WallflowSelfTest {
         view.setRenderingEnabled(false)
         try expect(view.layer?.speed == 0, "Scene animations did not pause")
         view.setRenderingEnabled(true)
+        // Resume deliberately starts on the next run-loop turn so the host can
+        // drop its freeze overlay while the layer is still on the pause frame.
+        let deadline = Date().addingTimeInterval(0.5)
+        while (view.layer?.speed ?? 0) != 1, Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
         try expect(view.layer?.speed == 1, "Scene animations did not resume")
     }
 
