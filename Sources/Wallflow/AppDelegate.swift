@@ -63,6 +63,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let hiddenCoverageWatchdogInterval: TimeInterval = 3.0
     private var globalMouseMonitor: Any?
     private var previousWindowAreas: [UInt32: CGFloat] = [:]
+    /// Displays whose next fallback publish must happen immediately so the
+    /// system desktop picture matches the freeze before a Dock/Space animation.
+    private var immediateFallbackDisplayIDs: Set<CGDirectDisplayID> = []
+    private static let desktopActivationBundleIDs: Set<String> = [
+        "com.apple.finder",
+        "com.apple.dock"
+    ]
     /// Settle time before a paused still is pushed to the system desktop picture.
     /// Must stay far below how quickly a user can hop back: the picture is what the
     /// Space animation shows, so anything slower than the round trip means they see
@@ -290,8 +297,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             || isClickInDockMargin(quartzPoint) else {
             return
         }
-        NSLog("Wallflow dock click — sampling restore surface")
+        // Pin the live frame now so the system desktop picture is ready before
+        // WindowServer's restore zoom. Returning then shows that same still.
+        if let controller = wallpaperControllers.first(where: {
+            $0.displayBounds.contains(quartzPoint)
+        }), !controller.isDesktopHidden {
+            NSLog(
+                "Wallflow display %u dock click — freezing live desktop",
+                controller.displayID
+            )
+            freezeLeavingDesktop(controller)
+        }
         evaluateForegroundCoverage()
+    }
+
+    private func freezeLeavingDesktop(_ controller: DesktopWindowController) {
+        immediateFallbackDisplayIDs.insert(controller.displayID)
+        pauseProbeState.cancel(for: controller.displayID)
+        resumeProbeState.cancel(for: controller.displayID)
+        applyDesktopHidden(true, to: controller)
     }
 
     private func isClickInDockMargin(_ quartzPoint: CGPoint) -> Bool {
@@ -302,15 +326,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Freeze displays that the activating app already covers on-screen.
-    /// Off-screen windows are often invisible to CGWindowList; the live watchdog
-    /// catches the Dock restore surface instead of guessing from a missing window.
+    /// Freeze live desktops that an activating app is about to cover.
+    ///
+    /// Must not run when the desktop is already paused: returning from a
+    /// full-screen app activates Finder and that used to freeze again, delaying
+    /// resume. The still is published immediately so the Dock/Space return
+    /// animation shows the same frame the user left.
     private func freezeDisplaysCoveredByIncomingApplication(_ app: NSRunningApplication) {
         guard isCoverageAutoPauseEnabled else { return }
         let pid = app.processIdentifier
         guard pid > 0,
               pid != ProcessInfo.processInfo.processIdentifier,
               app.activationPolicy == .regular else {
+            return
+        }
+        if let bundleID = app.bundleIdentifier,
+           Self.desktopActivationBundleIDs.contains(bundleID) {
             return
         }
         let onScreen = DesktopVisibility.visibleApplicationWindowBounds(
@@ -321,25 +352,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ownerPID: pid,
             onScreenOnly: false
         )
+        let mousePoint = DesktopVisibility.quartzPoint(fromAppKit: NSEvent.mouseLocation)
+        let preferredDisplayID = wallpaperControllers.first(where: {
+            $0.displayBounds.contains(mousePoint)
+        })?.displayID
         for controller in wallpaperControllers {
             let screenBounds = DesktopVisibility.desktopQuartzBounds(
                 displayID: controller.displayID,
                 screen: controller.screen
             )
-            guard DesktopVisibility.shouldFreezeForIncomingApplication(
+            guard DesktopVisibility.shouldFreezeLeavingDesktop(
+                isCurrentlyLive: !controller.isDesktopHidden,
                 screenBounds: screenBounds,
                 onScreenWindowBounds: onScreen,
-                allWindowBounds: allWindows
+                allWindowBounds: allWindows,
+                isPreferredDisplay: controller.displayID == preferredDisplayID
             ) else {
                 continue
             }
             NSLog(
-                "Wallflow display %u incoming covering window — pausing immediately",
-                controller.displayID
+                "Wallflow display %u leaving desktop — freezing for %@",
+                controller.displayID,
+                app.localizedName ?? "app"
             )
-            pauseProbeState.cancel(for: controller.displayID)
-            resumeProbeState.cancel(for: controller.displayID)
-            applyDesktopHidden(true, to: controller)
+            freezeLeavingDesktop(controller)
         }
     }
 
@@ -875,8 +911,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pendingFallbackImages[displayID] = image
         let generation = (fallbackPublishGeneration[displayID] ?? 0) + 1
         fallbackPublishGeneration[displayID] = generation
+        let delay = immediateFallbackDisplayIDs.contains(displayID)
+            ? 0
+            : Self.desktopFallbackPublishDelay
+        immediateFallbackDisplayIDs.remove(displayID)
         DispatchQueue.main.asyncAfter(
-            deadline: .now() + Self.desktopFallbackPublishDelay
+            deadline: .now() + delay
         ) { [weak self, weak controller] in
             guard let self,
                   let controller,
@@ -949,16 +989,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             screenBoundsByDisplay: boundsByDisplay
         )
         let windowSamples = DesktopVisibility.visibleApplicationWindowSamples()
-        var growingDisplayIDs = Set<CGDirectDisplayID>()
+        var animatingDisplayIDs = Set<CGDirectDisplayID>()
         for controller in controllers {
             let screenBounds = boundsByDisplay[controller.displayID] ?? controller.displayBounds
-            let growing = DesktopVisibility.growingRestoreWindowBounds(
+            let animating = DesktopVisibility.animatingRestoreWindowBounds(
                 current: windowSamples,
                 previousAreas: previousWindowAreas,
                 screenBounds: screenBounds
             )
-            if !growing.isEmpty {
-                growingDisplayIDs.insert(controller.displayID)
+            if !animating.isEmpty {
+                animatingDisplayIDs.insert(controller.displayID)
             }
         }
         previousWindowAreas = Dictionary(
@@ -966,7 +1006,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         for controller in controllers {
             if dockRestoreDisplayIDs.contains(controller.displayID)
-                || growingDisplayIDs.contains(controller.displayID) {
+                || animatingDisplayIDs.contains(controller.displayID) {
+                if !controller.isDesktopHidden {
+                    immediateFallbackDisplayIDs.insert(controller.displayID)
+                }
                 pauseProbeState.cancel(for: controller.displayID)
                 resumeProbeState.cancel(for: controller.displayID)
                 applyDesktopHidden(true, to: controller)
@@ -984,7 +1027,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     continue
                 }
                 if dockRestoreDisplayIDs.contains(controller.displayID)
-                    || growingDisplayIDs.contains(controller.displayID) {
+                    || animatingDisplayIDs.contains(controller.displayID) {
                     continue
                 }
                 if hiddenDisplayIDs.contains(controller.displayID) {

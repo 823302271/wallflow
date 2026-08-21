@@ -325,6 +325,10 @@ final class DesktopWindowController {
     }
 
     func ensureDesktopLayering() {
+        // Do not order the wallpaper forward while the desktop is hidden: a
+        // full-screen Dock restore would pop it into the animation and flicker
+        // on the way back.
+        guard !isDesktopHidden else { return }
         window.ignoresMouseEvents = true
         window.orderFrontRegardless()
     }

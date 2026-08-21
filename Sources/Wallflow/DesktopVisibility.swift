@@ -63,23 +63,33 @@ enum DesktopVisibility {
         }
     }
 
-    /// Whether activating an app already covers this display.
+    /// Whether activating an app should freeze this display *because we are
+    /// leaving a live desktop*.
     ///
-    /// Do not freeze just because the app has no on-screen window — returning to
-    /// the desktop often activates Finder with no covering window, and that delay
-    /// is what the user sees when switching back.
-    static func shouldFreezeForIncomingApplication(
+    /// Returning to the desktop also activates an app (often Finder). That must
+    /// not freeze again — the desktop is already paused, and an extra hold is
+    /// the long resume delay. Only freeze while the wallpaper is still live.
+    static func shouldFreezeLeavingDesktop(
+        isCurrentlyLive: Bool,
         screenBounds: CGRect,
         onScreenWindowBounds: [CGRect],
-        allWindowBounds: [CGRect]
+        allWindowBounds: [CGRect],
+        isPreferredDisplay: Bool
     ) -> Bool {
+        guard isCurrentlyLive else { return false }
         if isDisplayHidden(screenBounds, by: onScreenWindowBounds) {
             return true
         }
         if hasSignificantWindow(in: onScreenWindowBounds, on: screenBounds) {
             return false
         }
-        return isDisplayHidden(screenBounds, by: allWindowBounds)
+        if isDisplayHidden(screenBounds, by: allWindowBounds) {
+            return true
+        }
+        // No on-screen window: the app is coming from another Space or from the
+        // Dock. Freeze only the display the user clicked so other monitors keep
+        // playing.
+        return isPreferredDisplay
     }
 
     /// Owner of the frontmost on-screen window at a Quartz point.
@@ -225,14 +235,16 @@ enum DesktopVisibility {
         }
     }
 
-    /// Windows that just appeared large or grew quickly toward covering the display.
-    static func growingRestoreWindowBounds(
+    /// Windows that appeared large, or whose size is changing fast (Dock zoom in
+    /// or the reverse zoom back to the Dock). Either case must keep the desktop
+    /// frozen so returning does not reveal a live frame mid-animation.
+    static func animatingRestoreWindowBounds(
         current: [WindowAreaSample],
         previousAreas: [UInt32: CGFloat],
         screenBounds: CGRect,
         newWindowRatio: CGFloat = 0.25,
-        growthRatio: CGFloat = 0.12,
-        minimumRatio: CGFloat = 0.18
+        sizeChangeRatio: CGFloat = 0.08,
+        minimumRatio: CGFloat = 0.15
     ) -> [CGRect] {
         let screenArea = screenBounds.width * screenBounds.height
         guard screenArea > 0 else { return [] }
@@ -249,8 +261,8 @@ enum DesktopVisibility {
                 return onScreenRatio >= newWindowRatio ? sample.bounds : nil
             }
             let previous = previousAreas[sample.windowID] ?? 0
-            let grew = (area - previous) / screenArea >= growthRatio
-            return grew && onScreenRatio >= minimumRatio ? sample.bounds : nil
+            let sizeChanged = abs(area - previous) / screenArea >= sizeChangeRatio
+            return sizeChanged && onScreenRatio >= minimumRatio ? sample.bounds : nil
         }
     }
 

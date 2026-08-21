@@ -171,42 +171,62 @@ enum WallflowSelfTest {
         let smallOnMain = CGRect(x: 40, y: 40, width: 320, height: 240)
 
         try expect(
-            DesktopVisibility.shouldFreezeForIncomingApplication(
+            DesktopVisibility.shouldFreezeLeavingDesktop(
+                isCurrentlyLive: true,
                 screenBounds: mainDisplay,
                 onScreenWindowBounds: [coveringMain],
-                allWindowBounds: [coveringMain]
+                allWindowBounds: [coveringMain],
+                isPreferredDisplay: true
             ),
-            "An on-screen maximized window did not freeze the desktop"
+            "An on-screen maximized window did not freeze the live desktop"
         )
         try expect(
-            DesktopVisibility.shouldFreezeForIncomingApplication(
+            DesktopVisibility.shouldFreezeLeavingDesktop(
+                isCurrentlyLive: true,
                 screenBounds: mainDisplay,
                 onScreenWindowBounds: [],
-                allWindowBounds: [coveringMain]
+                allWindowBounds: [],
+                isPreferredDisplay: true
             ),
-            "Dock-clicking a maximized window on another Space did not freeze"
+            "Dock-opening a maximized window on another Space did not freeze the live desktop"
         )
         try expect(
-            !DesktopVisibility.shouldFreezeForIncomingApplication(
+            !DesktopVisibility.shouldFreezeLeavingDesktop(
+                isCurrentlyLive: false,
+                screenBounds: mainDisplay,
+                onScreenWindowBounds: [],
+                allWindowBounds: [],
+                isPreferredDisplay: true
+            ),
+            "Returning to the desktop froze again and delayed resume"
+        )
+        try expect(
+            !DesktopVisibility.shouldFreezeLeavingDesktop(
+                isCurrentlyLive: true,
                 screenBounds: mainDisplay,
                 onScreenWindowBounds: [smallOnMain],
-                allWindowBounds: [smallOnMain, coveringMain]
+                allWindowBounds: [smallOnMain, coveringMain],
+                isPreferredDisplay: true
             ),
             "A normal window froze the desktop because the same app has a full-screen window elsewhere"
         )
         try expect(
-            DesktopVisibility.shouldFreezeForIncomingApplication(
+            DesktopVisibility.shouldFreezeLeavingDesktop(
+                isCurrentlyLive: true,
                 screenBounds: secondaryDisplay,
                 onScreenWindowBounds: [],
-                allWindowBounds: [coveringSecondary]
+                allWindowBounds: [coveringSecondary],
+                isPreferredDisplay: false
             ),
             "An incoming covering window on the secondary display was ignored"
         )
         try expect(
-            !DesktopVisibility.shouldFreezeForIncomingApplication(
+            !DesktopVisibility.shouldFreezeLeavingDesktop(
+                isCurrentlyLive: true,
                 screenBounds: mainDisplay,
                 onScreenWindowBounds: [],
-                allWindowBounds: [coveringSecondary]
+                allWindowBounds: [coveringSecondary],
+                isPreferredDisplay: false
             ),
             "A covering window on the secondary display froze the main display"
         )
@@ -225,12 +245,14 @@ enum WallflowSelfTest {
             "A tiny palette was treated as a significant window"
         )
         try expect(
-            !DesktopVisibility.shouldFreezeForIncomingApplication(
+            !DesktopVisibility.shouldFreezeLeavingDesktop(
+                isCurrentlyLive: true,
                 screenBounds: mainDisplay,
                 onScreenWindowBounds: [],
-                allWindowBounds: []
+                allWindowBounds: [],
+                isPreferredDisplay: false
             ),
-            "An app with no windows froze the desktop on activation"
+            "An app with no windows froze an unrelated display"
         )
         try expect(
             DesktopVisibility.isLikelyDockOrMenuChrome(
@@ -253,7 +275,7 @@ enum WallflowSelfTest {
             ) == Set([CGDirectDisplayID(1)]),
             "A restore surface on the main display was assigned to the wrong screen"
         )
-        let growing = DesktopVisibility.growingRestoreWindowBounds(
+        let growing = DesktopVisibility.animatingRestoreWindowBounds(
             current: [
                 DesktopVisibility.WindowAreaSample(
                     windowID: 10,
@@ -267,7 +289,7 @@ enum WallflowSelfTest {
             !growing.isEmpty,
             "A rapidly growing restore window was not detected"
         )
-        let appearedLarge = DesktopVisibility.growingRestoreWindowBounds(
+        let appearedLarge = DesktopVisibility.animatingRestoreWindowBounds(
             current: [
                 DesktopVisibility.WindowAreaSample(
                     windowID: 11,
@@ -281,7 +303,7 @@ enum WallflowSelfTest {
             !appearedLarge.isEmpty,
             "A newly appeared maximized window was not detected"
         )
-        let smallNew = DesktopVisibility.growingRestoreWindowBounds(
+        let smallNew = DesktopVisibility.animatingRestoreWindowBounds(
             current: [
                 DesktopVisibility.WindowAreaSample(
                     windowID: 12,
@@ -294,6 +316,20 @@ enum WallflowSelfTest {
         try expect(
             smallNew.isEmpty,
             "A newly appeared normal window was treated as a restore animation"
+        )
+        let shrinking = DesktopVisibility.animatingRestoreWindowBounds(
+            current: [
+                DesktopVisibility.WindowAreaSample(
+                    windowID: 13,
+                    bounds: CGRect(x: 200, y: 100, width: 500, height: 400)
+                )
+            ],
+            previousAreas: [13: 1000 * 800],
+            screenBounds: mainDisplay
+        )
+        try expect(
+            !shrinking.isEmpty,
+            "A window zooming back to the Dock was not kept frozen"
         )
     }
 
