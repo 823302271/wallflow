@@ -5,11 +5,14 @@ import Foundation
 enum DesktopVisibility {
     /// Application windows that can cover the desktop wallpaper.
     /// Uses Quartz global coordinates (same as `CGDisplayBounds` / `CGWindowList`).
-    static func visibleApplicationWindowBounds() -> [CGRect] {
-        let options: CGWindowListOption = [
-            .optionOnScreenOnly,
-            .excludeDesktopElements
-        ]
+    static func visibleApplicationWindowBounds(
+        ownerPID: pid_t? = nil,
+        onScreenOnly: Bool = true
+    ) -> [CGRect] {
+        var options: CGWindowListOption = [.excludeDesktopElements]
+        if onScreenOnly {
+            options.insert(.optionOnScreenOnly)
+        }
         guard let windowInfo = CGWindowListCopyWindowInfo(
             options,
             kCGNullWindowID
@@ -23,10 +26,12 @@ enum DesktopVisibility {
         // (typically 20+) and screensaver layers.
         let maxCoveringLayer = 15
         return windowInfo.compactMap { info in
-            let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+            let windowOwnerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
             let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue
             let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
-            guard ownerPID != ownPID,
+            guard let windowOwnerPID,
+                  windowOwnerPID != ownPID,
+                  ownerPID == nil || windowOwnerPID == ownerPID,
                   let layer,
                   layer >= 0,
                   layer <= maxCoveringLayer,
@@ -41,6 +46,43 @@ enum DesktopVisibility {
             }
             return bounds
         }
+    }
+
+    /// Whether any listed window occupies a meaningful portion of this display.
+    static func hasSignificantWindow(
+        in windowBounds: [CGRect],
+        on screenBounds: CGRect,
+        minimumAreaRatio: CGFloat = 0.04
+    ) -> Bool {
+        let screenArea = screenBounds.width * screenBounds.height
+        guard screenArea > 0 else { return false }
+        return windowBounds.contains { bounds in
+            let intersection = bounds.intersection(screenBounds)
+            guard !intersection.isNull else { return false }
+            return (intersection.width * intersection.height) / screenArea >= minimumAreaRatio
+        }
+    }
+
+    /// Whether activating an app should freeze this display before Space/occlusion catch up.
+    ///
+    /// Clicking a maximized or full-screen window in the Dock zooms it on the current
+    /// Space first. The real window is often still on another Space (off-screen) for
+    /// that whole animation, so on-screen coverage never sees it. Freeze immediately
+    /// when that app already owns a covering window — unless it also has a normal
+    /// window here, which is the user-facing target (a small Safari window must not
+    /// freeze because the same app has a full-screen video on another Space).
+    static func shouldFreezeForIncomingApplication(
+        screenBounds: CGRect,
+        onScreenWindowBounds: [CGRect],
+        allWindowBounds: [CGRect]
+    ) -> Bool {
+        if isDisplayHidden(screenBounds, by: onScreenWindowBounds) {
+            return true
+        }
+        if hasSignificantWindow(in: onScreenWindowBounds, on: screenBounds) {
+            return false
+        }
+        return isDisplayHidden(screenBounds, by: allWindowBounds)
     }
 
     /// Quartz bounds of the usable desktop on a display (menu bar / dock excluded when present).

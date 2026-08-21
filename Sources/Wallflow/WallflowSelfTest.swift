@@ -17,6 +17,7 @@ enum WallflowSelfTest {
         try testLocalizationResources()
         try testWallpaperSnapshotPreservesResolution()
         try testDesktopVisibilityRules()
+        try testIncomingApplicationCoverage()
         try testDesktopCoverageSamplerIsolation()
         try testDisplayVisibilityProbeIsolation()
         try testSystemSuspensionState()
@@ -159,6 +160,69 @@ enum WallflowSelfTest {
                 coveredBy: []
             ),
             "Empty cover list should expose the desktop"
+        )
+    }
+
+    private static func testIncomingApplicationCoverage() throws {
+        let mainDisplay = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let secondaryDisplay = CGRect(x: 1000, y: 0, width: 1000, height: 800)
+        let coveringMain = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let coveringSecondary = CGRect(x: 1000, y: 0, width: 1000, height: 800)
+        let smallOnMain = CGRect(x: 40, y: 40, width: 320, height: 240)
+
+        try expect(
+            DesktopVisibility.shouldFreezeForIncomingApplication(
+                screenBounds: mainDisplay,
+                onScreenWindowBounds: [coveringMain],
+                allWindowBounds: [coveringMain]
+            ),
+            "An on-screen maximized window did not freeze the desktop"
+        )
+        try expect(
+            DesktopVisibility.shouldFreezeForIncomingApplication(
+                screenBounds: mainDisplay,
+                onScreenWindowBounds: [],
+                allWindowBounds: [coveringMain]
+            ),
+            "Dock-clicking a maximized window on another Space did not freeze"
+        )
+        try expect(
+            !DesktopVisibility.shouldFreezeForIncomingApplication(
+                screenBounds: mainDisplay,
+                onScreenWindowBounds: [smallOnMain],
+                allWindowBounds: [smallOnMain, coveringMain]
+            ),
+            "A normal window froze the desktop because the same app has a full-screen window elsewhere"
+        )
+        try expect(
+            DesktopVisibility.shouldFreezeForIncomingApplication(
+                screenBounds: secondaryDisplay,
+                onScreenWindowBounds: [],
+                allWindowBounds: [coveringSecondary]
+            ),
+            "An incoming covering window on the secondary display was ignored"
+        )
+        try expect(
+            !DesktopVisibility.shouldFreezeForIncomingApplication(
+                screenBounds: mainDisplay,
+                onScreenWindowBounds: [],
+                allWindowBounds: [coveringSecondary]
+            ),
+            "A covering window on the secondary display froze the main display"
+        )
+        try expect(
+            DesktopVisibility.hasSignificantWindow(
+                in: [smallOnMain],
+                on: mainDisplay
+            ),
+            "A visible application window was not treated as significant"
+        )
+        try expect(
+            !DesktopVisibility.hasSignificantWindow(
+                in: [CGRect(x: 10, y: 10, width: 20, height: 20)],
+                on: mainDisplay
+            ),
+            "A tiny palette was treated as a significant window"
         )
     }
 

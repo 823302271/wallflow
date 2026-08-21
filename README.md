@@ -28,6 +28,7 @@ Wallpaper Engine web and scene compatibility.
 - Full native backing resolution for Canvas-Metal wallpapers
 - Two-buffer Metal swap chain instead of the default three-buffer allocation
 - Rendering suspension when visible app windows collectively hide a display's desktop
+- Immediate freeze when a maximized or full-screen window is opened from the Dock, matching Space transitions
 - Automatic suspension during screen lock, display/system sleep, and inactive login sessions
 - Incremental display reconciliation without restarting retained-screen renderers
 - Per-display Space handling: only the hidden display pauses and keeps its last frame; other displays keep playing
@@ -231,8 +232,11 @@ wallpaper can react to the same click.
 During a full-screen or Space transition, Wallflow keeps the same desktop window,
 WebKit surface, and renderer alive above the system wallpaper and below desktop
 icons. The window joins every desktop Space, while visibility is evaluated **per
-display**: a full-screen Space on one monitor pauses only that monitor. A Space
-change freezes every display on the frame that was on screen at that instant,
+display**: a full-screen Space on one monitor pauses only that monitor. Opening a
+maximized or full-screen window from the Dock freezes that display immediately,
+because the zoom plays on the current Space before occlusion or a Space change
+is reported. A Space change freezes every display on the frame that was on
+screen at that instant,
 because coverage still reports the outgoing layout while the animation runs: a
 display that is still visible resumes from that exact frame as soon as coverage
 confirms it, and a covered one never advances while nobody can see it. Wallflow
