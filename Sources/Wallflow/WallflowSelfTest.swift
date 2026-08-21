@@ -225,38 +225,12 @@ enum WallflowSelfTest {
             "A tiny palette was treated as a significant window"
         )
         try expect(
-            DesktopVisibility.shouldFreezeForIncomingApplication(
-                screenBounds: mainDisplay,
-                onScreenWindowBounds: [],
-                allWindowBounds: [],
-                appHasOnScreenWindow: false,
-                isPreferredDisplay: true
-            ),
-            "Activating an app with no on-screen window did not freeze the clicked display"
-        )
-        try expect(
             !DesktopVisibility.shouldFreezeForIncomingApplication(
                 screenBounds: mainDisplay,
                 onScreenWindowBounds: [],
-                allWindowBounds: [],
-                appHasOnScreenWindow: false,
-                isPreferredDisplay: false
+                allWindowBounds: []
             ),
-            "Activating an app with no on-screen window froze an unrelated display"
-        )
-        try expect(
-            DesktopVisibility.isZoomFillingDisplay(
-                mainDisplay,
-                by: [CGRect(x: 80, y: 40, width: 840, height: 720)]
-            ),
-            "A restoring maximized window was not treated as filling the display"
-        )
-        try expect(
-            !DesktopVisibility.isZoomFillingDisplay(
-                mainDisplay,
-                by: [smallOnMain]
-            ),
-            "A normal window was treated as a maximized restore animation"
+            "An app with no windows froze the desktop on activation"
         )
         try expect(
             DesktopVisibility.isLikelyDockOrMenuChrome(
@@ -267,10 +241,59 @@ enum WallflowSelfTest {
         )
         try expect(
             !DesktopVisibility.isLikelyDockOrMenuChrome(
-                bounds: CGRect(x: 80, y: 40, width: 840, height: 720),
+                bounds: CGRect(x: 720, y: 680, width: 80, height: 80),
                 screens: [mainDisplay]
             ),
-            "A zooming window was mistaken for Dock chrome"
+            "A Dock restore thumbnail was mistaken for the Dock panel"
+        )
+        try expect(
+            DesktopVisibility.displayIDsIntersected(
+                by: [CGRect(x: 100, y: 100, width: 200, height: 200)],
+                screenBoundsByDisplay: [1: mainDisplay, 2: secondaryDisplay]
+            ) == Set([CGDirectDisplayID(1)]),
+            "A restore surface on the main display was assigned to the wrong screen"
+        )
+        let growing = DesktopVisibility.growingRestoreWindowBounds(
+            current: [
+                DesktopVisibility.WindowAreaSample(
+                    windowID: 10,
+                    bounds: CGRect(x: 100, y: 40, width: 700, height: 600)
+                )
+            ],
+            previousAreas: [10: 80 * 80],
+            screenBounds: mainDisplay
+        )
+        try expect(
+            !growing.isEmpty,
+            "A rapidly growing restore window was not detected"
+        )
+        let appearedLarge = DesktopVisibility.growingRestoreWindowBounds(
+            current: [
+                DesktopVisibility.WindowAreaSample(
+                    windowID: 11,
+                    bounds: coveringMain
+                )
+            ],
+            previousAreas: [:],
+            screenBounds: mainDisplay
+        )
+        try expect(
+            !appearedLarge.isEmpty,
+            "A newly appeared maximized window was not detected"
+        )
+        let smallNew = DesktopVisibility.growingRestoreWindowBounds(
+            current: [
+                DesktopVisibility.WindowAreaSample(
+                    windowID: 12,
+                    bounds: smallOnMain
+                )
+            ],
+            previousAreas: [:],
+            screenBounds: mainDisplay
+        )
+        try expect(
+            smallNew.isEmpty,
+            "A newly appeared normal window was treated as a restore animation"
         )
     }
 

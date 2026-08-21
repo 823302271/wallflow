@@ -51,23 +51,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let spaceSettleSampleDelays: [TimeInterval] = [0.12, 0.5, 1.0]
     /// Rapid samples after an app is activated, launched, or unhidden so a
     /// dock-zoom restore is seen before the window finishes filling the screen.
-    private static let incomingWindowSampleDelays: [TimeInterval] = [0.0, 0.1, 0.28, 0.6]
+    private static let incomingWindowSampleDelays: [TimeInterval] = [0.0, 0.08, 0.2]
     /// Same-Space covering (maximized window) has no occlusion signal. Confirm
     /// once, quickly — the previous 1.2s + 3-sample debounce played through the
     /// entire dock-zoom animation.
     private static let sameSpacePauseProbeDelay: TimeInterval = 0.08
     private static let sameSpacePauseProbeSamples = 1
-    /// Keep an incoming maximized/full-screen window paused through its dock zoom
-    /// so on-screen coverage cannot resume while the real window is still off-screen.
-    private static let incomingPauseHoldDuration: TimeInterval = 1.0
-    private static let incomingZoomWatchInterval: TimeInterval = 0.05
-    private static let incomingZoomWatchDuration: TimeInterval = 1.2
-    private static let incomingZoomFillRatio: CGFloat = 0.45
-    /// Per-display deadline while an incoming covering window's zoom/Space animation runs.
-    private var incomingPauseHoldUntil: [CGDirectDisplayID: Date] = [:]
+    /// Live-desktop poll. Dock restore animations last ~0.5s, so this must be
+    /// much faster than the hidden-display watchdog.
+    private static let liveCoverageWatchdogInterval: TimeInterval = 0.05
+    private static let hiddenCoverageWatchdogInterval: TimeInterval = 3.0
     private var globalMouseMonitor: Any?
-    private var incomingZoomWatch: Timer?
-    private var incomingZoomWatchGeneration = 0
+    private var previousWindowAreas: [UInt32: CGFloat] = [:]
     /// Settle time before a paused still is pushed to the system desktop picture.
     /// Must stay far below how quickly a user can hop back: the picture is what the
     /// Space animation shows, so anything slower than the round trip means they see
@@ -113,8 +108,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         coverageWatchdog?.invalidate()
         coverageWatchdog = nil
-        incomingZoomWatch?.invalidate()
-        incomingZoomWatch = nil
         if let globalMouseMonitor {
             NSEvent.removeMonitor(globalMouseMonitor)
             self.globalMouseMonitor = nil
@@ -283,7 +276,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             as? NSRunningApplication {
             freezeDisplaysCoveredByIncomingApplication(app)
         }
-        beginIncomingZoomWatch()
         scheduleIncomingWindowCoverageEvaluations()
     }
 
@@ -298,9 +290,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             || isClickInDockMargin(quartzPoint) else {
             return
         }
-        NSLog("Wallflow dock click — freezing incoming zoom")
-        freezeDisplayContaining(quartzPoint)
-        beginIncomingZoomWatch()
+        NSLog("Wallflow dock click — sampling restore surface")
+        evaluateForegroundCoverage()
     }
 
     private func isClickInDockMargin(_ quartzPoint: CGPoint) -> Bool {
@@ -311,26 +302,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func freezeDisplayContaining(_ quartzPoint: CGPoint) {
-        guard let controller = wallpaperControllers.first(where: {
-            $0.displayBounds.contains(quartzPoint)
-        }) ?? wallpaperControllers.first else {
-            return
-        }
-        freezeIncomingZoom(on: controller)
-    }
-
-    private func freezeIncomingZoom(on controller: DesktopWindowController) {
-        incomingPauseHoldUntil[controller.displayID] = Date()
-            .addingTimeInterval(Self.incomingPauseHoldDuration)
-        pauseProbeState.cancel(for: controller.displayID)
-        resumeProbeState.cancel(for: controller.displayID)
-        applyDesktopHidden(true, to: controller)
-    }
-
-    /// Freeze displays that the activating app already covers, including windows
-    /// that still live on another Space. Dock-zoom of a maximized window happens
-    /// on this Space before `activeSpaceDidChange` / occlusion fire.
+    /// Freeze displays that the activating app already covers on-screen.
+    /// Off-screen windows are often invisible to CGWindowList; the live watchdog
+    /// catches the Dock restore surface instead of guessing from a missing window.
     private func freezeDisplaysCoveredByIncomingApplication(_ app: NSRunningApplication) {
         guard isCoverageAutoPauseEnabled else { return }
         let pid = app.processIdentifier
@@ -347,20 +321,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ownerPID: pid,
             onScreenOnly: false
         )
-        let mousePoint = DesktopVisibility.quartzPoint(fromAppKit: NSEvent.mouseLocation)
-        let preferredDisplayID = wallpaperControllers.first(where: {
-            $0.displayBounds.contains(mousePoint)
-        })?.displayID ?? wallpaperControllers.first?.displayID
-        let appHasOnScreenWindow = wallpaperControllers.contains { controller in
-            DesktopVisibility.hasSignificantWindow(
-                in: onScreen,
-                on: DesktopVisibility.desktopQuartzBounds(
-                    displayID: controller.displayID,
-                    screen: controller.screen
-                )
-            )
-        }
-        var didFreeze = false
         for controller in wallpaperControllers {
             let screenBounds = DesktopVisibility.desktopQuartzBounds(
                 displayID: controller.displayID,
@@ -369,9 +329,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard DesktopVisibility.shouldFreezeForIncomingApplication(
                 screenBounds: screenBounds,
                 onScreenWindowBounds: onScreen,
-                allWindowBounds: allWindows,
-                appHasOnScreenWindow: appHasOnScreenWindow,
-                isPreferredDisplay: controller.displayID == preferredDisplayID
+                allWindowBounds: allWindows
             ) else {
                 continue
             }
@@ -379,62 +337,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "Wallflow display %u incoming covering window — pausing immediately",
                 controller.displayID
             )
-            freezeIncomingZoom(on: controller)
-            didFreeze = true
-        }
-        guard didFreeze else { return }
-        beginIncomingZoomWatch()
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + Self.incomingPauseHoldDuration
-        ) { [weak self] in
-            self?.evaluateForegroundCoverage()
-        }
-    }
-
-    private func beginIncomingZoomWatch() {
-        guard isCoverageAutoPauseEnabled else { return }
-        incomingZoomWatch?.invalidate()
-        incomingZoomWatchGeneration += 1
-        let generation = incomingZoomWatchGeneration
-        let deadline = Date().addingTimeInterval(Self.incomingZoomWatchDuration)
-        let timer = Timer(timeInterval: Self.incomingZoomWatchInterval, repeats: true) { [weak self] timer in
-            guard let self, generation == self.incomingZoomWatchGeneration else {
-                timer.invalidate()
-                return
-            }
-            self.pollIncomingZoomWatch()
-            guard Date() >= deadline else { return }
-            timer.invalidate()
-            if self.incomingZoomWatchGeneration == generation {
-                self.incomingZoomWatch = nil
-            }
-            self.evaluateForegroundCoverage()
-        }
-        timer.tolerance = 0.01
-        RunLoop.main.add(timer, forMode: .common)
-        incomingZoomWatch = timer
-        pollIncomingZoomWatch()
-    }
-
-    private func pollIncomingZoomWatch() {
-        let screens = wallpaperControllers.map(\.displayBounds)
-        let covering = DesktopVisibility.visibleApplicationWindowBounds()
-        let zoomSurfaces = DesktopVisibility.zoomSurfaceWindowBounds(screens: screens)
-        for controller in wallpaperControllers {
-            let screenBounds = DesktopVisibility.desktopQuartzBounds(
-                displayID: controller.displayID,
-                screen: controller.screen
-            )
-            let filling = DesktopVisibility.isZoomFillingDisplay(
-                screenBounds,
-                by: covering
-            ) || DesktopVisibility.isZoomFillingDisplay(
-                screenBounds,
-                by: zoomSurfaces
-            )
-            if filling {
-                freezeIncomingZoom(on: controller)
-            }
+            pauseProbeState.cancel(for: controller.displayID)
+            resumeProbeState.cancel(for: controller.displayID)
+            applyDesktopHidden(true, to: controller)
         }
     }
 
@@ -448,13 +353,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.evaluateForegroundCoverage()
             }
         }
-    }
-
-    private func isIncomingPauseHoldActive(for displayID: CGDirectDisplayID) -> Bool {
-        guard let until = incomingPauseHoldUntil[displayID] else { return false }
-        if until > Date() { return true }
-        incomingPauseHoldUntil.removeValue(forKey: displayID)
-        return false
     }
 
     @objc private func activeSpaceChanged(_ notification: Notification) {
@@ -510,11 +408,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard coverageWatchdog == nil else { return }
         // Adaptive interval: when every display is already frozen, poll less often
         // so background CPU stays below live-desktop rendering.
-        let timer = Timer(timeInterval: 0.4, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: Self.liveCoverageWatchdogInterval, repeats: true) { [weak self] _ in
             self?.evaluateForegroundCoverage()
             self?.retuneCoverageWatchdog()
         }
-        timer.tolerance = 0.1
+        timer.tolerance = 0.01
         RunLoop.main.add(timer, forMode: .common)
         coverageWatchdog = timer
     }
@@ -523,9 +421,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let coverageWatchdog else { return }
         let allHidden = !wallpaperControllers.isEmpty
             && wallpaperControllers.allSatisfy(\.isDesktopHidden)
-        let desired: TimeInterval = allHidden ? 3.0 : 0.4
+        let desired: TimeInterval = allHidden
+            ? Self.hiddenCoverageWatchdogInterval
+            : Self.liveCoverageWatchdogInterval
         // Timer.timeInterval is read-only after create — rebuild when regime changes.
-        if abs(coverageWatchdog.timeInterval - desired) < 0.05 { return }
+        if abs(coverageWatchdog.timeInterval - desired) < 0.02 { return }
         coverageWatchdog.invalidate()
         self.coverageWatchdog = nil
         let timer = Timer(timeInterval: desired, repeats: true) { [weak self] _ in
@@ -834,9 +734,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func rebuildWallpaperWindows() {
         pauseProbeState.clear()
         resumeProbeState.clear()
-        incomingPauseHoldUntil.removeAll()
-        incomingZoomWatch?.invalidate()
-        incomingZoomWatch = nil
+        previousWindowAreas.removeAll()
         pendingFallbackImages.removeAll()
         displayConfigurationSignature = Self.currentDisplayConfigurationSignature()
         loadProjectsForAttachedDisplays()
@@ -910,9 +808,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let retainedDisplayIDs = Set(nextControllers.map(\.displayID))
         pauseProbeState.retain(displayIDs: retainedDisplayIDs)
         resumeProbeState.retain(displayIDs: retainedDisplayIDs)
-        incomingPauseHoldUntil = incomingPauseHoldUntil.filter {
-            retainedDisplayIDs.contains($0.key)
-        }
         pendingFallbackImages = pendingFallbackImages.filter {
             retainedDisplayIDs.contains($0.key)
         }
@@ -1047,6 +942,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
             }
         )
+        let screens = controllers.map(\.displayBounds)
+        let dockRestoreBounds = DesktopVisibility.dockRestoreWindowBounds(screens: screens)
+        let dockRestoreDisplayIDs = DesktopVisibility.displayIDsIntersected(
+            by: dockRestoreBounds,
+            screenBoundsByDisplay: boundsByDisplay
+        )
+        let windowSamples = DesktopVisibility.visibleApplicationWindowSamples()
+        var growingDisplayIDs = Set<CGDirectDisplayID>()
+        for controller in controllers {
+            let screenBounds = boundsByDisplay[controller.displayID] ?? controller.displayBounds
+            let growing = DesktopVisibility.growingRestoreWindowBounds(
+                current: windowSamples,
+                previousAreas: previousWindowAreas,
+                screenBounds: screenBounds
+            )
+            if !growing.isEmpty {
+                growingDisplayIDs.insert(controller.displayID)
+            }
+        }
+        previousWindowAreas = Dictionary(
+            uniqueKeysWithValues: windowSamples.map { ($0.windowID, $0.bounds.width * $0.bounds.height) }
+        )
+        for controller in controllers {
+            if dockRestoreDisplayIDs.contains(controller.displayID)
+                || growingDisplayIDs.contains(controller.displayID) {
+                pauseProbeState.cancel(for: controller.displayID)
+                resumeProbeState.cancel(for: controller.displayID)
+                applyDesktopHidden(true, to: controller)
+            }
+        }
         desktopCoverageSampler.sample(
             screenBoundsByDisplay: boundsByDisplay
         ) { [weak self] hiddenDisplayIDs in
@@ -1056,6 +981,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             for controller in controllers {
                 guard self.wallpaperControllers.contains(where: { $0 === controller }) else {
+                    continue
+                }
+                if dockRestoreDisplayIDs.contains(controller.displayID)
+                    || growingDisplayIDs.contains(controller.displayID) {
                     continue
                 }
                 if hiddenDisplayIDs.contains(controller.displayID) {
@@ -1070,7 +999,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Cancel pending resume/pause probes and force the live surface on.
     private func forceDesktopLive(_ controller: DesktopWindowController) {
         let displayID = controller.displayID
-        incomingPauseHoldUntil.removeValue(forKey: displayID)
         pauseProbeState.cancel(for: displayID)
         resumeProbeState.cancel(for: displayID)
         applyDesktopHidden(false, to: controller)
@@ -1113,14 +1041,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Dock-zoom of a maximized window is still on this Space, so coverage
-        // reports "visible desktop" around the shrinking thumbnail. Hold the
-        // freeze until that animation (and the following Space hop) have settled.
-        guard !isIncomingPauseHoldActive(for: displayID) else {
-            resumeProbeState.cancel(for: displayID)
-            return
-        }
-
         // Already live — nothing to do.
         if !controller.isDesktopHidden {
             return
@@ -1130,15 +1050,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // probe that is partway through its consecutive-visible samples, or a
         // display polled faster than the probe runs would stay frozen forever.
         guard let generation = resumeProbeState.begin(for: displayID) else { return }
-        // Base stability delay after Space has been quiet.
-        let delay: TimeInterval = 0.35
-        // Three consecutive visible samples (~0.2s apart) before resume.
         scheduleResumeVisibilityProbe(
             displayID: displayID,
             generation: generation,
             controller: controller,
-            delay: delay,
-            remainingSamples: 3
+            delay: 0.2,
+            remainingSamples: 2
         )
     }
 
@@ -1215,16 +1132,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Preference flipped off while a probe was in flight — go live now.
             guard self.isCoverageAutoPauseEnabled else {
                 self.forceDesktopLive(controller)
-                return
-            }
-            if self.isIncomingPauseHoldActive(for: displayID) {
-                self.scheduleResumeVisibilityProbe(
-                    displayID: displayID,
-                    generation: generation,
-                    controller: controller,
-                    delay: 0.15,
-                    remainingSamples: remainingSamples
-                )
                 return
             }
             let screenBounds = DesktopVisibility.desktopQuartzBounds(

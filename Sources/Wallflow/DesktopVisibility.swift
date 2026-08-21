@@ -63,21 +63,15 @@ enum DesktopVisibility {
         }
     }
 
-    /// Whether activating an app should freeze this display before Space/occlusion catch up.
+    /// Whether activating an app already covers this display.
     ///
-    /// Clicking a maximized or full-screen window in the Dock zooms it on the current
-    /// Space first. The real window is often still on another Space, and macOS does
-    /// not report those off-screen windows to `CGWindowList`. Freeze this display
-    /// when the app has no on-screen window anywhere and this is the display the
-    /// user is interacting with. A normal window already on this Space is the
-    /// user-facing target and must not freeze (a small Safari window with a
-    /// full-screen video on another Space).
+    /// Do not freeze just because the app has no on-screen window — returning to
+    /// the desktop often activates Finder with no covering window, and that delay
+    /// is what the user sees when switching back.
     static func shouldFreezeForIncomingApplication(
         screenBounds: CGRect,
         onScreenWindowBounds: [CGRect],
-        allWindowBounds: [CGRect],
-        appHasOnScreenWindow: Bool = false,
-        isPreferredDisplay: Bool = false
+        allWindowBounds: [CGRect]
     ) -> Bool {
         if isDisplayHidden(screenBounds, by: onScreenWindowBounds) {
             return true
@@ -85,10 +79,7 @@ enum DesktopVisibility {
         if hasSignificantWindow(in: onScreenWindowBounds, on: screenBounds) {
             return false
         }
-        if isDisplayHidden(screenBounds, by: allWindowBounds) {
-            return true
-        }
-        return !appHasOnScreenWindow && isPreferredDisplay
+        return isDisplayHidden(screenBounds, by: allWindowBounds)
     }
 
     /// Owner of the frontmost on-screen window at a Quartz point.
@@ -125,9 +116,12 @@ enum DesktopVisibility {
         windowOwner(at: quartzPoint) == "Dock"
     }
 
-    /// Windows that can be a Dock zoom / restore surface, including Dock-owned
-    /// animation windows that sit above normal app layers.
-    static func zoomSurfaceWindowBounds(screens: [CGRect]) -> [CGRect] {
+    /// Dock-owned restore/zoom surfaces, excluding the Dock panel itself.
+    ///
+    /// A maximized window opening from the Dock is often a Dock animation at a
+    /// high window layer, so the app's real window never appears in coverage
+    /// until the zoom has already finished.
+    static func dockRestoreWindowBounds(screens: [CGRect]) -> [CGRect] {
         let options: CGWindowListOption = [
             .optionOnScreenOnly,
             .excludeDesktopElements
@@ -141,54 +135,123 @@ enum DesktopVisibility {
         let ownPID = ProcessInfo.processInfo.processIdentifier
         return windowInfo.compactMap { info in
             let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
-            let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue
             let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
             let owner = (info[kCGWindowOwnerName as String] as? String) ?? ""
             guard ownerPID != ownPID,
-                  let layer,
-                  layer >= 0,
-                  layer <= 27,
+                  owner == "Dock",
                   alpha > 0.05,
                   let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
                   let bounds = CGRect(
                       dictionaryRepresentation: boundsDictionary as CFDictionary
                   ),
-                  bounds.width > 8,
-                  bounds.height > 8 else {
-                return nil
-            }
-            if owner != "Dock", isWallpaperInputIgnoredOwner(owner) {
-                return nil
-            }
-            if owner == "Dock", isLikelyDockOrMenuChrome(bounds: bounds, screens: screens) {
+                  bounds.width > 16,
+                  bounds.height > 16,
+                  !isLikelyDockOrMenuChrome(bounds: bounds, screens: screens) else {
                 return nil
             }
             return bounds
         }
     }
 
+    static func displayIDsIntersected(
+        by windowBounds: [CGRect],
+        screenBoundsByDisplay: [CGDirectDisplayID: CGRect]
+    ) -> Set<CGDirectDisplayID> {
+        Set(screenBoundsByDisplay.compactMap { displayID, screenBounds in
+            windowBounds.contains { bounds in
+                let intersection = bounds.intersection(screenBounds)
+                return !intersection.isNull
+                    && intersection.width > 8
+                    && intersection.height > 8
+            } ? displayID : nil
+        })
+    }
+
     static func isLikelyDockOrMenuChrome(bounds: CGRect, screens: [CGRect]) -> Bool {
         screens.contains { screen in
+            let horizontalStrip = bounds.height < 160
+                && bounds.width > max(bounds.height * 2, 200)
+            let verticalStrip = bounds.width < 140
+                && bounds.height > max(bounds.width * 2, 200)
             let atTop = abs(bounds.minY - screen.minY) < 8 && bounds.height < 48
-            let atBottom = abs(bounds.maxY - screen.maxY) < 8 && bounds.height < 160
-            let atLeft = abs(bounds.minX - screen.minX) < 8 && bounds.width < 140
-            let atRight = abs(bounds.maxX - screen.maxX) < 8 && bounds.width < 140
+            let atBottom = abs(bounds.maxY - screen.maxY) < 8 && horizontalStrip
+            let atLeft = abs(bounds.minX - screen.minX) < 8 && verticalStrip
+            let atRight = abs(bounds.maxX - screen.maxX) < 8 && verticalStrip
             return atTop || atBottom || atLeft || atRight
         }
     }
 
-    /// A restoring maximized window often fills the display visually long before
-    /// coverage hits the 98.5% pause threshold.
-    static func isZoomFillingDisplay(
-        _ screenBounds: CGRect,
-        by windowBounds: [CGRect],
-        fillThreshold: CGFloat = 0.45
-    ) -> Bool {
-        isDisplayHidden(
-            screenBounds,
-            by: windowBounds,
-            coverageThreshold: fillThreshold
-        )
+    struct WindowAreaSample {
+        let windowID: UInt32
+        let bounds: CGRect
+    }
+
+    static func visibleApplicationWindowSamples(
+        ownerPID: pid_t? = nil
+    ) -> [WindowAreaSample] {
+        let options: CGWindowListOption = [
+            .optionOnScreenOnly,
+            .excludeDesktopElements
+        ]
+        guard let windowInfo = CGWindowListCopyWindowInfo(
+            options,
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return []
+        }
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        return windowInfo.compactMap { info in
+            let windowOwnerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+            let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue
+            let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
+            let windowID = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+            guard let windowOwnerPID,
+                  windowOwnerPID != ownPID,
+                  ownerPID == nil || windowOwnerPID == ownerPID,
+                  let layer,
+                  layer >= 0,
+                  layer <= 15,
+                  alpha > 0.01,
+                  let windowID,
+                  let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(
+                      dictionaryRepresentation: boundsDictionary as CFDictionary
+                  ),
+                  bounds.width > 1,
+                  bounds.height > 1 else {
+                return nil
+            }
+            return WindowAreaSample(windowID: windowID, bounds: bounds)
+        }
+    }
+
+    /// Windows that just appeared large or grew quickly toward covering the display.
+    static func growingRestoreWindowBounds(
+        current: [WindowAreaSample],
+        previousAreas: [UInt32: CGFloat],
+        screenBounds: CGRect,
+        newWindowRatio: CGFloat = 0.25,
+        growthRatio: CGFloat = 0.12,
+        minimumRatio: CGFloat = 0.18
+    ) -> [CGRect] {
+        let screenArea = screenBounds.width * screenBounds.height
+        guard screenArea > 0 else { return [] }
+        return current.compactMap { sample in
+            let intersection = sample.bounds.intersection(screenBounds)
+            guard !intersection.isNull,
+                  intersection.width > 8,
+                  intersection.height > 8 else {
+                return nil
+            }
+            let area = sample.bounds.width * sample.bounds.height
+            let onScreenRatio = (intersection.width * intersection.height) / screenArea
+            if previousAreas[sample.windowID] == nil {
+                return onScreenRatio >= newWindowRatio ? sample.bounds : nil
+            }
+            let previous = previousAreas[sample.windowID] ?? 0
+            let grew = (area - previous) / screenArea >= growthRatio
+            return grew && onScreenRatio >= minimumRatio ? sample.bounds : nil
+        }
     }
 
     /// Quartz bounds of the usable desktop on a display (menu bar / dock excluded when present).
