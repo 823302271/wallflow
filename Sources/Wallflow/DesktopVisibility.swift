@@ -66,15 +66,18 @@ enum DesktopVisibility {
     /// Whether activating an app should freeze this display before Space/occlusion catch up.
     ///
     /// Clicking a maximized or full-screen window in the Dock zooms it on the current
-    /// Space first. The real window is often still on another Space (off-screen) for
-    /// that whole animation, so on-screen coverage never sees it. Freeze immediately
-    /// when that app already owns a covering window — unless it also has a normal
-    /// window here, which is the user-facing target (a small Safari window must not
-    /// freeze because the same app has a full-screen video on another Space).
+    /// Space first. The real window is often still on another Space, and macOS does
+    /// not report those off-screen windows to `CGWindowList`. Freeze this display
+    /// when the app has no on-screen window anywhere and this is the display the
+    /// user is interacting with. A normal window already on this Space is the
+    /// user-facing target and must not freeze (a small Safari window with a
+    /// full-screen video on another Space).
     static func shouldFreezeForIncomingApplication(
         screenBounds: CGRect,
         onScreenWindowBounds: [CGRect],
-        allWindowBounds: [CGRect]
+        allWindowBounds: [CGRect],
+        appHasOnScreenWindow: Bool = false,
+        isPreferredDisplay: Bool = false
     ) -> Bool {
         if isDisplayHidden(screenBounds, by: onScreenWindowBounds) {
             return true
@@ -82,7 +85,110 @@ enum DesktopVisibility {
         if hasSignificantWindow(in: onScreenWindowBounds, on: screenBounds) {
             return false
         }
-        return isDisplayHidden(screenBounds, by: allWindowBounds)
+        if isDisplayHidden(screenBounds, by: allWindowBounds) {
+            return true
+        }
+        return !appHasOnScreenWindow && isPreferredDisplay
+    }
+
+    /// Owner of the frontmost on-screen window at a Quartz point.
+    static func windowOwner(at quartzPoint: CGPoint) -> String? {
+        let options: CGWindowListOption = [
+            .optionOnScreenOnly,
+            .excludeDesktopElements
+        ]
+        guard let windowInfo = CGWindowListCopyWindowInfo(
+            options,
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return nil
+        }
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        for info in windowInfo {
+            let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+            let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
+            guard ownerPID != ownPID,
+                  alpha > 0.05,
+                  let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(
+                      dictionaryRepresentation: boundsDictionary as CFDictionary
+                  ),
+                  bounds.contains(quartzPoint) else {
+                continue
+            }
+            return info[kCGWindowOwnerName as String] as? String
+        }
+        return nil
+    }
+
+    static func isDockClick(at quartzPoint: CGPoint) -> Bool {
+        windowOwner(at: quartzPoint) == "Dock"
+    }
+
+    /// Windows that can be a Dock zoom / restore surface, including Dock-owned
+    /// animation windows that sit above normal app layers.
+    static func zoomSurfaceWindowBounds(screens: [CGRect]) -> [CGRect] {
+        let options: CGWindowListOption = [
+            .optionOnScreenOnly,
+            .excludeDesktopElements
+        ]
+        guard let windowInfo = CGWindowListCopyWindowInfo(
+            options,
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return []
+        }
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        return windowInfo.compactMap { info in
+            let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+            let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue
+            let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
+            let owner = (info[kCGWindowOwnerName as String] as? String) ?? ""
+            guard ownerPID != ownPID,
+                  let layer,
+                  layer >= 0,
+                  layer <= 27,
+                  alpha > 0.05,
+                  let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(
+                      dictionaryRepresentation: boundsDictionary as CFDictionary
+                  ),
+                  bounds.width > 8,
+                  bounds.height > 8 else {
+                return nil
+            }
+            if owner != "Dock", isWallpaperInputIgnoredOwner(owner) {
+                return nil
+            }
+            if owner == "Dock", isLikelyDockOrMenuChrome(bounds: bounds, screens: screens) {
+                return nil
+            }
+            return bounds
+        }
+    }
+
+    static func isLikelyDockOrMenuChrome(bounds: CGRect, screens: [CGRect]) -> Bool {
+        screens.contains { screen in
+            let atTop = abs(bounds.minY - screen.minY) < 8 && bounds.height < 48
+            let atBottom = abs(bounds.maxY - screen.maxY) < 8 && bounds.height < 160
+            let atLeft = abs(bounds.minX - screen.minX) < 8 && bounds.width < 140
+            let atRight = abs(bounds.maxX - screen.maxX) < 8 && bounds.width < 140
+            return atTop || atBottom || atLeft || atRight
+        }
+    }
+
+    /// A restoring maximized window often fills the display visually long before
+    /// coverage hits the 98.5% pause threshold.
+    static func isZoomFillingDisplay(
+        _ screenBounds: CGRect,
+        by windowBounds: [CGRect],
+        fillThreshold: CGFloat = 0.45
+    ) -> Bool {
+        isDisplayHidden(
+            screenBounds,
+            by: windowBounds,
+            coverageThreshold: fillThreshold
+        )
     }
 
     /// Quartz bounds of the usable desktop on a display (menu bar / dock excluded when present).

@@ -224,6 +224,54 @@ enum WallflowSelfTest {
             ),
             "A tiny palette was treated as a significant window"
         )
+        try expect(
+            DesktopVisibility.shouldFreezeForIncomingApplication(
+                screenBounds: mainDisplay,
+                onScreenWindowBounds: [],
+                allWindowBounds: [],
+                appHasOnScreenWindow: false,
+                isPreferredDisplay: true
+            ),
+            "Activating an app with no on-screen window did not freeze the clicked display"
+        )
+        try expect(
+            !DesktopVisibility.shouldFreezeForIncomingApplication(
+                screenBounds: mainDisplay,
+                onScreenWindowBounds: [],
+                allWindowBounds: [],
+                appHasOnScreenWindow: false,
+                isPreferredDisplay: false
+            ),
+            "Activating an app with no on-screen window froze an unrelated display"
+        )
+        try expect(
+            DesktopVisibility.isZoomFillingDisplay(
+                mainDisplay,
+                by: [CGRect(x: 80, y: 40, width: 840, height: 720)]
+            ),
+            "A restoring maximized window was not treated as filling the display"
+        )
+        try expect(
+            !DesktopVisibility.isZoomFillingDisplay(
+                mainDisplay,
+                by: [smallOnMain]
+            ),
+            "A normal window was treated as a maximized restore animation"
+        )
+        try expect(
+            DesktopVisibility.isLikelyDockOrMenuChrome(
+                bounds: CGRect(x: 200, y: 740, width: 600, height: 60),
+                screens: [mainDisplay]
+            ),
+            "The Dock panel was not recognized as chrome"
+        )
+        try expect(
+            !DesktopVisibility.isLikelyDockOrMenuChrome(
+                bounds: CGRect(x: 80, y: 40, width: 840, height: 720),
+                screens: [mainDisplay]
+            ),
+            "A zooming window was mistaken for Dock chrome"
+        )
     }
 
     private static func testDesktopCoverageSamplerIsolation() throws {

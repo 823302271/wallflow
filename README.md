@@ -29,6 +29,7 @@ Wallpaper Engine web and scene compatibility.
 - Two-buffer Metal swap chain instead of the default three-buffer allocation
 - Rendering suspension when visible app windows collectively hide a display's desktop
 - Immediate freeze when a maximized or full-screen window is opened from the Dock, matching Space transitions
+- Dock clicks freeze that display through the restore zoom, including Dock-owned animation windows
 - Automatic suspension during screen lock, display/system sleep, and inactive login sessions
 - Incremental display reconciliation without restarting retained-screen renderers
 - Per-display Space handling: only the hidden display pauses and keeps its last frame; other displays keep playing
