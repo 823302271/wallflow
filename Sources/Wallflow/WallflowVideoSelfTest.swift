@@ -108,54 +108,42 @@ final class WallflowVideoSelfTest {
                     )
                     return
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                    self?.verifyFlakyResumeKeepsCheckpoint(originalTime: pausedTime)
+                // DesktopWindowController commits at this exact reveal boundary.
+                // The next real pause must capture a fresh current time instead of
+                // snapping back to the previous Space session.
+                view.commitPauseSession()
+                guard view.checkpointMediaSecondsForTesting == nil else {
+                    self.finish(
+                        .failure(
+                            WallflowSelfTestError.failed(
+                                "Reveal did not release the previous checkpoint"
+                            )
+                        )
+                    )
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    self?.verifyLongPauseHold(previousSessionTime: pausedTime)
                 }
             }
         }
     }
 
-    /// Simulate a Space-transition false resume: play briefly, re-pause, checkpoint
-    /// must stay at the original pause time (not a future frame).
-    private func verifyFlakyResumeKeepsCheckpoint(originalTime: TimeInterval) {
+    /// Long absence: checkpoint data must stay fixed; resume seeks from that data.
+    private func verifyLongPauseHold(previousSessionTime: TimeInterval) {
         guard let view = wallpaperView else { return }
         view.setRenderingEnabled(false, completion: nil)
-        guard let held = view.checkpointMediaSecondsForTesting,
-              abs(held - originalTime) < 0.08 else {
+        let pausedTime = view.playbackTimeForTesting
+        guard pausedTime > previousSessionTime + 0.1 else {
             finish(
                 .failure(
                     WallflowSelfTestError.failed(
-                        "Flaky re-pause rewrote checkpoint (\(String(describing: view.checkpointMediaSecondsForTesting)) vs \(originalTime))"
+                        "New pause reused the previous session checkpoint"
                     )
                 )
             )
             return
         }
-        view.setRenderingEnabled(true) { [weak self] in
-            guard let self, let view = self.wallpaperView else { return }
-            let resumeTime = view.playbackTimeForTesting
-            guard resumeTime + 0.05 >= originalTime,
-                  resumeTime <= originalTime + 0.12 else {
-                self.finish(
-                    .failure(
-                        WallflowSelfTestError.failed(
-                            "Flaky resume seek missed checkpoint (\(resumeTime) vs \(originalTime))"
-                        )
-                    )
-                )
-                return
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                self?.verifyLongPauseHold()
-            }
-        }
-    }
-
-    /// Long absence: checkpoint data must stay fixed; resume seeks from that data.
-    private func verifyLongPauseHold() {
-        guard let view = wallpaperView else { return }
-        view.setRenderingEnabled(false, completion: nil)
-        let pausedTime = view.playbackTimeForTesting
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.2) { [weak self] in
             guard let self, let view = self.wallpaperView else { return }
             guard let held = view.checkpointMediaSecondsForTesting,
@@ -185,8 +173,18 @@ final class WallflowVideoSelfTest {
                     )
                     return
                 }
-                // Wait past checkpoint commit delay so the next pause records a fresh time.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                view.commitPauseSession()
+                guard view.checkpointMediaSecondsForTesting == nil else {
+                    self.finish(
+                        .failure(
+                            WallflowSelfTestError.failed(
+                                "Long-pause checkpoint was not committed at reveal"
+                            )
+                        )
+                    )
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
                     self?.verifyResumeAndSnapshot(previousTime: pausedTime)
                 }
             }

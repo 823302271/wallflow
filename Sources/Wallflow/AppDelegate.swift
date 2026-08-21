@@ -12,7 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var propertiesWindowController: WallpaperPropertiesWindowController?
     private var libraryWindowController: WallpaperLibraryWindowController?
     private var isManuallyPaused = false
-    private var isSystemSuspended = false
+    private var systemSuspensionState = SystemSuspensionState()
     private var isAudioMuted = false
     private var pauseWhenDesktopHidden = true
     private var currentProject = WallpaperProject.builtIn
@@ -24,23 +24,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var coverageEvaluationGeneration = 0
     private var coverageWatchdog: Timer?
     private var fallbackRefreshGeneration = 0
+    /// Latest paused still per display, awaiting publication to the system desktop.
+    private var pendingFallbackImages: [CGDirectDisplayID: NSImage] = [:]
+    private var fallbackPublishGeneration: [CGDirectDisplayID: Int] = [:]
     /// Per-display resume debounce so brief Space-transition "visible" blips
     /// cannot start the playhead and produce a future-frame jump.
-    private var resumeDebounceGeneration: [CGDirectDisplayID: Int] = [:]
-    /// Per-display Space holds. The workspace Space notification has no display
-    /// identity, so concrete transitions are keyed by wallpaper-window occlusion.
-    private var displaySpaceTransitions = DisplaySpaceTransitionState()
-    /// Per-display generation for host-driven pause-session commit.
-    private var sessionCommitGeneration: [CGDirectDisplayID: Int] = [:]
-    /// Quiet period before the affected display may resume.
-    private static let spaceTransitionQuietPeriod: TimeInterval = 0.85
-    /// Continuous live play required before unlocking the pause-session timeline.
-    private static let pauseSessionCommitDelay: TimeInterval = 1.5
+    private var resumeProbeState = DisplayVisibilityProbeState()
+    /// Per-display pause debounce. Space animations can transiently report the
+    /// outgoing app windows as full coverage while the desktop remains visible.
+    private var pauseProbeState = DisplayVisibilityProbeState()
     private var didFinishLaunching = false
+    private var isMigratingExternalWallpapers = false
     private var pendingOpenURLs: [URL] = []
     private let importService = WallpaperImportService()
     private let wallpaperLibrary = WallpaperLibrary()
     private let desktopFallbackManager = DesktopFallbackManager()
+    private let desktopCoverageSampler = DesktopCoverageSampler()
     private let displayWallpaperStore = DisplayWallpaperStore()
     private let automaticallyPauseCoveredDisplays = !CommandLine.arguments.contains(
         "--no-auto-pause"
@@ -48,21 +47,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private static let savedProjectPathKey = "Wallflow.selectedProjectPath"
     private static let pauseWhenDesktopHiddenKey = "Wallflow.pauseWhenDesktopHidden"
+    /// Coverage samples taken after a Space hop, spanning the transition animation.
+    private static let spaceSettleSampleDelays: [TimeInterval] = [0.12, 0.5, 1.0]
+    /// Settle time before a paused still is pushed to the system desktop picture.
+    /// Must stay far below how quickly a user can hop back: the picture is what the
+    /// Space animation shows, so anything slower than the round trip means they see
+    /// the *previous* freeze. A 2s delay made that happen on every switch.
+    private static let desktopFallbackPublishDelay: TimeInterval = 0.3
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         restoreDesktopVisibilityPreference()
         loadProjectsForAttachedDisplays()
         syncFocusedProjectState()
-        registerCurrentProjectInLibrary()
+        registerAttachedProjectsInLibrary()
         configureStatusItem()
         rebuildWallpaperWindows()
         registerForSystemEvents()
         startCoverageWatchdog()
+        // Sweep stills left by earlier runs, preserving whatever macOS is reading
+        // right now — deleting the active picture leaves the desktop showing a
+        // stale cached bitmap with no file behind it.
+        desktopFallbackManager.removeOrphanedImages(
+            activeURLs: Set(
+                NSScreen.screens.compactMap {
+                    NSWorkspace.shared.desktopImageURL(for: $0)
+                }
+            )
+        )
         didFinishLaunching = true
         if let sourceURL = pendingOpenURLs.first {
             pendingOpenURLs.removeAll()
             importWallpaper(from: sourceURL, persist: true, target: .all)
         }
+        migrateLegacyExternalWallpapers()
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -78,6 +95,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         coverageWatchdog?.invalidate()
         coverageWatchdog = nil
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        DistributedNotificationCenter.default().removeObserver(self)
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -98,10 +116,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             forKey: Self.pauseWhenDesktopHiddenKey
         )
         desktopHiddenPauseMenuItem?.state = pauseWhenDesktopHidden ? .on : .off
-        // Turning the preference off must resume immediately.
-        if !pauseWhenDesktopHidden {
-            displaySpaceTransitions.clear()
-        }
         evaluateForegroundCoverage()
         NSLog(
             "Wallflow pause-when-hidden %@",
@@ -240,17 +254,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func foregroundLayoutChanged(_ notification: Notification) {
-        evaluateForegroundCoverage()
-        scheduleForegroundCoverageEvaluation()
+        scheduleForegroundCoverageEvaluation(after: 0.2)
     }
 
     @objc private func activeSpaceChanged(_ notification: Notification) {
-        // NSWorkspace provides no display ID or userInfo here. Use this only as a
-        // prompt to re-evaluate; the per-window occlusion notification below owns
-        // display-specific transition holds and pause-session pinning.
         NSLog("Wallflow active Space changed")
-        evaluateForegroundCoverage()
-        scheduleForegroundCoverageEvaluation(after: 0.6)
+        // This notification carries no display identity, so it cannot be used to
+        // freeze anything: pinning every display made an unrelated monitor stutter
+        // on each hop. Per-display coverage is the only display-specific signal, so
+        // just re-sample and let each display decide for itself. Freezing a moment
+        // later than the hop is fine; what matters is that reveal == freeze.
+        scheduleSpaceSettledCoverageEvaluations()
+    }
+
+    /// Re-sample while the Space animation settles. A mid-animation sample can
+    /// still see either layout, so take a few instead of trusting the first one;
+    /// whichever confirms first starts the matching probe.
+    private func scheduleSpaceSettledCoverageEvaluations() {
+        for delay in Self.spaceSettleSampleDelays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.evaluateForegroundCoverage()
+            }
+        }
     }
 
     @objc private func wallpaperWindowOcclusionChanged(_ notification: Notification) {
@@ -261,51 +286,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               }) else {
             return
         }
-        // Apple identifies the changed NSWindow here, which gives us the physical
-        // display that NSWorkspace.activeSpaceDidChangeNotification omits.
-        beginSpaceTransition(for: controller)
-    }
-
-    private func isInSpaceTransitionQuietPeriod(
-        for displayID: CGDirectDisplayID
-    ) -> Bool {
-        displaySpaceTransitions.isQuiet(
-            for: displayID,
-            now: ProcessInfo.processInfo.systemUptime
-        )
-    }
-
-    /// Pin only the display whose wallpaper window changed occlusion.
-    private func beginSpaceTransition(for controller: DesktopWindowController) {
-        guard isCoverageAutoPauseEnabled else { return }
-        let displayID = controller.displayID
-        let generation = displaySpaceTransitions.begin(
-            for: displayID,
-            now: ProcessInfo.processInfo.systemUptime,
-            quietPeriod: Self.spaceTransitionQuietPeriod
-        )
-        resumeDebounceGeneration[displayID, default: 0] += 1
-        sessionCommitGeneration[displayID, default: 0] += 1
-        let changed = controller.pinDesktopForSpaceTransition()
-        if changed {
-            NSLog("Wallflow display %u rendering paused", displayID)
+        guard controller.isWindowVisible else {
+            // WindowServer says nobody can see this window — either it is covered or
+            // its Space is not the one the user is looking at. That is authoritative
+            // and, unlike coverage geometry, it is per-display and Space-aware, so
+            // pause right now instead of probing. Coverage alone kept the wallpaper
+            // running for the whole time the user was on another Space.
+            NSLog(
+                "Wallflow display %u occluded — pausing immediately",
+                controller.displayID
+            )
+            pauseProbeState.cancel(for: controller.displayID)
+            resumeProbeState.cancel(for: controller.displayID)
+            applyDesktopHidden(true, to: controller)
+            return
         }
-        NSLog(
-            "Wallflow display %u Space transition pinned (generation=%d)",
-            displayID,
-            generation
-        )
-        let quiet = Self.spaceTransitionQuietPeriod
-        scheduleSpaceSettledCoverageEvaluation(
-            for: controller,
-            after: quiet,
-            transitionGeneration: generation
-        )
-        scheduleSpaceSettledCoverageEvaluation(
-            for: controller,
-            after: quiet + 0.4,
-            transitionGeneration: generation
-        )
+        // Visible again. Occlusion cannot tell whether app windows still cover the
+        // desktop on this Space, so the coverage probe owns the resume decision.
+        evaluateForegroundCoverage(for: controller)
     }
 
     private func scheduleForegroundCoverageEvaluation(after delay: TimeInterval = 0.35) {
@@ -314,27 +312,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, generation == self.coverageEvaluationGeneration else { return }
             self.evaluateForegroundCoverage()
-        }
-    }
-
-    /// A later hop on this display cancels its pending evaluation. Other displays
-    /// have independent generations and continue rendering without interruption.
-    private func scheduleSpaceSettledCoverageEvaluation(
-        for controller: DesktopWindowController,
-        after delay: TimeInterval,
-        transitionGeneration: Int
-    ) {
-        let displayID = controller.displayID
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            [weak self, weak controller] in
-            guard let self,
-                  let controller,
-                  transitionGeneration == self.displaySpaceTransitions.generation(
-                      for: displayID
-                  ) else {
-                return
-            }
-            self.evaluateForegroundCoverage(for: controller)
         }
     }
 
@@ -369,15 +346,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.coverageWatchdog = timer
     }
 
-    @objc private func systemWillSuspend(_ notification: Notification) {
-        isSystemSuspended = true
-        applyRenderingState()
+    @objc private func systemWillSleep(_ notification: Notification) {
+        updateSystemSuspension(.systemSleep, active: true)
     }
 
-    @objc private func systemDidResume(_ notification: Notification) {
-        isSystemSuspended = false
-        wallpaperControllers.forEach { $0.ensureDesktopLayering() }
+    @objc private func systemDidWake(_ notification: Notification) {
+        updateSystemSuspension(.systemSleep, active: false)
+    }
+
+    @objc private func screensDidSleep(_ notification: Notification) {
+        updateSystemSuspension(.screensSleep, active: true)
+    }
+
+    @objc private func screensDidWake(_ notification: Notification) {
+        updateSystemSuspension(.screensSleep, active: false)
+    }
+
+    @objc private func sessionDidResignActive(_ notification: Notification) {
+        updateSystemSuspension(.sessionInactive, active: true)
+    }
+
+    @objc private func sessionDidBecomeActive(_ notification: Notification) {
+        updateSystemSuspension(.sessionInactive, active: false)
+    }
+
+    @objc private func screenDidLock(_ notification: Notification) {
+        updateSystemSuspension(.screenLocked, active: true)
+    }
+
+    @objc private func screenDidUnlock(_ notification: Notification) {
+        updateSystemSuspension(.screenLocked, active: false)
+    }
+
+    private func updateSystemSuspension(
+        _ reason: SystemSuspensionState.Reason,
+        active: Bool
+    ) {
+        let wasSuspended = systemSuspensionState.isSuspended
+        guard systemSuspensionState.set(reason, active: active) else { return }
+        let isSuspended = systemSuspensionState.isSuspended
+        NSLog(
+            "Wallflow system suspension %@: %@",
+            isSuspended ? "active" : "cleared",
+            systemSuspensionState.description
+        )
+        guard wasSuspended != isSuspended else { return }
         applyRenderingState()
+        guard !isSuspended else { return }
+        wallpaperControllers.forEach { $0.ensureDesktopLayering() }
         evaluateForegroundCoverage()
         scheduleFallbackRefresh(delay: 0.8)
     }
@@ -536,25 +552,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let workspaceCenter = NSWorkspace.shared.notificationCenter
         workspaceCenter.addObserver(
             self,
-            selector: #selector(systemWillSuspend(_:)),
+            selector: #selector(systemWillSleep(_:)),
             name: NSWorkspace.willSleepNotification,
             object: nil
         )
         workspaceCenter.addObserver(
             self,
-            selector: #selector(systemDidResume(_:)),
+            selector: #selector(systemDidWake(_:)),
             name: NSWorkspace.didWakeNotification,
             object: nil
         )
         workspaceCenter.addObserver(
             self,
-            selector: #selector(systemWillSuspend(_:)),
+            selector: #selector(screensDidSleep(_:)),
+            name: NSWorkspace.screensDidSleepNotification,
+            object: nil
+        )
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(screensDidWake(_:)),
+            name: NSWorkspace.screensDidWakeNotification,
+            object: nil
+        )
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(sessionDidResignActive(_:)),
             name: NSWorkspace.sessionDidResignActiveNotification,
             object: nil
         )
         workspaceCenter.addObserver(
             self,
-            selector: #selector(systemDidResume(_:)),
+            selector: #selector(sessionDidBecomeActive(_:)),
             name: NSWorkspace.sessionDidBecomeActiveNotification,
             object: nil
         )
@@ -570,10 +598,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSWorkspace.didActivateApplicationNotification,
             object: nil
         )
+        let distributedCenter = DistributedNotificationCenter.default()
+        distributedCenter.addObserver(
+            self,
+            selector: #selector(screenDidLock(_:)),
+            name: Notification.Name("com.apple.screenIsLocked"),
+            object: nil,
+            suspensionBehavior: .deliverImmediately
+        )
+        distributedCenter.addObserver(
+            self,
+            selector: #selector(screenDidUnlock(_:)),
+            name: Notification.Name("com.apple.screenIsUnlocked"),
+            object: nil,
+            suspensionBehavior: .deliverImmediately
+        )
     }
 
     private func rebuildWallpaperWindows() {
-        displaySpaceTransitions.clear()
+        pauseProbeState.clear()
+        resumeProbeState.clear()
+        pendingFallbackImages.removeAll()
         displayConfigurationSignature = Self.currentDisplayConfigurationSignature()
         loadProjectsForAttachedDisplays()
         let previousControllers = wallpaperControllers
@@ -626,6 +671,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 reusedCount += 1
             } else {
                 availableByDisplayID.removeValue(forKey: displayID)?.close()
+                // Probes hold a weak controller reference. Release this display's
+                // slot with the controller it was watching, otherwise the in-flight
+                // probe dies silently and blocks every later probe on that display.
+                pauseProbeState.cancel(for: displayID)
+                resumeProbeState.cancel(for: displayID)
                 nextControllers.append(
                     makeDesktopController(
                         screen: screen,
@@ -638,9 +688,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         wallpaperControllers = nextControllers
-        displaySpaceTransitions.retain(
-            displayIDs: Set(nextControllers.map(\.displayID))
-        )
+        let retainedDisplayIDs = Set(nextControllers.map(\.displayID))
+        pauseProbeState.retain(displayIDs: retainedDisplayIDs)
+        resumeProbeState.retain(displayIDs: retainedDisplayIDs)
+        pendingFallbackImages = pendingFallbackImages.filter {
+            retainedDisplayIDs.contains($0.key)
+        }
         applyRenderingState()
         applyAudioState()
         for controller in wallpaperControllers {
@@ -683,16 +736,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func bindPausedFrameHandler(to controller: DesktopWindowController) {
         controller.onPausedFrameCaptured = { [weak self, weak controller] image in
             guard let self, let controller else { return }
+            self.publishDesktopFallback(image, for: controller)
+        }
+    }
+
+    /// Keep the system desktop picture in step with the freeze frame.
+    ///
+    /// That picture is the layer under our window: it shows through while a Space
+    /// animates and while the Metal layer re-acquires a drawable on the destination
+    /// Space. Left stale it holds a frame from minutes ago, so returning to the
+    /// desktop cuts from that frame to the live one — the jump users actually see.
+    ///
+    /// `setDesktopImageURL` refreshes WindowServer globally, so publishing is
+    /// deferred until the transition that triggered the pause has settled, and
+    /// coalesced per display.
+    private func publishDesktopFallback(
+        _ image: NSImage,
+        for controller: DesktopWindowController
+    ) {
+        let displayID = controller.displayID
+        pendingFallbackImages[displayID] = image
+        let generation = (fallbackPublishGeneration[displayID] ?? 0) + 1
+        fallbackPublishGeneration[displayID] = generation
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.desktopFallbackPublishDelay
+        ) { [weak self, weak controller] in
+            guard let self,
+                  let controller,
+                  generation == self.fallbackPublishGeneration[displayID],
+                  let pending = self.pendingFallbackImages.removeValue(
+                      forKey: displayID
+                  ) else {
+                return
+            }
+            NSLog(
+                "Wallflow display %u desktop fallback published",
+                displayID
+            )
             self.desktopFallbackManager.update(
-                image: image,
+                image: pending,
                 for: controller.screen,
-                displayID: controller.displayID
+                displayID: displayID
             )
         }
     }
 
     private func applyRenderingState() {
-        let shouldRender = !isManuallyPaused && !isSystemSuspended
+        let shouldRender = !isManuallyPaused && !systemSuspensionState.isSuspended
         wallpaperControllers.forEach { $0.setRenderingEnabled(shouldRender) }
         pauseMenuItem?.title = isManuallyPaused
             ? L10n.text(.resumeAnimation)
@@ -722,37 +812,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
-        let windowBounds = DesktopVisibility.visibleApplicationWindowBounds()
-        for controller in controllers {
-            // Mid multi-hop swipe on this display: never resume its intermediate
-            // desktop, but leave every other display untouched.
-            if isInSpaceTransitionQuietPeriod(for: controller.displayID) {
-                requestDesktopHidden(true, for: controller)
-                continue
+        coverageEvaluationGeneration += 1
+        let generation = coverageEvaluationGeneration
+        let boundsByDisplay = Dictionary(
+            uniqueKeysWithValues: controllers.map { controller in
+                (
+                    controller.displayID,
+                    DesktopVisibility.desktopQuartzBounds(
+                        displayID: controller.displayID,
+                        screen: controller.screen
+                    )
+                )
             }
-            // Refresh Quartz bounds in case the display layout moved.
-            let screenBounds = DesktopVisibility.desktopQuartzBounds(
-                displayID: controller.displayID,
-                screen: controller.screen
-            )
-            let coveredByWindows = DesktopVisibility.isDisplayHidden(
-                screenBounds,
-                by: windowBounds
-            )
-            // Occluded (full-screen Space, or window not on this Space) => hidden.
-            let isDesktopHidden = coveredByWindows || !controller.isWindowVisible
-            requestDesktopHidden(isDesktopHidden, for: controller)
+        )
+        desktopCoverageSampler.sample(
+            screenBoundsByDisplay: boundsByDisplay
+        ) { [weak self] hiddenDisplayIDs in
+            guard let self,
+                  generation == self.coverageEvaluationGeneration else {
+                return
+            }
+            for controller in controllers {
+                guard self.wallpaperControllers.contains(where: { $0 === controller }) else {
+                    continue
+                }
+                if hiddenDisplayIDs.contains(controller.displayID) {
+                    self.requestDesktopHidden(true, for: controller)
+                } else {
+                    self.requestDesktopHidden(false, for: controller)
+                }
+            }
         }
     }
 
     /// Cancel pending resume/pause probes and force the live surface on.
     private func forceDesktopLive(_ controller: DesktopWindowController) {
         let displayID = controller.displayID
-        resumeDebounceGeneration[displayID, default: 0] += 1
+        pauseProbeState.cancel(for: displayID)
+        resumeProbeState.cancel(for: displayID)
         applyDesktopHidden(false, to: controller)
     }
 
-    /// Pause immediately; resume only after a short per-display stable period.
+    /// Change state only after per-display coverage remains stable.
     private func requestDesktopHidden(
         _ hidden: Bool,
         for controller: DesktopWindowController
@@ -765,15 +866,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let displayID = controller.displayID
         if hidden {
-            // Cancel any pending resume and pause right away so the playhead freezes.
-            resumeDebounceGeneration[displayID, default: 0] += 1
-            applyDesktopHidden(true, to: controller)
+            resumeProbeState.cancel(for: displayID)
+            guard !controller.isDesktopHidden else { return }
+            guard let generation = pauseProbeState.begin(for: displayID) else { return }
+            schedulePauseVisibilityProbe(
+                displayID: displayID,
+                generation: generation,
+                controller: controller,
+                delay: 1.2,
+                remainingSamples: 3
+            )
             return
         }
 
-        // Still swiping through Spaces — do not arm resume yet.
-        if isInSpaceTransitionQuietPeriod(for: displayID) {
-            resumeDebounceGeneration[displayID, default: 0] += 1
+        pauseProbeState.cancel(for: displayID)
+
+        // Coverage geometry is Space-blind: this display's desktop can be fully
+        // exposed while the user is looking at an entirely different Space. Never
+        // let it resume a window WindowServer reports as invisible.
+        guard controller.isWindowVisible else {
+            resumeProbeState.cancel(for: displayID)
             applyDesktopHidden(true, to: controller)
             return
         }
@@ -783,8 +895,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let generation = (resumeDebounceGeneration[displayID] ?? 0) + 1
-        resumeDebounceGeneration[displayID] = generation
+        // One probe at a time: a watchdog tick or app activation must not restart a
+        // probe that is partway through its consecutive-visible samples, or a
+        // display polled faster than the probe runs would stay frozen forever.
+        guard let generation = resumeProbeState.begin(for: displayID) else { return }
         // Base stability delay after Space has been quiet.
         let delay: TimeInterval = 0.35
         // Three consecutive visible samples (~0.2s apart) before resume.
@@ -797,6 +911,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    private func schedulePauseVisibilityProbe(
+        displayID: CGDirectDisplayID,
+        generation: Int,
+        controller: DesktopWindowController,
+        delay: TimeInterval,
+        remainingSamples: Int
+    ) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak controller] in
+            guard let self,
+                  let controller,
+                  self.pauseProbeState.isCurrent(generation, for: displayID),
+                  !controller.isDesktopHidden else {
+                return
+            }
+            guard self.isCoverageAutoPauseEnabled else {
+                self.forceDesktopLive(controller)
+                return
+            }
+            let screenBounds = DesktopVisibility.desktopQuartzBounds(
+                displayID: displayID,
+                screen: controller.screen
+            )
+            self.desktopCoverageSampler.sample(
+                screenBoundsByDisplay: [displayID: screenBounds]
+            ) { [weak self, weak controller] hiddenDisplayIDs in
+                guard let self,
+                      let controller,
+                      self.pauseProbeState.isCurrent(generation, for: displayID),
+                      !controller.isDesktopHidden else {
+                    return
+                }
+                guard hiddenDisplayIDs.contains(displayID) else {
+                    self.pauseProbeState.cancel(for: displayID)
+                    return
+                }
+                if remainingSamples <= 1 {
+                    guard self.pauseProbeState.finish(
+                        generation,
+                        for: displayID
+                    ) else {
+                        return
+                    }
+                    self.applyDesktopHidden(true, to: controller)
+                    return
+                }
+                self.schedulePauseVisibilityProbe(
+                    displayID: displayID,
+                    generation: generation,
+                    controller: controller,
+                    delay: 0.2,
+                    remainingSamples: remainingSamples - 1
+                )
+            }
+        }
+    }
+
     private func scheduleResumeVisibilityProbe(
         displayID: CGDirectDisplayID,
         generation: Int,
@@ -807,7 +977,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak controller] in
             guard let self,
                   let controller,
-                  self.resumeDebounceGeneration[displayID] == generation,
+                  self.resumeProbeState.isCurrent(generation, for: displayID),
                   controller.isDesktopHidden else {
                 return
             }
@@ -816,41 +986,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.forceDesktopLive(controller)
                 return
             }
-            // A new Space hop started while we were probing — abort resume.
-            if self.isInSpaceTransitionQuietPeriod(for: displayID) {
-                self.applyDesktopHidden(true, to: controller)
-                return
-            }
-            let windowBounds = DesktopVisibility.visibleApplicationWindowBounds()
             let screenBounds = DesktopVisibility.desktopQuartzBounds(
                 displayID: controller.displayID,
                 screen: controller.screen
             )
-            let stillHidden = DesktopVisibility.isDisplayHidden(
-                screenBounds,
-                by: windowBounds
-            ) || !controller.isWindowVisible
-            guard !stillHidden else {
-                // Stay paused; a later coverage pass re-arms resume when stable.
-                self.applyDesktopHidden(true, to: controller)
-                return
-            }
-            if remainingSamples <= 1 {
-                // Final sample: refuse resume if another Space hop began.
-                guard !self.isInSpaceTransitionQuietPeriod(for: displayID) else {
-                    self.applyDesktopHidden(true, to: controller)
+            self.desktopCoverageSampler.sample(
+                screenBoundsByDisplay: [displayID: screenBounds]
+            ) { [weak self, weak controller] hiddenDisplayIDs in
+                guard let self,
+                      let controller,
+                      self.resumeProbeState.isCurrent(generation, for: displayID),
+                      controller.isDesktopHidden else {
                     return
                 }
-                self.applyDesktopHidden(false, to: controller)
-                return
+                // Re-check occlusion at the decision point: the user may have hopped
+                // to another Space while these samples were in flight.
+                let stillHidden = hiddenDisplayIDs.contains(displayID)
+                    || !controller.isWindowVisible
+                guard !stillHidden else {
+                    // Stay paused; a later visibility pass re-arms resume.
+                    self.resumeProbeState.cancel(for: displayID)
+                    return
+                }
+                if remainingSamples <= 1 {
+                    guard self.resumeProbeState.finish(
+                        generation,
+                        for: displayID
+                    ) else {
+                        return
+                    }
+                    self.applyDesktopHidden(false, to: controller)
+                    return
+                }
+                self.scheduleResumeVisibilityProbe(
+                    displayID: displayID,
+                    generation: generation,
+                    controller: controller,
+                    delay: 0.2,
+                    remainingSamples: remainingSamples - 1
+                )
             }
-            self.scheduleResumeVisibilityProbe(
-                displayID: displayID,
-                generation: generation,
-                controller: controller,
-                delay: 0.2,
-                remainingSamples: remainingSamples - 1
-            )
         }
     }
 
@@ -858,11 +1033,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ hidden: Bool,
         to controller: DesktopWindowController
     ) {
-        // Normal visibility polling is idempotent; only the per-window Space path
-        // above explicitly re-pins an already hidden renderer.
         let changed = controller.setDesktopHidden(hidden)
         if hidden {
-            sessionCommitGeneration[controller.displayID, default: 0] += 1
             if changed {
                 NSLog(
                     "Wallflow display %u rendering paused",
@@ -876,34 +1048,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "Wallflow display %u rendering resumed",
             controller.displayID
         )
-        schedulePauseSessionCommit(for: controller)
-    }
-
-    /// Unlock renderer pause-session locks only after continuous live play with no
-    /// Space hop — so 1→2→3 intermediate resumes cannot rewrite the timeline.
-    private func schedulePauseSessionCommit(for controller: DesktopWindowController) {
-        let displayID = controller.displayID
-        let commitGeneration = (sessionCommitGeneration[displayID] ?? 0) + 1
-        sessionCommitGeneration[displayID] = commitGeneration
-        let transitionGeneration = displaySpaceTransitions.generation(for: displayID)
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.pauseSessionCommitDelay) {
-            [weak self, weak controller] in
-            guard let self,
-                  let controller,
-                  self.sessionCommitGeneration[displayID] == commitGeneration,
-                  transitionGeneration == self.displaySpaceTransitions.generation(
-                      for: displayID
-                  ),
-                  !self.isInSpaceTransitionQuietPeriod(for: displayID),
-                  !controller.isDesktopHidden else {
-                return
-            }
-            controller.commitPauseSession()
-            NSLog(
-                "Wallflow display %u pause session committed",
-                displayID
-            )
-        }
     }
 
     private func loadProjectsForAttachedDisplays() {
@@ -1053,6 +1197,111 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.showError(error)
             }
         }
+    }
+
+    /// Older releases could register command-line or pre-managed local projects by
+    /// their original path. Copy them in the background and atomically repoint all
+    /// library/display state once each managed copy is valid.
+    private func migrateLegacyExternalWallpapers() {
+        guard !isMigratingExternalWallpapers else { return }
+        let entries = wallpaperLibrary.externalLocalEntries
+        guard !entries.isEmpty else { return }
+        isMigratingExternalWallpapers = true
+        migrateLegacyExternalWallpapers(
+            entries,
+            at: 0,
+            didChangeActiveAssignment: false
+        )
+    }
+
+    private func migrateLegacyExternalWallpapers(
+        _ entries: [WallpaperLibraryEntry],
+        at index: Int,
+        didChangeActiveAssignment: Bool
+    ) {
+        guard entries.indices.contains(index) else {
+            isMigratingExternalWallpapers = false
+            refreshLibraryWindow()
+            if didChangeActiveAssignment {
+                reconcileWallpaperWindows()
+            }
+            return
+        }
+
+        let entry = entries[index]
+        importService.prepare(sourceURL: entry.sourceURL) { [weak self] result in
+            guard let self else { return }
+            var changedActiveAssignment = didChangeActiveAssignment
+            switch result {
+            case .success(let managedURL):
+                do {
+                    let project = try WallpaperProjectLoader.load(managedURL)
+                    let managedSourceURL = project.manifestURL
+                        ?? project.entryURL
+                        ?? managedURL
+                    let newSource = managedSourceURL.isFileURL
+                        ? managedSourceURL.standardizedFileURL.path
+                        : managedSourceURL.absoluteString
+                    guard self.wallpaperLibrary.replace(
+                        entry,
+                        with: project,
+                        sourceURL: managedSourceURL
+                    ) != nil else {
+                        throw WallpaperProjectLoaderError.unsupportedSelection(managedURL)
+                    }
+                    let changedDisplays = self.displayWallpaperStore.replaceSource(
+                        entry.source,
+                        with: newSource
+                    )
+                    changedActiveAssignment = !changedDisplays.isEmpty
+                        || changedActiveAssignment
+                    if UserDefaults.standard.string(
+                        forKey: Self.savedProjectPathKey
+                    ) == entry.source {
+                        UserDefaults.standard.set(
+                            newSource,
+                            forKey: Self.savedProjectPathKey
+                        )
+                    }
+                    self.migrateUserProperties(
+                        from: entry.sourceURL,
+                        to: managedSourceURL
+                    )
+                    NSLog(
+                        "Wallflow migrated wallpaper into managed storage: %@",
+                        managedSourceURL.path
+                    )
+                } catch {
+                    NSLog(
+                        "Wallflow could not migrate wallpaper %@: %@",
+                        entry.source,
+                        error.localizedDescription
+                    )
+                }
+            case .failure(let error):
+                NSLog(
+                    "Wallflow could not migrate wallpaper %@: %@",
+                    entry.source,
+                    error.localizedDescription
+                )
+            }
+            self.migrateLegacyExternalWallpapers(
+                entries,
+                at: index + 1,
+                didChangeActiveAssignment: changedActiveAssignment
+            )
+        }
+    }
+
+    private func migrateUserProperties(from oldURL: URL, to managedURL: URL) {
+        let oldKey = Self.userPropertiesStorageKey(for: oldURL)
+        let newKey = Self.userPropertiesStorageKey(for: managedURL)
+        guard oldKey != newKey,
+              UserDefaults.standard.object(forKey: newKey) == nil,
+              let data = UserDefaults.standard.data(forKey: oldKey) else {
+            return
+        }
+        UserDefaults.standard.set(data, forKey: newKey)
     }
 
     private func updateProjectTitle() {
@@ -1212,14 +1461,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func registerCurrentProjectInLibrary() {
-        guard currentProject.kind != .builtIn,
-              let sourceURL = currentProject.manifestURL
-                ?? currentProject.entryURL
-                ?? currentProject.rootURL else {
-            return
+    private func registerAttachedProjectsInLibrary() {
+        for project in projectsByDisplayID.values where project.kind != .builtIn {
+            guard let sourceURL = project.manifestURL
+                ?? project.entryURL
+                ?? project.rootURL else {
+                continue
+            }
+            wallpaperLibrary.install(project: project, sourceURL: sourceURL)
         }
-        wallpaperLibrary.install(project: currentProject, sourceURL: sourceURL)
     }
 
     private var currentLibraryEntryID: UUID? {
@@ -1364,6 +1614,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let url = project.manifestURL ?? project.entryURL ?? project.rootURL else {
             return nil
         }
+        return Self.userPropertiesStorageKey(for: url)
+    }
+
+    private static func userPropertiesStorageKey(for url: URL) -> String {
         let source = url.isFileURL ? url.standardizedFileURL.path : url.absoluteString
         let encodedPath = Data(source.utf8).base64EncodedString()
         return "Wallflow.userProperties.\(encodedPath)"

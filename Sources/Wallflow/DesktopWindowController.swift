@@ -95,13 +95,12 @@ private final class DesktopPresentationView: NSView {
 
     func showFrozenFrame(_ image: NSImage) {
         frozenFrameView.show(image)
-        // Hide the live renderer under the still so WebKit/Metal/AVPlayer stop
-        // compositing while the desktop is covered — major background CPU win.
-        rendererView.isHidden = true
+        // Keep the paused renderer attached beneath the still. Hiding and unhiding
+        // an MTKView tears down its drawable; returning from Space could then expose
+        // an older drawable before the restored pause frame was presented.
     }
 
     func hideFrozenFrame() {
-        rendererView.isHidden = false
         frozenFrameView.hide()
     }
 
@@ -122,13 +121,10 @@ final class DesktopWindowController {
     /// Kept false under the freeze overlay so playhead cannot advance ahead of the still.
     private var isLiveSurfaceEnabled = true
     private var frozenFrame: NSImage?
-    /// Freeze image locked for the current hide-session. Not replaced by a live
-    /// recapture after a brief false resume (which would show a future frame).
+    /// Freeze image locked while a paused renderer prepares its matching live frame.
     private var pauseSessionFrozenFrame: NSImage?
     private var presentationGeneration = 0
     private var frameCaptureGeneration = 0
-    private var freezeCommitGeneration = 0
-    private var sessionCommitGeneration = 0
     private(set) var isDesktopHidden = false
     private(set) var screen: NSScreen
     let displayID: CGDirectDisplayID
@@ -196,14 +192,10 @@ final class DesktopWindowController {
         window.level = Self.wallpaperLevel
         // Do NOT use .fullScreenAuxiliary — that keeps the wallpaper alive on
         // full-screen Spaces so it never pauses.
-        //
-        // Do NOT use .canJoinAllSpaces either: joining every Space makes the
-        // wallpaper look "desktop visible" on intermediate empty Spaces during
-        // multi-hop swipes (1→2→3→Desktop). That briefly resumes the timeline on
-        // each hop and produces a future-frame jump when the user finally lands.
-        // Stay on the Space where the window was shown; other Spaces use the
-        // static desktop fallback until the user returns.
+        // Join desktop Spaces so each one gets the live renderer. Per-display
+        // occlusion/coverage decides when a full-screen Space should pause it.
         window.collectionBehavior = [
+            .canJoinAllSpaces,
             .canJoinAllApplications,
             .ignoresCycle,
             .stationary
@@ -216,10 +208,6 @@ final class DesktopWindowController {
             NSDeviceDescriptionKey("NSScreenNumber")
         ] as? NSNumber
         return CGDirectDisplayID(number?.uint32Value ?? 0)
-    }
-
-    var isWindowVisible: Bool {
-        window.occlusionState.contains(.visible)
     }
 
     func setRenderingEnabled(_ enabled: Bool) {
@@ -249,10 +237,17 @@ final class DesktopWindowController {
             presentationGeneration += 1
             let generation = presentationGeneration
             isLiveSurfaceEnabled = false
-            sessionCommitGeneration += 1
             // Particles are not part of the video freeze checkpoint: stop them only
             // because the desktop is not visible (CPU), not because the still freezes.
             wallpaperRenderer.setParticlesActive(false)
+            // The system desktop picture is what the Space transition animation
+            // actually shows — our window does not participate in that animation.
+            // Left unpublished it holds a frame from minutes ago and the return to
+            // the desktop cuts straight from it to the live frame.
+            //
+            // It has to be republished, but setDesktopImageURL refreshes WindowServer
+            // globally and hitches unrelated displays, so the host delays it well
+            // past the transition instead of firing during the animation.
             beginPausedCapture(generation: generation, publishDesktopFallback: true)
             return true
         }
@@ -260,42 +255,25 @@ final class DesktopWindowController {
         isDesktopHidden = false
         presentationGeneration += 1
         let generation = presentationGeneration
-        // Show the paused still and only re-enable the live surface when revealing
-        // so resume does not play "under" the freeze (which looked like a jump to
-        // a future frame).
-        showCachedFrozenFrame()
-        isLiveSurfaceEnabled = false
-        applyRenderingState()
-        prepareForPresentation()
+        // Identical to the manual-resume path in setRenderingEnabled(_:). A Space
+        // hop must not take a different route than an ordinary unpause: the extra
+        // applyRenderingState()/prepareForPresentation() that used to run here
+        // re-entered the renderer's pause/present machinery on the way out.
         if requestedRenderingEnabled {
             beginLiveReveal(generation: generation)
+        } else {
+            isLiveSurfaceEnabled = false
+            applyRenderingState()
         }
         return true
     }
 
-    /// Re-pin an already hidden renderer only for a confirmed Space transition on
-    /// this display. Normal coverage polling remains idempotent.
-    @discardableResult
-    func pinDesktopForSpaceTransition() -> Bool {
-        if !isDesktopHidden {
-            return setDesktopHidden(true)
-        }
-        presentationGeneration += 1
-        let generation = presentationGeneration
-        isLiveSurfaceEnabled = false
-        sessionCommitGeneration += 1
-        wallpaperRenderer.setParticlesActive(false)
-        beginPausedCapture(generation: generation, publishDesktopFallback: true)
-        return false
-    }
-
-    /// Host-only: unlock pause-session freeze/timeline after stable live play with
-    /// no intervening Space hop.
-    func commitPauseSession() {
+    private func commitPauseSession() {
         guard !isDesktopHidden, isLiveSurfaceEnabled, requestedRenderingEnabled else {
             return
         }
         pauseSessionFrozenFrame = nil
+        frozenFrame = nil
         wallpaperRenderer.commitPauseSession()
     }
 
@@ -355,6 +333,13 @@ final class DesktopWindowController {
         candidate === window
     }
 
+    /// WindowServer's own per-display verdict on whether this wallpaper window can
+    /// be seen. Unlike coverage geometry it accounts for the window being on a
+    /// Space the user is not looking at.
+    var isWindowVisible: Bool {
+        window.occlusionState.contains(.visible)
+    }
+
     func close() {
         presentationGeneration += 1
         frameCaptureGeneration += 1
@@ -362,23 +347,13 @@ final class DesktopWindowController {
         window.close()
     }
 
-    private func showCachedFrozenFrame() {
-        guard let frozenFrame else { return }
-        presentationView.showFrozenFrame(frozenFrame)
-    }
-
     /// Disable the live surface and capture a still only after the renderer reports
     /// that its playhead is frozen (so snapshot == resume checkpoint).
+    ///
+    /// Nothing is posted to the overlay before the renderer is pinned. The paused
+    /// renderer keeps the exact frame the user last saw, so any cached still put up
+    /// here can only be older than what is already correct on screen.
     private func beginPausedCapture(generation: Int, publishDesktopFallback: Bool) {
-        // Cancel any pending session commit so a re-pause keeps the hide-session still.
-        freezeCommitGeneration += 1
-        sessionCommitGeneration += 1
-        if let sticky = pauseSessionFrozenFrame {
-            frozenFrame = sticky
-            presentationView.showFrozenFrame(sticky)
-        } else {
-            showCachedFrozenFrame()
-        }
         // pinToPauseSession always re-snaps even when the renderer was already paused.
         wallpaperRenderer.pinToPauseSession { [weak self] in
             guard let self, generation == self.presentationGeneration else { return }
@@ -400,16 +375,33 @@ final class DesktopWindowController {
     }
 
     private func capturePausedFrame(generation: Int, publishDesktopFallback: Bool) {
-        showCachedFrozenFrame()
         captureLiveFrame { [weak self] image in
-            guard let self, generation == self.presentationGeneration else { return }
-            guard let image else { return }
-            self.frozenFrame = image
-            self.pauseSessionFrozenFrame = image
-            self.presentationView.showFrozenFrame(image)
+            guard let self else { return }
+            guard let image else {
+                NSLog(
+                    "Wallflow display %u paused capture FAILED",
+                    self.displayID
+                )
+                return
+            }
+            // The still belongs to the renderer's frozen timeline, not to a
+            // presentation generation. A pause/resume landing during this async
+            // Metal capture must not discard the publish, or the system desktop
+            // picture keeps showing a frame from an earlier freeze — which is what
+            // shows through during the Space animation and reads as a jump.
             if publishDesktopFallback {
                 self.onPausedFrameCaptured?(image)
             }
+            guard generation == self.presentationGeneration else {
+                NSLog(
+                    "Wallflow display %u paused still superseded (published anyway)",
+                    self.displayID
+                )
+                return
+            }
+            self.frozenFrame = image
+            self.pauseSessionFrozenFrame = image
+            self.presentationView.showFrozenFrame(image)
         }
     }
 
@@ -437,7 +429,6 @@ final class DesktopWindowController {
     /// completion while still showing the pause-frame (playhead not yet advancing).
     /// We drop the freeze on that matching frame; renderers start time on the next turn.
     private func beginLiveReveal(generation: Int) {
-        showCachedFrozenFrame()
         isLiveSurfaceEnabled = true
         // Particles are independent of freeze still: re-enable when desktop visible.
         wallpaperRenderer.setParticlesActive(
@@ -456,6 +447,7 @@ final class DesktopWindowController {
             // Drop freeze immediately while the live surface still matches it.
             // Renderers deliberately delay playhead advance until the next run-loop.
             self.presentationView.hideFrozenFrame()
+            self.commitPauseSession()
         }
     }
 

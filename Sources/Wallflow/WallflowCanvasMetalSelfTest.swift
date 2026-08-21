@@ -8,6 +8,8 @@ final class WallflowCanvasMetalSelfTest {
     private var completion: ((Result<Void, Error>) -> Void)?
     private var pausedTime = 0.0
     private var pausedSubmissionCount = 0
+    private var pausedKoiPosition = CGPoint.zero
+    private var didCompleteSuppressedResume = false
 
     func run(
         projectURL: URL,
@@ -126,6 +128,7 @@ final class WallflowCanvasMetalSelfTest {
                     view.setRenderingEnabled(false)
                     self.pausedTime = view.virtualTimeForTesting
                     self.pausedSubmissionCount = view.renderSubmissionCountForTesting
+                    self.pausedKoiPosition = try self.koiPosition(from: view)
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
                         self?.verifyPausedState()
                     }
@@ -188,9 +191,47 @@ final class WallflowCanvasMetalSelfTest {
             )
             return
         }
-        view.setRenderingEnabled(true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            self?.verifyResumedState()
+        // Model the switching primary display temporarily having no presentable
+        // drawable. The old 0.4-second fallback revealed a stale surface here.
+        view.suppressPresentationForTesting = true
+        didCompleteSuppressedResume = false
+        view.setRenderingEnabled(true) { [weak self, weak view] in
+            guard let self, let view else { return }
+            self.didCompleteSuppressedResume = true
+            do {
+                let revealPosition = try self.koiPosition(from: view)
+                guard view.virtualTimeForTesting == self.pausedTime,
+                      hypot(
+                        revealPosition.x - self.pausedKoiPosition.x,
+                        revealPosition.y - self.pausedKoiPosition.y
+                      ) < 0.000_001 else {
+                    throw WallflowSelfTestError.failed(
+                        "Canvas Metal advanced before the paused frame was revealed"
+                    )
+                }
+                // Match DesktopWindowController's reveal boundary.
+                view.commitPauseSession()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                    self?.verifyResumedState()
+                }
+            } catch {
+                self.finish(.failure(error))
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self, weak view] in
+            guard let self, let view else { return }
+            guard !self.didCompleteSuppressedResume else {
+                self.finish(
+                    .failure(
+                        WallflowSelfTestError.failed(
+                            "Canvas Metal revealed before a drawable was presented"
+                        )
+                    )
+                )
+                return
+            }
+            view.suppressPresentationForTesting = false
+            view.draw()
         }
     }
 
@@ -208,7 +249,78 @@ final class WallflowCanvasMetalSelfTest {
             )
             return
         }
-        finish(.success(()))
+        let secondPausedTime = view.virtualTimeForTesting
+        view.setRenderingEnabled(false)
+        guard view.virtualTimeForTesting == secondPausedTime,
+              secondPausedTime > pausedTime else {
+            finish(
+                .failure(
+                    WallflowSelfTestError.failed(
+                        "Canvas Metal reused the previous Space checkpoint"
+                    )
+                )
+            )
+            return
+        }
+        view.setRenderingEnabled(true) { [weak self, weak view] in
+            guard let self, let view else { return }
+            guard view.virtualTimeForTesting == secondPausedTime else {
+                self.finish(
+                    .failure(
+                        WallflowSelfTestError.failed(
+                            "Canvas Metal second reveal skipped its paused frame"
+                        )
+                    )
+                )
+                return
+            }
+            // Still inside the pause session: the host has not committed. A Space
+            // hop landing here must snap the timeline back AND repaint, otherwise
+            // the still captured for the freeze shows a frame nobody saw.
+            self.verifySpaceHopSnapsBack(to: secondPausedTime)
+        }
+    }
+
+    private func verifySpaceHopSnapsBack(to lockedTime: Double) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self, weak view = wallpaperView] in
+            guard let self, let view else { return }
+            guard view.virtualTimeForTesting > lockedTime else {
+                self.finish(
+                    .failure(
+                        WallflowSelfTestError.failed(
+                            "Canvas Metal did not resume after its second reveal"
+                        )
+                    )
+                )
+                return
+            }
+            let advancedSubmissionCount = view.renderSubmissionCountForTesting
+            view.pinToPauseSession(completion: nil)
+            guard view.virtualTimeForTesting == lockedTime,
+                  view.renderSubmissionCountForTesting > advancedSubmissionCount else {
+                self.finish(
+                    .failure(
+                        WallflowSelfTestError.failed(
+                            "Canvas Metal Space re-pin did not repaint the locked frame"
+                        )
+                    )
+                )
+                return
+            }
+            view.setRenderingEnabled(true) { [weak self, weak view] in
+                guard let self, let view else { return }
+                view.commitPauseSession()
+                self.finish(.success(()))
+            }
+        }
+    }
+
+    private func koiPosition(from view: CanvasMetalWallpaperView) throws -> CGPoint {
+        guard let x = try view.evaluateJavaScriptForTesting("kois[0].x") as? NSNumber,
+              let y = try view.evaluateJavaScriptForTesting("kois[0].y") as? NSNumber else {
+            throw WallflowSelfTestError.failed("Canvas Metal koi position probe failed")
+        }
+        return CGPoint(x: x.doubleValue, y: y.doubleValue)
     }
 
     private func integer(from value: Any?) throws -> Int {

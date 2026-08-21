@@ -52,6 +52,24 @@ final class DisplayWallpaperStore {
         save()
     }
 
+    /// Repoint every display using an old external path to its managed copy.
+    @discardableResult
+    func replaceSource(
+        _ oldSource: String,
+        with newSource: String
+    ) -> [CGDirectDisplayID] {
+        var changedDisplayIDs: [CGDirectDisplayID] = []
+        for (key, source) in assignments where source == oldSource {
+            guard let id = UInt32(key) else { continue }
+            assignments[key] = newSource
+            changedDisplayIDs.append(CGDirectDisplayID(id))
+        }
+        if !changedDisplayIDs.isEmpty {
+            save()
+        }
+        return changedDisplayIDs
+    }
+
     /// All display IDs currently assigned to the given source (or built-in).
     func displayIDs(usingSource source: String?) -> [CGDirectDisplayID] {
         let token = source ?? Self.builtInToken

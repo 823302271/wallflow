@@ -8,8 +8,8 @@ protocol WallpaperRenderer: AnyObject {
     /// Re-assert the pause-session lock (seek/snap back even if already paused).
     /// Used on every Space hop so a stuck or half-resumed surface cannot drift.
     func pinToPauseSession(completion: (() -> Void)?)
-    /// Host-only: release the pause-session lock after stable live playback.
-    /// Renderers must not clear their own session locks on a timer.
+    /// Host-only: release the pause-session lock after the matching live frame is
+    /// ready to reveal. Renderers must not clear their own locks on a timer.
     func commitPauseSession()
     func setAudioMuted(_ muted: Bool)
     func setPlaysAudio(_ enabled: Bool)

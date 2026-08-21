@@ -47,6 +47,13 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
     private var shapeBufferCapacity = 0
     private var shapeBufferIndex = 0
     private var renderSubmissionCount = 0
+    /// Pending reveal attached to MTKView-managed drawable presentations. A Space
+    /// transition may temporarily discard drawables on only the moving display, so
+    /// keep retrying the exact paused frame instead of revealing on a timer.
+    private var resumePresentationGeneration = 0
+    private var pendingPresentationGeneration: Int?
+    private var pendingPresentationCompletion: (() -> Void)?
+    var suppressPresentationForTesting = false
 
     var contentView: NSView { self }
     var commandCountForTesting: Int {
@@ -129,24 +136,50 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
         if enabled == isRenderingEnabled {
             if !enabled {
                 pinToPauseSession(completion: completion)
-            } else {
+            } else if pendingPresentationGeneration == nil {
                 completion?()
             }
             return
         }
         isRenderingEnabled = enabled
+        resumePresentationGeneration += 1
+        let presentationGeneration = resumePresentationGeneration
         if enabled {
+            var didReveal = false
+            let revealAfterPresentation: () -> Void = { [weak self] in
+                guard let self, self.isRenderingEnabled, !didReveal else { return }
+                didReveal = true
+                // The host removes its still only after Metal has actually presented
+                // the exact paused frame underneath it.
+                // DIAGNOSTIC: the frame actually revealed to the user.
+                NSLog("Wallflow canvas revealed at %.0fms", self.virtualTimeMilliseconds)
+                completion?()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.isRenderingEnabled else { return }
+                    self.startScheduler()
+                    self.startInputBridge()
+                }
+            }
             if let locked = sessionVirtualTimeMilliseconds {
+                // DIAGNOSTIC: timeline positions across a pause/resume cycle.
+                NSLog(
+                    "Wallflow canvas resume: locked=%.0fms current=%.0fms delta=%.0fms",
+                    locked,
+                    virtualTimeMilliseconds,
+                    virtualTimeMilliseconds - locked
+                )
                 virtualTimeMilliseconds = locked
-                renderNextFrame()
+                // `latestFrame` already represents this exact virtual time. Calling
+                // renderNextFrame() here advanced 41.67 ms before the host removed
+                // its frozen overlay, producing a visible one-frame jump on resume.
+                // MTKView owns currentDrawable lifetime. Request a normal draw so
+                // this presentation cannot reuse an already-presented drawable.
+                pendingPresentationGeneration = presentationGeneration
+                pendingPresentationCompletion = revealAfterPresentation
+                requestResumeFramePresentation(generation: presentationGeneration)
+                return
             }
-            // Reveal while still on the last drawn frame, then start the clock.
-            completion?()
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.isRenderingEnabled else { return }
-                self.startScheduler()
-                self.startInputBridge()
-            }
+            revealAfterPresentation()
         } else {
             pinToPauseSession(completion: completion)
         }
@@ -154,19 +187,33 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
 
     func pinToPauseSession(completion: (() -> Void)?) {
         isRenderingEnabled = false
+        resumePresentationGeneration += 1
+        pendingPresentationGeneration = nil
+        pendingPresentationCompletion = nil
         stopScheduler()
         stopInputBridge()
+        // DIAGNOSTIC: where the timeline froze, and whether a lock already existed.
+        NSLog(
+            "Wallflow canvas pin: current=%.0fms existingLock=%@",
+            virtualTimeMilliseconds,
+            sessionVirtualTimeMilliseconds.map { String(format: "%.0fms", $0) } ?? "none"
+        )
         if sessionVirtualTimeMilliseconds == nil {
             sessionVirtualTimeMilliseconds = virtualTimeMilliseconds
-        } else if let locked = sessionVirtualTimeMilliseconds {
+        } else if let locked = sessionVirtualTimeMilliseconds,
+                  locked != virtualTimeMilliseconds {
+            // Snap back: a false resume may have advanced past the locked frame.
+            // renderNextFrame() would no-op here — rendering is already disabled.
             virtualTimeMilliseconds = locked
-            renderNextFrame()
+            renderCurrentFrame()
         }
         completion?()
     }
 
     func commitPauseSession() {
         guard isRenderingEnabled else { return }
+        // DIAGNOSTIC: lock released — the timeline is free to advance from here.
+        NSLog("Wallflow canvas commit: lock released at %.0fms", virtualTimeMilliseconds)
         sessionVirtualTimeMilliseconds = nil
     }
 
@@ -186,7 +233,9 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
     }
 
     func prepareForPresentation() {
-        displayIfNeeded()
+        // A single MTKView draw obtains and presents one fresh drawable. Calling
+        // displayIfNeeded() immediately before draw() could render twice against
+        // the same drawable during window restoration.
         draw()
     }
 
@@ -251,7 +300,14 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
 
     func draw(in view: MTKView) {
         guard let frame = latestFrame else { return }
-        render(frame)
+        guard !suppressPresentationForTesting else { return }
+        if let generation = pendingPresentationGeneration {
+            _ = render(frame) { [weak self] in
+                self?.completeResumeFramePresentation(generation: generation)
+            }
+        } else {
+            _ = render(frame)
+        }
     }
 
     private func configureMetalView() {
@@ -299,6 +355,13 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
         guard isRenderingEnabled, !reportedRuntimeFailure else { return }
         dispatchMouseMovement()
         virtualTimeMilliseconds += 1_000.0 / Double(Self.framesPerSecond)
+        renderCurrentFrame()
+    }
+
+    /// Re-render whatever `virtualTimeMilliseconds` currently holds. Used by the
+    /// pause-session pin, which must repaint while rendering is disabled.
+    private func renderCurrentFrame() {
+        guard !reportedRuntimeFailure else { return }
         do {
             latestFrame = try runtime.renderFrame(
                 timeMilliseconds: virtualTimeMilliseconds
@@ -412,7 +475,36 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
         fputs("Wallflow Canvas Metal stopped: \(error.localizedDescription)\n", stderr)
     }
 
-    private func render(_ frame: CanvasMetalFrame) {
+    private func requestResumeFramePresentation(generation: Int) {
+        guard isRenderingEnabled,
+              !reportedRuntimeFailure,
+              pendingPresentationGeneration == generation else {
+            return
+        }
+        draw()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self,
+                  self.isRenderingEnabled,
+                  self.pendingPresentationGeneration == generation else {
+                return
+            }
+            self.requestResumeFramePresentation(generation: generation)
+        }
+    }
+
+    private func completeResumeFramePresentation(generation: Int) {
+        guard pendingPresentationGeneration == generation else { return }
+        let completion = pendingPresentationCompletion
+        pendingPresentationGeneration = nil
+        pendingPresentationCompletion = nil
+        completion?()
+    }
+
+    @discardableResult
+    private func render(
+        _ frame: CanvasMetalFrame,
+        presented completion: (() -> Void)? = nil
+    ) -> Bool {
         guard bounds.width > 0,
               bounds.height > 0,
               let descriptor = currentRenderPassDescriptor,
@@ -423,12 +515,20 @@ final class CanvasMetalWallpaperView: MTKView, MTKViewDelegate, WallpaperRendere
                 descriptor: descriptor,
                 commandBuffer: commandBuffer
               ) else {
-            return
+            return false
         }
 
+        if let completion {
+            drawable.addPresentedHandler { _ in
+                DispatchQueue.main.async {
+                    completion()
+                }
+            }
+        }
         commandBuffer.present(drawable)
         commandBuffer.commit()
         renderSubmissionCount += 1
+        return true
     }
 
     private func encode(

@@ -44,7 +44,7 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
     private var audioMuted = false
     private var fitMode: WallpaperFitMode
     /// Written on pause; resume always restores from this data.
-    /// Stays locked until the host calls `commitPauseSession()` after stable play.
+    /// Stays locked until the host reveals the restored matching frame.
     private var checkpoint: VideoPlaybackCheckpoint?
     private var resumeGeneration = 0
 
@@ -130,8 +130,10 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
     }
 
     func commitPauseSession() {
-        // Only the host may release the lock after a Space-quiet stable resume.
-        guard renderingEnabled, player.rate > 0 else { return }
+        // Only the host may release the lock after the matching frame is ready.
+        // `rate` may temporarily be zero while AVPlayer buffers or reaches a loop
+        // boundary; renderingEnabled is the authoritative host state.
+        guard renderingEnabled else { return }
         checkpoint = nil
     }
 
@@ -261,6 +263,7 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
             guard let self, generation == self.resumeGeneration, self.renderingEnabled else {
                 return
             }
+            let playbackStartTime = self.player.currentTime()
             // Host hides the freeze while we are still paused at the checkpoint.
             completion?()
             // One run-loop turn after reveal: only then advance the playhead.
@@ -270,9 +273,45 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
                       self.renderingEnabled else {
                     return
                 }
-                self.player.play()
-                // Checkpoint stays until host `commitPauseSession()` — Space hops
-                // after a brief intermediate resume must still snap back here.
+                self.startPlayback(
+                    generation: generation,
+                    baseline: playbackStartTime,
+                    attempt: 0
+                )
+                // The host clears the checkpoint after this matching frame is
+                // revealed. An aborted reveal keeps it locked for the next retry.
+            }
+        }
+
+        var didFinishPreroll = false
+        let revealAfterPreroll: () -> Void = {
+            guard !didFinishPreroll else { return }
+            didFinishPreroll = true
+            revealReady()
+        }
+        let prerollThenReveal: () -> Void = { [weak self] in
+            guard let self, generation == self.resumeGeneration, self.renderingEnabled else {
+                return
+            }
+            self.player.preroll(atRate: 1) { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self,
+                          generation == self.resumeGeneration,
+                          self.renderingEnabled else {
+                        return
+                    }
+                    revealAfterPreroll()
+                }
+            }
+            // AVPlayer can delay a preroll callback while rebuilding a decoder.
+            // Keep the frozen frame bounded, then let guarded playback retries run.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self,
+                      generation == self.resumeGeneration,
+                      self.renderingEnabled else {
+                    return
+                }
+                revealAfterPreroll()
             }
         }
 
@@ -281,7 +320,7 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
             // No checkpoint: still delay play until after the host can reveal.
             player.pause()
             player.rate = 0
-            revealReady()
+            prerollThenReveal()
             return
         }
 
@@ -295,13 +334,51 @@ final class VideoWallpaperView: NSView, WallpaperRenderer {
             // Stay paused at the seeked frame so the freeze overlay matches.
             self.player.pause()
             self.player.rate = 0
-            revealReady()
+            prerollThenReveal()
             if !ok {
                 NSLog(
                     "Wallflow video restore seek was approximate at %.3fs",
                     target.seconds
                 )
             }
+        }
+    }
+
+    private func startPlayback(
+        generation: Int,
+        baseline: CMTime,
+        attempt: Int
+    ) {
+        guard generation == resumeGeneration, renderingEnabled else { return }
+        player.playImmediately(atRate: 1)
+        guard attempt < 4 else {
+            NSLog(
+                "Wallflow video playback did not advance after resume (status=%d)",
+                player.timeControlStatus.rawValue
+            )
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self,
+                  generation == self.resumeGeneration,
+                  self.renderingEnabled else {
+                return
+            }
+            let current = self.player.currentTime()
+            let advanced = current.isValid
+                && current.isNumeric
+                && baseline.isValid
+                && baseline.isNumeric
+                && current.seconds > baseline.seconds + 0.03
+            if advanced || self.player.timeControlStatus == .playing {
+                return
+            }
+            self.ensurePlayerItemReady()
+            self.startPlayback(
+                generation: generation,
+                baseline: baseline,
+                attempt: attempt + 1
+            )
         }
     }
 

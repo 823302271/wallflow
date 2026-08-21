@@ -28,12 +28,12 @@ Wallpaper Engine web and scene compatibility.
 - Full native backing resolution for Canvas-Metal wallpapers
 - Two-buffer Metal swap chain instead of the default three-buffer allocation
 - Rendering suspension when visible app windows collectively hide a display's desktop
-- Automatic suspension during sleep and inactive login sessions
+- Automatic suspension during screen lock, display/system sleep, and inactive login sessions
 - Incremental display reconciliation without restarting retained-screen renderers
 - Per-display Space handling: only the hidden display pauses and keeps its last frame; other displays keep playing
-- Wallpaper windows do not join every Space (avoids multi-hop 1→2→3→Desktop resume jumps)
+- Wallpaper windows join every desktop Space so live playback continues after switching desktops
 - Video pause writes a playback checkpoint and resume seeks to that time; the host commits the pause session only after stable play
-- On pause, the current frame is captured and set as that display's system desktop wallpaper
+- The current frame is frozen in-place; the system desktop fallback is refreshed outside Space transitions
 - Menu bar pause and resume controls
 - Default-on pause only when a display's desktop is fully hidden
 - Persistent wallpaper library with switching, reveal, and uninstall actions
@@ -143,7 +143,8 @@ project. A web compatibility fixture is included at `Fixtures/web-wallpaper`.
   dragging the file onto `Wallflow.app`.
 - Local files, project directories, and ZIPs are copied into
   `~/Library/Application Support/Wallflow/ImportedWallpapers`, so they do not
-  depend on their original path or a temporary directory. Existing managed
+  depend on their original path or a temporary directory. Legacy local-path
+  records are migrated into managed storage automatically, and existing managed
   import directories are rediscovered at launch.
 - Successful imports are added to **Wallpaper Library...** automatically.
   Removing a local wallpaper deletes only Wallflow's installed copy, never the
@@ -229,9 +230,13 @@ wallpaper can react to the same click.
 
 During a full-screen or Space transition, Wallflow keeps the same desktop window,
 WebKit surface, and renderer alive above the system wallpaper and below desktop
-icons. Visibility is evaluated **per display**: switching Space or going full
-screen on one monitor pauses only that monitor. Before the desktop disappears,
-Wallflow saves the last frame and writes it as the system desktop fallback. When
+icons. The window joins every desktop Space, while visibility is evaluated **per
+display**: a full-screen Space on one monitor pauses only that monitor. A Space
+change freezes every display on the frame that was on screen at that instant,
+because coverage still reports the outgoing layout while the animation runs: a
+display that is still visible resumes from that exact frame as soon as coverage
+confirms it, and a covered one never advances while nobody can see it. Wallflow
+does not rewrite the system desktop during the Space animation. When
 the desktop returns, the frozen frame is shown first; video then seeks from its
 checkpoint and the live surface is revealed without a jump. Incremental display
 reconciliation reuses retained-screen renderers when another display is connected

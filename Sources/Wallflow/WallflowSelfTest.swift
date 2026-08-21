@@ -17,7 +17,10 @@ enum WallflowSelfTest {
         try testLocalizationResources()
         try testWallpaperSnapshotPreservesResolution()
         try testDesktopVisibilityRules()
-        try testDisplaySpaceTransitionIsolation()
+        try testDesktopCoverageSamplerIsolation()
+        try testDisplayVisibilityProbeIsolation()
+        try testSystemSuspensionState()
+        try testDisplayWallpaperSourceMigration()
         try testLocalWallpaperImportIsPersistent()
         try testWallpaperLibrary()
         try testWebManifest()
@@ -159,43 +162,119 @@ enum WallflowSelfTest {
         )
     }
 
-    private static func testDisplaySpaceTransitionIsolation() throws {
-        let mainDisplay: CGDirectDisplayID = 101
-        let secondaryDisplay: CGDirectDisplayID = 202
-        var state = DisplaySpaceTransitionState()
+    private static func testDesktopCoverageSamplerIsolation() throws {
+        let mainDisplay: CGDirectDisplayID = 1
+        let secondaryDisplay: CGDirectDisplayID = 2
+        let mainBounds = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let secondaryBounds = CGRect(x: 1000, y: 0, width: 1000, height: 800)
+        let hiddenDisplayIDs = DesktopCoverageSampler.hiddenDisplayIDs(
+            screenBoundsByDisplay: [
+                mainDisplay: mainBounds,
+                secondaryDisplay: secondaryBounds
+            ],
+            windowBounds: [secondaryBounds]
+        )
+        try expect(
+            hiddenDisplayIDs == Set([secondaryDisplay]),
+            "Secondary coverage incorrectly marked the main display hidden"
+        )
+    }
 
-        let firstGeneration = state.begin(
-            for: secondaryDisplay,
-            now: 10,
-            quietPeriod: 0.85
-        )
-        try expect(firstGeneration == 1, "Secondary display generation did not start")
-        try expect(
-            state.isQuiet(for: secondaryDisplay, now: 10.5),
-            "Secondary display Space hold was not active"
-        )
-        try expect(
-            !state.isQuiet(for: mainDisplay, now: 10.5),
-            "Secondary display Space hold leaked to the main display"
+    private static func testDisplayVisibilityProbeIsolation() throws {
+        let mainDisplay: CGDirectDisplayID = 1
+        let secondaryDisplay: CGDirectDisplayID = 3
+        var state = DisplayVisibilityProbeState()
+
+        let mainGeneration = try expectValue(
+            state.begin(for: mainDisplay),
+            "Main display visibility probe did not start"
         )
         try expect(
-            state.generation(for: mainDisplay) == 0,
-            "Secondary display navigation changed the main display generation"
+            state.begin(for: mainDisplay) == nil,
+            "Watchdog restarted an in-flight main display visibility probe"
+        )
+        let secondaryGeneration = try expectValue(
+            state.begin(for: secondaryDisplay),
+            "Secondary display visibility probe did not start independently"
+        )
+        state.cancel(for: mainDisplay)
+        try expect(
+            !state.isCurrent(mainGeneration, for: mainDisplay),
+            "Canceled main display visibility probe remained current"
+        )
+        try expect(
+            state.finish(secondaryGeneration, for: secondaryDisplay),
+            "Secondary display visibility probe was invalidated by the main display"
+        )
+        // A finished probe must be re-armable, otherwise a display that resumed
+        // once could never be probed again.
+        try expect(
+            state.begin(for: secondaryDisplay) != nil,
+            "Finished visibility probe blocked the next probe on that display"
+        )
+    }
+
+    private static func testSystemSuspensionState() throws {
+        var state = SystemSuspensionState()
+        try expect(!state.isSuspended, "System suspension started active")
+
+        try expect(
+            state.set(.screenLocked, active: true) && state.isSuspended,
+            "Screen lock did not suspend rendering"
+        )
+        _ = state.set(.systemSleep, active: true)
+        _ = state.set(.screensSleep, active: true)
+        _ = state.set(.systemSleep, active: false)
+        _ = state.set(.screensSleep, active: false)
+        try expect(
+            state.isSuspended,
+            "Wake notifications resumed rendering while the screen was still locked"
         )
 
-        let secondGeneration = state.begin(
-            for: secondaryDisplay,
-            now: 10.4,
-            quietPeriod: 0.85
-        )
-        try expect(secondGeneration == 2, "A repeated hop did not advance its display")
+        _ = state.set(.sessionInactive, active: true)
+        _ = state.set(.screenLocked, active: false)
         try expect(
-            state.isQuiet(for: secondaryDisplay, now: 11.2),
-            "A repeated hop did not extend its display hold"
+            state.isSuspended,
+            "Unlock resumed rendering before the user session became active"
+        )
+        _ = state.set(.sessionInactive, active: false)
+        try expect(
+            !state.isSuspended,
+            "Rendering did not resume after every suspension reason cleared"
+        )
+    }
+
+    private static func testDisplayWallpaperSourceMigration() throws {
+        let suiteName = "WallflowDisplayMigrationTests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            throw WallflowSelfTestError.failed("Could not create display migration defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let mainDisplay: CGDirectDisplayID = 11
+        let secondaryDisplay: CGDirectDisplayID = 22
+        let untouchedDisplay: CGDirectDisplayID = 33
+        let oldSource = "/tmp/external/project.json"
+        let managedSource = "/tmp/managed/project.json"
+        let untouchedSource = "/tmp/other/project.json"
+        let store = DisplayWallpaperStore(defaults: defaults)
+        store.setSource(oldSource, for: [mainDisplay, secondaryDisplay])
+        store.setSource(untouchedSource, for: untouchedDisplay)
+
+        let changed = store.replaceSource(oldSource, with: managedSource)
+        try expect(
+            Set(changed) == Set([mainDisplay, secondaryDisplay]),
+            "External wallpaper assignments were not migrated together"
+        )
+        let reloaded = DisplayWallpaperStore(defaults: defaults)
+        try expect(
+            reloaded.source(for: mainDisplay) == managedSource
+                && reloaded.source(for: secondaryDisplay) == managedSource,
+            "Managed wallpaper assignments were not persisted"
         )
         try expect(
-            !state.isQuiet(for: secondaryDisplay, now: 11.3),
-            "Display hold remained active after its quiet period"
+            reloaded.source(for: untouchedDisplay) == untouchedSource,
+            "Unrelated display assignment changed during migration"
         )
     }
 
@@ -316,6 +395,76 @@ enum WallflowSelfTest {
         try expect(
             !FileManager.default.fileExists(atPath: installRoot.path),
             "Managed wallpaper files were not removed"
+        )
+
+        let externalRoot = directory.appendingPathComponent("External", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: externalRoot,
+            withIntermediateDirectories: true
+        )
+        try "<!doctype html><title>Legacy</title>".write(
+            to: externalRoot.appendingPathComponent("index.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try """
+        { "file": "index.html", "type": "web", "title": "Legacy External" }
+        """.write(
+            to: externalRoot.appendingPathComponent("project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let externalProject = try WallpaperProjectLoader.load(externalRoot)
+        let externalSource = externalProject.manifestURL ?? externalRoot
+        let externalEntry = reloaded.install(
+            project: externalProject,
+            sourceURL: externalSource
+        )
+        try expect(
+            reloaded.externalLocalEntries.map(\.id).contains(externalEntry.id),
+            "External local wallpaper was not selected for migration"
+        )
+        try expect(
+            reloaded.setFitMode(.fill, for: externalProject),
+            "External wallpaper fit mode could not be set"
+        )
+
+        let importService = WallpaperImportService(importedRootURL: importedRoot)
+        let managedURL = try importService.installLocalProject(externalRoot)
+        let managedProject = try WallpaperProjectLoader.load(managedURL)
+        let managedSource = managedProject.manifestURL ?? managedProject.entryURL ?? managedURL
+        let entryBeforeReplacement = try expectValue(
+            reloaded.entries.first(where: { $0.id == externalEntry.id }),
+            "External wallpaper disappeared before migration"
+        )
+        let migratedEntry = try expectValue(
+            reloaded.replace(
+                entryBeforeReplacement,
+                with: managedProject,
+                sourceURL: managedSource
+            ),
+            "External wallpaper library entry was not replaced"
+        )
+        try expect(
+            migratedEntry.id == externalEntry.id && migratedEntry.fitMode == .fill,
+            "Wallpaper identity or display mode changed during migration"
+        )
+        try expect(
+            reloaded.isManaged(migratedEntry),
+            "Migrated wallpaper was not classified as managed"
+        )
+
+        try FileManager.default.removeItem(at: externalRoot)
+        _ = try WallpaperProjectLoader.load(migratedEntry.sourceURL)
+        let migratedReload = WallpaperLibrary(
+            defaults: defaults,
+            importedRootURL: importedRoot
+        )
+        try expect(
+            migratedReload.entries.count == 1
+                && migratedReload.entries.first?.id == externalEntry.id
+                && migratedReload.entries.first?.fitMode == .fill,
+            "Migrated wallpaper metadata was not preserved after reload"
         )
     }
 

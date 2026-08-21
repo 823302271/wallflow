@@ -9,6 +9,16 @@ final class DesktopFallbackManager {
         qos: .utility
     )
     private var generations: [CGDirectDisplayID: Int] = [:]
+    /// URLs handed to macOS, oldest first, per display.
+    ///
+    /// Every publish needs a *fresh* URL: macOS caches the desktop picture by URL,
+    /// so reusing a filename can redisplay the content it cached for that name last
+    /// time — the wallpaper visibly one step behind. Files are retired strictly by
+    /// age here on the main queue, several publishes after they stop being active,
+    /// which is what the old prune-by-modification-date got wrong: it raced with
+    /// setDesktopImageURL and deleted the picture macOS was reading.
+    private var installedURLs: [CGDirectDisplayID: [URL]] = [:]
+    private static let retainedFallbackCount = 4
 
     init() {
         let applicationSupport = try? FileManager.default.url(
@@ -45,7 +55,7 @@ final class DesktopFallbackManager {
         )
         options[.allowClipping] = true
         let fallbackURL = directory.appendingPathComponent(
-            "display-\(displayID)-\(UUID().uuidString).png"
+            "display-\(displayID)-\(generation)-\(UUID().uuidString).png"
         )
 
         encodingQueue.async { [weak self] in
@@ -57,6 +67,10 @@ final class DesktopFallbackManager {
                 try pngData.write(to: fallbackURL, options: .atomic)
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
+                    // A newer still superseded this one. Leave the file alone: it is
+                    // an inactive slot that the next publish will overwrite, and
+                    // deleting files in this directory is what previously pulled the
+                    // active picture out from under macOS.
                     guard self.generations[displayID] == generation else {
                         try? FileManager.default.removeItem(at: fallbackURL)
                         return
@@ -67,10 +81,7 @@ final class DesktopFallbackManager {
                             for: screen,
                             options: options
                         )
-                        self.pruneFallbackImages(
-                            for: displayID,
-                            keeping: fallbackURL
-                        )
+                        self.retire(fallbackURL, for: displayID)
                     } catch {
                         NSLog(
                             "Wallflow could not set the desktop fallback image: %@",
@@ -87,32 +98,33 @@ final class DesktopFallbackManager {
         }
     }
 
-    private func pruneFallbackImages(
-        for displayID: CGDirectDisplayID,
-        keeping currentURL: URL
-    ) {
-        let prefix = "display-\(displayID)-"
+    /// Record a newly installed picture and delete only URLs that have been
+    /// superseded several publishes ago — never the one macOS is reading.
+    private func retire(_ installedURL: URL, for displayID: CGDirectDisplayID) {
+        var urls = installedURLs[displayID] ?? []
+        urls.append(installedURL)
+        while urls.count > Self.retainedFallbackCount {
+            let stale = urls.removeFirst()
+            try? FileManager.default.removeItem(at: stale)
+        }
+        installedURLs[displayID] = urls
+    }
+
+    /// One-time sweep of files left by earlier runs. Nothing here can be the
+    /// picture macOS is currently reading, because this app has not installed one
+    /// yet in this process.
+    func removeOrphanedImages(activeURLs: Set<URL>) {
         let urls = (try? FileManager.default.contentsOfDirectory(
             at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey],
+            includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
         ))?.filter {
-            $0.lastPathComponent.hasPrefix(prefix) && $0.pathExtension == "png"
+            $0.pathExtension == "png"
+                && $0.lastPathComponent.hasPrefix("display-")
+                && !activeURLs.contains($0)
         } ?? []
-        let sorted = urls.sorted {
-            let left = try? $0.resourceValues(
-                forKeys: [.contentModificationDateKey]
-            ).contentModificationDate
-            let right = try? $1.resourceValues(
-                forKeys: [.contentModificationDateKey]
-            ).contentModificationDate
-            return (left ?? .distantPast) > (right ?? .distantPast)
-        }
-        for url in sorted.filter({ $0 != currentURL }).dropFirst(2) {
+        for url in urls {
             try? FileManager.default.removeItem(at: url)
         }
-        try? FileManager.default.removeItem(
-            at: directory.appendingPathComponent("display-\(displayID).png")
-        )
     }
 }

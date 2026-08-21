@@ -65,17 +65,29 @@ final class WallpaperLibrary {
 
     private let defaults: UserDefaults
     private let importedRootURL: URL
-    private let importService = WallpaperImportService()
+    private let importService: WallpaperImportService
     private(set) var entries: [WallpaperLibraryEntry]
 
     init(
         defaults: UserDefaults = .standard,
         importedRootURL: URL? = nil
     ) {
+        let resolvedImportedRootURL = importedRootURL ?? Self.defaultImportedRootURL()
         self.defaults = defaults
-        self.importedRootURL = importedRootURL ?? Self.defaultImportedRootURL()
+        self.importedRootURL = resolvedImportedRootURL
+        importService = WallpaperImportService(importedRootURL: resolvedImportedRootURL)
         entries = Self.loadEntries(from: defaults)
         discoverManagedWallpapers()
+    }
+
+    /// Available local entries created by older builds that still depend on files
+    /// outside Wallflow's Application Support directory.
+    var externalLocalEntries: [WallpaperLibraryEntry] {
+        entries.filter { entry in
+            entry.sourceURL.isFileURL
+                && entry.isAvailable
+                && managedInstallRoot(for: entry.sourceURL) == nil
+        }
     }
 
     @discardableResult
@@ -100,6 +112,29 @@ final class WallpaperLibrary {
         sortEntries()
         save()
         return entry
+    }
+
+    /// Repoint a legacy entry to its managed copy while preserving identity,
+    /// addition date, and display mode. Any discovered duplicate is merged.
+    @discardableResult
+    func replace(
+        _ entry: WallpaperLibraryEntry,
+        with project: WallpaperProject,
+        sourceURL: URL
+    ) -> WallpaperLibraryEntry? {
+        guard entries.contains(where: { $0.id == entry.id }) else { return nil }
+        let normalizedSource = Self.normalizedSource(sourceURL)
+        var replacement = entry
+        replacement.source = normalizedSource
+        replacement.title = project.displayTitle
+        replacement.kind = project.kind.rawValue
+        entries.removeAll {
+            $0.id == entry.id || $0.source == normalizedSource
+        }
+        entries.append(replacement)
+        sortEntries()
+        save()
+        return replacement
     }
 
     func remove(_ entry: WallpaperLibraryEntry, deleteManagedFiles: Bool) throws {
