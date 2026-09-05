@@ -35,11 +35,11 @@ struct DisplayVisibilityProbeState {
 
     mutating func clear() {
         pendingDisplayIDs.removeAll()
-        generations.removeAll()
+        // Delayed callbacks may still exist. Never recycle their generation IDs.
+        for id in generations.keys { generations[id, default: 0] += 1 }
     }
 
     mutating func retain(displayIDs: Set<CGDirectDisplayID>) {
-        pendingDisplayIDs.formIntersection(displayIDs)
-        generations = generations.filter { displayIDs.contains($0.key) }
+        for id in pendingDisplayIDs.subtracting(displayIDs) { cancel(for: id) }
     }
 }

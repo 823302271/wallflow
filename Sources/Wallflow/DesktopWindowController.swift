@@ -237,8 +237,7 @@ final class DesktopWindowController {
             presentationGeneration += 1
             let generation = presentationGeneration
             isLiveSurfaceEnabled = false
-            // Particles are not part of the video freeze checkpoint: stop them only
-            // because the desktop is not visible (CPU), not because the still freezes.
+            // Freeze particle state before capturing the same frame as the scene.
             wallpaperRenderer.setParticlesActive(false)
             // The system desktop picture is what the Space transition animation
             // actually shows — our window does not participate in that animation.
@@ -434,7 +433,7 @@ final class DesktopWindowController {
     /// We drop the freeze on that matching frame; renderers start time on the next turn.
     private func beginLiveReveal(generation: Int) {
         isLiveSurfaceEnabled = true
-        // Particles are independent of freeze still: re-enable when desktop visible.
+        // Resume particle simulation with the scene after the matching still is ready.
         wallpaperRenderer.setParticlesActive(
             requestedRenderingEnabled && !isDesktopHidden
         )
@@ -459,9 +458,7 @@ final class DesktopWindowController {
         wallpaperRenderer.setRenderingEnabled(
             requestedRenderingEnabled && !isDesktopHidden && isLiveSurfaceEnabled
         )
-        // Manual global pause freezes video/scene layers only; particles stay up
-        // while the desktop is visible. Desktop-hidden already called
-        // setParticlesActive(false).
+        // Every pause reason also suspends particle simulation and input.
         if !isDesktopHidden {
             wallpaperRenderer.setParticlesActive(requestedRenderingEnabled)
         }

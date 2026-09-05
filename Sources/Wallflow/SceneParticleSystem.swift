@@ -37,6 +37,8 @@ struct SceneParticleSystem: Equatable {
     struct SizeChange: Equatable {
         let startScale: Double
         let endScale: Double
+        let startTime: Double
+        let endTime: Double
     }
 
     struct AngularMovement: Equatable {
@@ -55,6 +57,7 @@ struct SceneParticleSystem: Equatable {
     let startTime: Double
     let followMouse: Bool
     let instanceSize: Double
+    let instanceCount: Double
     let randomFrame: Bool
     let emitter: Emitter
     let lifetime: Range1D
@@ -85,7 +88,8 @@ enum SceneParticleParser {
         let visibility = parseVisibility(object["visible"])
         let controlPoints = definition["controlpoint"] as? [[String: Any]] ?? []
         let followMouse = controlPoints.contains {
-            (($0["flags"] as? NSNumber)?.intValue ?? 0) != 0
+            (($0["id"] as? NSNumber)?.intValue ?? 0) == 0
+                && (($0["flags"] as? NSNumber)?.intValue ?? 0) & 1 != 0
         }
 
         let primary = (definition["emitter"] as? [[String: Any]])?.first
@@ -162,12 +166,16 @@ enum SceneParticleParser {
                     fadeOut: max(double(op["fadeouttime"], fallback: 0), 0)
                 )
             case "sizechange":
-                let start = double(op["scale"] ?? op["startscale"] ?? op["start"], fallback: 1)
+                let start = double(op["startvalue"] ?? op["scale"] ?? op["startscale"] ?? op["start"], fallback: 1)
                 let end = double(
-                    op["endscale"] ?? op["scaleend"] ?? op["end"] ?? op["scale"],
+                    op["endvalue"] ?? op["endscale"] ?? op["scaleend"] ?? op["end"] ?? op["scale"],
                     fallback: start
                 )
-                sizeChange = .init(startScale: start, endScale: end)
+                sizeChange = .init(
+                    startScale: start, endScale: end,
+                    startTime: double(op["starttime"], fallback: 0),
+                    endTime: double(op["endtime"], fallback: 1)
+                )
             case "angularmovement":
                 angularMovement = .init(force: doubleArray(op["force"], fallback: [0, 0, 0]))
             default:
@@ -191,6 +199,7 @@ enum SceneParticleParser {
             startTime: max(double(definition["starttime"], fallback: 0), 0),
             followMouse: followMouse,
             instanceSize: instanceSize,
+            instanceCount: max(double(override?["count"], fallback: 1), 0),
             randomFrame: randomFrame,
             emitter: emitter,
             lifetime: lifetime,
@@ -291,7 +300,7 @@ final class SceneParticleRuntime {
         var maxLife: CGFloat
         var roll: CGFloat
         var rollSpeed: CGFloat
-        var spriteIndex: Int
+        var image: CGImage
     }
 
     private let model: SceneParticleSystem
@@ -300,11 +309,9 @@ final class SceneParticleRuntime {
     private var particles: [Particle] = []
     private var sprites: [CGImage]
     private var spritePixelSize: CGSize
-    /// For `animationmode: randomframe`: draw without replacement so trails don't
-    /// spam the same petal pose. Config mode is still random, just de-clustered.
-    private var frameDrawBag: [Int] = []
+    // A bounded palette avoids bitmap work during every layer update.
+    private var tintedSprites: [Int: CGImage] = [:]
     private var emitAccumulator: Double = 0
-    private var mouseMovedThisTick = false
     private var hasMouseSample = false
     private var elapsed: Double = 0
     private var isEnabled = true
@@ -316,12 +323,17 @@ final class SceneParticleRuntime {
     private var viewBounds = CGRect.zero
 
     var layer: CALayer { hostLayer }
+    var needsSimulation: Bool {
+        isEnabled && isVisible && (!particles.isEmpty
+            || (model.emitter.rate * model.instanceCount > 0
+                && (!model.followMouse || (mouseInDesktop && hasMouseSample))))
+    }
 
     init(model: SceneParticleSystem, package: ScenePackage?, rootURL: URL?) {
         self.model = model
         if let loaded = Self.loadSprites(model: model, package: package, rootURL: rootURL),
            !loaded.isEmpty {
-            sprites = Self.deduplicateFrames(loaded)
+            sprites = loaded
         } else {
             sprites = Self.makePlaceholderFrames()
         }
@@ -330,7 +342,6 @@ final class SceneParticleRuntime {
         } else {
             spritePixelSize = CGSize(width: 64, height: 64)
         }
-        frameDrawBag = Array(0..<sprites.count).shuffled()
 
         hostLayer.name = "wallflow.particles.\(model.id)"
         hostLayer.isOpaque = false
@@ -348,7 +359,7 @@ final class SceneParticleRuntime {
         isVisible = model.visibility.defaultValue
         hostLayer.isHidden = !isVisible
         NSLog(
-            "Wallflow particles '%@': %d unique frame(s), randomFrame=%d, followMouse=%d, rate=%.1f",
+            "Wallflow particles '%@': %d frame(s), randomFrame=%d, followMouse=%d, rate=%.1f",
             model.name,
             sprites.count,
             model.randomFrame ? 1 : 0,
@@ -359,22 +370,19 @@ final class SceneParticleRuntime {
 
     func setVisible(_ visible: Bool) {
         isVisible = visible
-        hostLayer.isHidden = !visible || !isEnabled
+        hostLayer.isHidden = !visible
         if !visible {
             particles.removeAll(keepingCapacity: true)
             clearLayers()
             emitAccumulator = 0
-            mouseMovedThisTick = false
             hasMouseSample = false
         }
     }
 
     func setEnabled(_ enabled: Bool) {
         isEnabled = enabled
-        hostLayer.isHidden = !enabled || !isVisible
-        if !enabled {
-            // Keep last frame visually frozen under host freeze overlay.
-        }
+        // The last layer state remains visible for freeze capture and reveal.
+        if !enabled { hasMouseSample = false }
     }
 
     func updateLayout(
@@ -395,34 +403,25 @@ final class SceneParticleRuntime {
     func updateMouse(desktopPoint: CGPoint?, inDesktop: Bool) {
         mouseInDesktop = inDesktop
         if let desktopPoint {
-            if model.followMouse, hasMouseSample, inDesktop {
-                let step = hypot(desktopPoint.x - mousePoint.x, desktopPoint.y - mousePoint.y)
-                if step >= 1.0 {
-                    mouseMovedThisTick = true
-                }
-            }
             mousePoint = desktopPoint
             hasMouseSample = true
         }
         if !inDesktop {
-            mouseMovedThisTick = false
             hasMouseSample = false
             emitAccumulator = 0
         }
     }
 
     func tick(delta: TimeInterval) {
-        guard isEnabled, isVisible else { return }
+        guard isEnabled, isVisible, delta.isFinite, delta > 0 else { return }
+        let previousTime = elapsed
         elapsed += delta
-        if elapsed < model.startTime {
-            mouseMovedThisTick = false
-            return
-        }
-        let dt = CGFloat(delta)
-        emit(delta: delta)
-        mouseMovedThisTick = false
-        integrate(delta: dt)
-        syncLayers()
+        guard elapsed >= model.startTime else { return }
+        let activeDelta = previousTime < model.startTime ? elapsed - model.startTime : delta
+        let hadParticles = !particles.isEmpty
+        emit(delta: activeDelta)
+        integrate(delta: CGFloat(activeDelta))
+        if hadParticles || !particles.isEmpty { syncLayers() }
     }
 
     func debugBypassStartTime() {
@@ -454,21 +453,20 @@ final class SceneParticleRuntime {
         if model.followMouse {
             guard mouseInDesktop, hasMouseSample else { return }
             origin = mousePoint
-            // Moving: use config rate; idle: almost no emit (avoids pile + CPU).
-            let rateScale = mouseMovedThisTick ? 0.45 : 0.0
-            emitAccumulator += model.emitter.rate * delta * rateScale
         } else {
             origin = fixedOriginInView()
-            emitAccumulator += model.emitter.rate * delta * 0.45
         }
-        // Hard cap: at most 1 spawn per tick (~12 Hz).
-        let budget = min(Int(emitAccumulator), 1)
-        guard budget > 0 else { return }
-        emitAccumulator -= Double(budget)
-        for _ in 0..<budget {
-            spawn(at: origin)
-        }
+        let amount = model.emitter.rate * model.instanceCount * delta
+        guard amount.isFinite else { return }
+        emitAccumulator += min(amount, 4096)
+        let requested = Int(floor(emitAccumulator + 1e-9))
+        emitAccumulator = max(0, emitAccumulator - Double(requested))
+        // Drop excess emissions at capacity instead of accumulating a later burst.
+        let budget = min(requested, max(particleLimit - particles.count, 0))
+        for _ in 0..<budget { spawn(at: origin) }
     }
+
+    private var particleLimit: Int { min(max(model.maxCount, 1), 4096) }
 
     private func integrate(delta dt: CGFloat) {
         // movement.drag: continuous exponential damping (not per-frame * (1-drag)).
@@ -476,9 +474,9 @@ final class SceneParticleRuntime {
         let damping = CGFloat(exp(-drag * 2.0 * Double(dt)))
         let forceZ = CGFloat(model.angularMovement?.force[safe: 2] ?? 0)
 
-        var next: [Particle] = []
-        next.reserveCapacity(particles.count)
-        for var p in particles {
+        var liveCount = 0
+        for index in particles.indices {
+            var p = particles[index]
             p.life -= dt
             guard p.life > 0 else { continue }
             p.vx *= damping
@@ -487,93 +485,26 @@ final class SceneParticleRuntime {
             p.y += p.vy * dt
             p.rollSpeed += forceZ * dt
             p.roll += p.rollSpeed * dt
-            next.append(p)
+            particles[liveCount] = p
+            liveCount += 1
         }
-        particles = next
+        if liveCount < particles.count {
+            particles.removeLast(particles.count - liveCount)
+        }
     }
 
     func clearParticles() {
         particles.removeAll(keepingCapacity: true)
         clearLayers()
         emitAccumulator = 0
-        frameDrawBag = Array(0..<sprites.count).shuffled()
     }
 
-    /// `randomframe`: random order without immediate repeats (reshuffle bag).
-    /// Other modes: always frame 0 (WE default first frame).
     private func nextSpriteIndex() -> Int {
-        guard sprites.count > 1 else { return 0 }
-        guard model.randomFrame else { return 0 }
-        if frameDrawBag.isEmpty {
-            frameDrawBag = Array(0..<sprites.count).shuffled()
-        }
-        return frameDrawBag.removeLast()
-    }
-
-    /// Drop near-duplicate crops (invalid TEXS frames that clamped to the same region).
-    private static func deduplicateFrames(_ frames: [CGImage]) -> [CGImage] {
-        guard frames.count > 1 else { return frames }
-        var unique: [CGImage] = []
-        for frame in frames {
-            let isDup = unique.contains { existing in
-                existing.width == frame.width
-                    && existing.height == frame.height
-                    && framesLookSimilar(existing, frame)
-            }
-            if !isDup {
-                unique.append(frame)
-            }
-        }
-        return unique.isEmpty ? frames : unique
-    }
-
-    private static func framesLookSimilar(_ a: CGImage, _ b: CGImage) -> Bool {
-        let w = 16
-        let h = 16
-        guard let ca = downsampleAlpha(a, width: w, height: h),
-              let cb = downsampleAlpha(b, width: w, height: h) else {
-            return false
-        }
-        var same = 0
-        for i in 0..<(w * h) {
-            let da = ca[i] > 20
-            let db = cb[i] > 20
-            if da == db { same += 1 }
-        }
-        return Double(same) / Double(w * h) > 0.92
-    }
-
-    private static func downsampleAlpha(_ image: CGImage, width: Int, height: Int) -> [UInt8]? {
-        var buffer = [UInt8](repeating: 0, count: width * height * 4)
-        let ok = buffer.withUnsafeMutableBytes { raw -> Bool in
-            guard let base = raw.baseAddress,
-                  let ctx = CGContext(
-                    data: base,
-                    width: width,
-                    height: height,
-                    bitsPerComponent: 8,
-                    bytesPerRow: width * 4,
-                    space: CGColorSpaceCreateDeviceRGB(),
-                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-                  ) else {
-                return false
-            }
-            ctx.interpolationQuality = .low
-            ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-            return true
-        }
-        guard ok else { return nil }
-        var alpha = [UInt8](repeating: 0, count: width * height)
-        for i in 0..<(width * height) {
-            alpha[i] = buffer[i * 4 + 3]
-        }
-        return alpha
+        model.randomFrame ? Int.random(in: 0..<sprites.count) : 0
     }
 
     private func spawn(at point: CGPoint) {
-        // Soft global cap for CPU (config maxcount can be 666).
-        let cap = min(max(model.maxCount, 1), 48)
-        guard particles.count < cap else { return }
+        guard particles.count < particleLimit, !sprites.isEmpty else { return }
         let scale = max(sceneToViewScale, 0.001)
 
         // emitter sphererandom + directions + distance (scene units)
@@ -584,18 +515,14 @@ final class SceneParticleRuntime {
         )
         let dir = model.emitter.directions
         let sx = dir[safe: 0] ?? 1
-        let sy = max(dir[safe: 1] ?? 1, 0.05)
+        let sy = dir[safe: 1] ?? 1
         let sz = dir[safe: 2] ?? 1
         let u = Double.random(in: -1...1)
         let theta = Double.random(in: 0..<(2 * .pi))
         let radial = sqrt(max(0, 1 - u * u))
-        var ox = radial * cos(theta) * sx
-        var oy = u * sy
-        let oz = radial * sin(theta) * sz
-        let len = max(sqrt(ox * ox + oy * oy + oz * oz), 1e-6)
-        ox = ox / len * dist
-        oy = oy / len * dist
-        _ = oz
+        let ox = radial * cos(theta) * sx * dist
+        let oy = u * sy * dist
+        _ = sz // Z is not projected in the orthographic 2D renderer.
 
         let life = sample1D(
             min: model.lifetime.min,
@@ -607,13 +534,7 @@ final class SceneParticleRuntime {
             max: model.size.max,
             exponent: model.size.exponent
         ) * model.instanceSize
-        // Size is in orthographic scene units. Pure `size * sceneScale` on a
-        // 5120×2880 canvas turns 36–72 into a few points (pink flecks). WE
-        // particle sizes are typically authored around ~1080p preview weight;
-        // when the ortho canvas is taller than 1080, scale size up so visual
-        // weight stays consistent: sizeView = size × sceneScale × (canvasH/1080).
-        let canvasHeightFactor = max(canvasSize.height / 1080.0, 1.0)
-        let sizeView = CGFloat(sizeScene) * scale * CGFloat(canvasHeightFactor)
+        let sizeView = CGFloat(sizeScene) * scale
 
         let vx = CGFloat(sampleAxis(model.velocity, 0)) * scale
         let vy = CGFloat(sampleAxis(model.velocity, 1)) * scale
@@ -645,7 +566,7 @@ final class SceneParticleRuntime {
                 maxLife: max(CGFloat(life), 0.001),
                 roll: roll0,
                 rollSpeed: rollSpeed,
-                spriteIndex: spriteIndex
+                image: tintedSprite(at: spriteIndex)
             )
         )
     }
@@ -654,7 +575,9 @@ final class SceneParticleRuntime {
         guard let sizeChange = model.sizeChange, p.maxLife > 0 else {
             return p.baseSize
         }
-        let t = 1 - (p.life / p.maxLife)
+        let age = Double(1 - p.life / p.maxLife)
+        let t = min(max((age - sizeChange.startTime)
+            / max(sizeChange.endTime - sizeChange.startTime, 0.0001), 0), 1)
         let s = sizeChange.startScale
             + (sizeChange.endScale - sizeChange.startScale) * Double(t)
         return p.baseSize * CGFloat(s)
@@ -662,10 +585,45 @@ final class SceneParticleRuntime {
 
     private func alpha(for p: Particle) -> CGFloat {
         guard let fade = model.alphaFade else { return 1 }
-        let fadeIn = CGFloat(max(fade.fadeIn, 0.0001))
-        let fadeOut = CGFloat(max(fade.fadeOut, 0.0001))
-        let age = p.maxLife - p.life
-        return min(min(max(age / fadeIn, 0), 1), min(max(p.life / fadeOut, 0), 1))
+        return CGFloat(Self.fadeAlpha(
+            normalizedAge: Double(1 - p.life / p.maxLife), fade: fade
+        ))
+    }
+
+    static func fadeAlpha(normalizedAge age: Double, fade: SceneParticleSystem.AlphaFade) -> Double {
+        let fadeIn = fade.fadeIn > 0 ? age / fade.fadeIn : 1
+        let fadeOut = fade.fadeOut < 1 ? (1 - age) / (1 - fade.fadeOut) : 1
+        return max(0, min(1, fadeIn, fadeOut))
+    }
+
+    private func tintedSprite(at index: Int) -> CGImage {
+        let step = Int.random(in: 0..<32)
+        let key = index * 32 + step
+        if let cached = tintedSprites[key] { return cached }
+        let factors = (0..<3).map { axis -> Double in
+            let a = model.color.min[safe: axis] ?? 255
+            let b = model.color.max[safe: axis] ?? 255
+            return min(max((a + (b - a) * Double(step) / 31) / 255, 0), 1)
+        }
+        let source = sprites[index]
+        guard factors.contains(where: { $0 < 1 }),
+              let context = CGContext(
+                data: nil, width: source.width, height: source.height,
+                bitsPerComponent: 8, bytesPerRow: source.width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+              ), let bytes = context.data?.assumingMemoryBound(to: UInt8.self) else {
+            return source
+        }
+        context.draw(source, in: CGRect(x: 0, y: 0, width: source.width, height: source.height))
+        for pixel in 0..<(source.width * source.height) {
+            for channel in 0..<3 {
+                bytes[pixel * 4 + channel] = UInt8(Double(bytes[pixel * 4 + channel]) * factors[channel])
+            }
+        }
+        let image = context.makeImage() ?? source
+        tintedSprites[key] = image
+        return image
     }
 
     private func fixedOriginInView() -> CGPoint {
@@ -688,7 +646,7 @@ final class SceneParticleRuntime {
     }
 
     private func syncLayers() {
-        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        let scale = hostLayer.contentsScale
         let aspect = max(spritePixelSize.width, 1) / max(spritePixelSize.height, 1)
 
         while particleLayers.count < particles.count {
@@ -712,15 +670,13 @@ final class SceneParticleRuntime {
             hostLayer.addSublayer(layer)
             particleLayers.append(layer)
         }
-        if particleLayers.count > particles.count {
-            for layer in particleLayers.suffix(from: particles.count) {
-                layer.removeFromSuperlayer()
-            }
-            particleLayers.removeLast(particleLayers.count - particles.count)
-        }
-
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        // Reuse the high-water layer pool; emission and death do not churn layers.
+        for layer in particleLayers.dropFirst(particles.count) where !layer.isHidden {
+            layer.isHidden = true
+            layer.contents = nil
+        }
         for (index, p) in particles.enumerated() {
             let layer = particleLayers[index]
             let size = currentSize(for: p)
@@ -733,10 +689,8 @@ final class SceneParticleRuntime {
                 height = size
                 width = size * aspect
             }
-            let frame = sprites.isEmpty ? nil : sprites[p.spriteIndex % sprites.count]
-            layer.contents = frame
-            layer.backgroundColor = NSColor.clear.cgColor
-            layer.borderWidth = 0
+            layer.isHidden = false
+            if (layer.contents as AnyObject?) !== p.image { layer.contents = p.image }
             layer.bounds = CGRect(x: 0, y: 0, width: width, height: height)
             layer.position = CGPoint(x: p.x, y: p.y)
             layer.opacity = Float(alpha(for: p))
@@ -751,7 +705,7 @@ final class SceneParticleRuntime {
     private func sample1D(min: Double, max: Double, exponent: Double) -> Double {
         let lo = Swift.min(min, max)
         let hi = Swift.max(min, max)
-        let t = pow(Double.random(in: 0...1), Swift.max(exponent, 0.01))
+        let t = pow(Double.random(in: 0...1), Swift.max(exponent, 0))
         return lo + (hi - lo) * t
     }
 
@@ -911,8 +865,7 @@ final class SceneParticleRuntime {
                 image.height
             )
         }
-        let usable = cleaned.filter { hasCoverage($0) }
-        return usable.isEmpty ? cleaned : usable
+        return cleaned
     }
 
     private static func splitUsingTexJSON(atlas: CGImage, texURL: URL) -> [CGImage]? {
@@ -1014,31 +967,6 @@ final class SceneParticleRuntime {
             return image
         }
         return out
-    }
-
-    private static func hasCoverage(_ image: CGImage) -> Bool {
-        let w = min(image.width, 48)
-        let h = min(image.height, 48)
-        guard w > 0, h > 0,
-              let ctx = CGContext(
-                data: nil,
-                width: w,
-                height: h,
-                bitsPerComponent: 8,
-                bytesPerRow: w * 4,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-              ) else {
-            return true
-        }
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
-        guard let data = ctx.data else { return true }
-        let ptr = data.bindMemory(to: UInt8.self, capacity: w * h * 4)
-        var visible = 0
-        for i in 0..<(w * h) where ptr[i * 4 + 3] > 20 {
-            visible += 1
-        }
-        return Double(visible) / Double(w * h) > 0.02
     }
 
     private static func makePlaceholderFrames() -> [CGImage] {

@@ -24,8 +24,8 @@ Wallflow 是一个处于早期开发阶段的 macOS 原生交互式壁纸渲染�
 - Canvas-Metal 壁纸使用显示器完整原生像素分辨率
 - 使用双缓冲 Metal 交换链，减少默认三缓冲带来的内存占用
 - 可见应用窗口联合遮住某台显示器的桌面时暂停该显示器的渲染
-- 从 Dock 直接打开最大化或全屏窗口时立即冻结当前帧，与 Space 切换一致
-- 点击 Dock 即冻结该屏，覆盖缩放入场（含 Dock 自己的动画窗口）
+- 从 Dock 打开普通窗口或切换前台应用时继续播放，仅根据实际遮挡暂停
+- 遮挡检测排除 Dock 过渡动画和透明窗口，并合并多显示器的窗口查询
 - 锁屏、显示器/系统睡眠或登录会话非活动时自动暂停
 - 显示器变化时增量复用已有渲染器，不重启仍连接的屏幕
 - Space 切换按显示器独立处理：仅不可见的屏幕暂停并保留最后一帧，不影响其他屏幕
@@ -105,13 +105,16 @@ MP4 **不需要**转换成 HTML。Wallflow 通过 AVFoundation 直接打开 MP4�
 - 使用 AVFoundation 播放包内受支持格式的声音对象
 - 支持循环、随机和单次声音播放，以及暂停和全局静音
 - 场景图层无法渲染时回退显示项目预览图
+- 基础 2D 精灵粒子、鼠标发射器、随机帧、尺寸/颜色/数量覆盖与生命周期淡入淡出
+- 场景粒子使用单个 30 FPS 时钟和可复用图层；暂停保留状态并停止时钟与输入
+- 支持导入 `particle` 文件夹或 ZIP，作为场景共用的内置纹理素材
 
 尚未实现：
 
 - Wallpaper Engine 着色器转换和多通道特效
-- 粒子系统、SceneScript、骨骼网格和灯光
+- 完整粒子算子、多发射器、3D 粒子、SceneScript、骨骼网格和灯光
 - 视频纹理和由脚本触发的声音控制
-- 未包含在 `scene.pkg` 中的 Wallpaper Engine 内置资源包
+- 除手动导入的粒子纹理以外，未包含在 `scene.pkg` 中的其他内置资源
 
 ## 运行
 
@@ -121,7 +124,7 @@ cd wallflow
 swift run -c release
 ```
 
-使用菜单栏中的波形图标暂停或退出 Wallflow。
+使用菜单栏中的叠放图片图标暂停或退出 Wallflow。
 
 通过菜单栏的 **Open Wallpaper...** 选择 Wallpaper Engine 项目。仓库在 `Fixtures/web-wallpaper` 中提供了一个网页兼容性测试项目。
 
@@ -134,6 +137,7 @@ swift run -c release
 - 导入成功后会自动加入 **壁纸管理...**；移除本地壁纸时只删除 Wallflow 的安装副本，不会删除原始文件。URL 壁纸只会移除库记录。
 - 旧版本留下的失效路径会标记为 **文件不可用**；选中后点击 **重新定位壁纸...** 即可选择原项目并重新安装。
 - ZIP 在加载前会检查路径穿越、符号链接、文件数量和解压体积。
+- `particle.zip` 是共用纹理素材包，可通过同一个“打开壁纸...”入口安装到 `~/Library/Application Support/Wallflow/EngineAssets/materials/particle`，不作为独立壁纸加入壁纸库。安装成功后，当前壁纸会重新加载。复制失败会保留旧素材。
 
 包含本地资源的项目必须导入完整目录或完整 ZIP。单独提供远程 `project.json` 或 `scene.pkg` 无法包含同目录下的纹理、脚本、材质和媒体文件，因此会被明确拒绝。
 
@@ -175,6 +179,12 @@ swift run -c release
 open dist/Wallflow.app
 ```
 
+生成 Release 的 Apple Silicon DMG 和 SHA-256 校验文件：
+
+```sh
+./scripts/package-release.sh
+```
+
 生成的 app 使用临时签名，仅用于本机运行。Wallflow 是菜单栏应用，因此不会显示 Dock 图标。
 
 ## 性能设计
@@ -183,7 +193,11 @@ Wallflow 仅面向 Apple 芯片，并以 Metal 作为统一渲染主干。Canvas
 
 默认开启 **桌面不可见时暂停**：Wallflow 会计算所有可见应用窗口的联合覆盖区域，只有某块显示器已经没有桌面区域暴露时，才暂停对应的渲染、媒体、音频和壁纸输入。这也能识别由多个窗口共同组成全屏画面的浏览器。普通应用窗口不会导致暂停，只要仍有桌面区域暴露，动画就继续运行。鼠标输入采用全局旁路监听，不会拦截原应用；原应用收到点击的同时，交互壁纸也会收到同一次点击。
 
-在全屏或 Space 切换过程中，Wallflow 始终保留同一个桌面窗口、WebKit 表面和渲染器，并固定在系统壁纸之上、桌面图标之下。壁纸窗口会加入每个桌面 Space，可见性则按**每台显示器独立**计算：某块屏进入全屏 Space 时只暂停该屏，不会拖累其他屏幕。从 Dock 直接打开最大化或全屏窗口时也会立即冻结：缩放入场发生在当前 Space 上，此时窗口遮挡和 Space 切换通知都还没有到来。Space 切换发生时会立即在原窗口冻结当前帧：动画期间窗口覆盖检测仍会报告切换前的布局，因此依赖检测才暂停会让画面在无人观看时继续推进。冻结后，检测确认仍可见的屏幕从同一帧恢复，被遮挡的屏幕则不会私自前进。Space 动画期间不重写系统桌面；返回桌面时先显示冻结帧，视频等再从检查点 seek 就绪后揭开实时画面，避免跳帧或露出白色空表面。连接或断开其他显示器时，仍连接显示器上的渲染器会被复用，不再重新启动壁纸。鼠标仅桥接左键到壁纸；右键留给系统桌面菜单，不被壁纸层拦截。
+在全屏或 Space 切换过程中，Wallflow 保留同一个桌面窗口和渲染器。窗口加入每个桌面 Space，可见性按每台显示器独立计算：窗口不可见时立即暂停，可见应用窗口覆盖整个桌面时经过稳定采样再暂停，恢复也需确认可见。应用激活、点击 Dock 或收到 Space 切换通知本身不会暂停其他可见显示器。Dock 的动画表面不参与应用覆盖计算，仍有桌面露出的普通窗口不会触发暂停。
+
+暂停时保留当前粒子的年龄、位置和发射余量，与图片、视频和声音一起停止；恢复从原状态续播。静态/视差场景使用鼠标事件驱动，鼠标离开显示器且粒子消散后不再定时唤醒。多显示器覆盖查询在后台合并，手动暂停、锁屏和休眠时停止覆盖轮询。系统桌面兜底图采用延迟合并发布，避免每次应用激活都重新抓图或写入 PNG。
+
+粒子兼容仍是子集，尚不能保证与 Windows 的完整效果逐像素一致。发射率与淡入淡出的参数含义参照 [Wallpaper Engine 发射器文档](https://docs.wallpaperengine.io/en/scene/particles/component/emitter.html) 和 [粒子算子文档](https://docs.wallpaperengine.io/en/scene/particles/component/operator.html)。
 
 ## 架构方向
 
@@ -199,7 +213,11 @@ swift run Wallflow --canvas-metal-self-test /path/to/project.json
 swift run Wallflow --web-self-test
 swift run Wallflow --video-self-test /path/to/video.mp4
 swift run Wallflow --library-self-test
+swift run -c release Wallflow --self-test --verify-import /path/to/particle.zip
+swift run -c release Wallflow --scene-self-test /path/to/project.json
 ```
+
+`--verify-import` 会在隔离的临时目录中验证实际 ZIP，结束后清理，不修改壁纸库。`--scene-self-test` 使用真实运行循环检查播放、暂停、恢复的定时次数与进程 CPU 时间；它不测量整机瓦数。
 
 第一条命令验证项目加载、渲染器选择、壁纸库、桌面可见性、包、纹理和场景构建。第二条命令会通过 Metal 执行未修改的 Canvas 壁纸，并验证绘制、属性、输入、暂停和恢复。第三条命令启动真实 WKWebView。第四条验证原生视频播放与静态帧抓取。第五条会把中英文壁纸管理窗口渲染为 PNG 测试图。
 

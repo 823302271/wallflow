@@ -18,8 +18,7 @@ protocol WallpaperRenderer: AnyObject {
     func applyUserProperties(_ properties: JSONValue)
     func prepareForPresentation()
     func captureFrame(completion: @escaping (NSImage?) -> Void)
-    /// Particles (scene effects) are independent of video/scene freeze checkpoints.
-    /// Host pauses them only when the desktop is truly not visible (CPU).
+    /// Suspend particle work without discarding the frame or simulation state.
     func setParticlesActive(_ active: Bool)
 }
 

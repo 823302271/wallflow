@@ -277,10 +277,11 @@ final class WallflowWebSelfTest {
 
     private func verifyMouseBridge() {
         let script = """
+        const clicksBefore = window.__wallflowProbe.clicks;
         window.__wallflowDispatchMouse('mousemove', 41, 73, 0, 0);
         window.__wallflowDispatchMouse('mousedown', 41, 73, 0, 1);
         window.__wallflowDispatchMouse('mouseup', 41, 73, 0, 0);
-        JSON.stringify({ mouse: window.__wallflowProbe.mouse, clicks: window.__wallflowProbe.clicks, contextmenus: window.__wallflowProbe.contextmenus });
+        JSON.stringify({ mouse: window.__wallflowProbe.mouse, clicks: window.__wallflowProbe.clicks - clicksBefore, contextmenus: window.__wallflowProbe.contextmenus });
         """
         wallpaperView?.evaluateJavaScriptForTesting(script) { [weak self] value, error in
             guard let self else { return }

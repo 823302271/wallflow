@@ -14,6 +14,23 @@ if CommandLine.arguments.contains("--self-test") {
         fputs("Wallflow self-test failed: \(error)\n", stderr)
         exit(EXIT_FAILURE)
     }
+} else if let testIndex = CommandLine.arguments.firstIndex(of: "--scene-self-test"),
+          CommandLine.arguments.indices.contains(testIndex + 1) {
+    let application = NSApplication.shared
+    application.setActivationPolicy(.prohibited)
+    let runner = WallflowSceneSelfTest()
+    runner.run(projectURL: URL(fileURLWithPath: CommandLine.arguments[testIndex + 1])) { result in
+        switch result {
+        case .success:
+            print("Wallflow scene self-test passed")
+            exit(EXIT_SUCCESS)
+        case .failure(let error):
+            fputs("Wallflow scene self-test failed: \(error)\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+    }
+    application.run()
+    withExtendedLifetime(runner) {}
 } else if let dumpIndex = CommandLine.arguments.firstIndex(of: "--particle-dump"),
           CommandLine.arguments.indices.contains(dumpIndex + 1) {
     let projectPath = CommandLine.arguments[dumpIndex + 1]

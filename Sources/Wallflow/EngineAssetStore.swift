@@ -65,7 +65,8 @@ final class EngineAssetStore {
         let cleaned = hint
             .replacingOccurrences(of: "\\", with: "/")
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard !cleaned.isEmpty else { return nil }
+        guard !cleaned.isEmpty,
+              !cleaned.split(separator: "/").contains("..") else { return nil }
 
         var candidates: [URL] = []
         // materials/particle/... (WE material path convention)
@@ -109,55 +110,54 @@ final class EngineAssetStore {
         return nil
     }
 
-    /// Install a particle pack folder (contents of WE `assets/materials/particle`).
-    /// Accepts either the `particle` directory itself or a parent that contains it.
-    @discardableResult
-    func installParticlePack(from sourceURL: URL) throws -> URL {
-        let source = sourceURL.standardizedFileURL
-        var isDir: ObjCBool = false
-        guard fileManager.fileExists(atPath: source.path, isDirectory: &isDir),
-              isDir.boolValue else {
-            throw EngineAssetError.notADirectory(source.path)
-        }
-
-        let particleSource: URL
-        if source.lastPathComponent.lowercased() == "particle" {
-            particleSource = source
-        } else {
-            let nested = source.appendingPathComponent("particle", isDirectory: true)
-            let materialsNested = source
-                .appendingPathComponent("materials", isDirectory: true)
-                .appendingPathComponent("particle", isDirectory: true)
-            if fileManager.fileExists(atPath: nested.path) {
-                particleSource = nested
-            } else if fileManager.fileExists(atPath: materialsNested.path) {
-                particleSource = materialsNested
-            } else {
-                // Assume the selected folder *is* the particle pack root.
-                particleSource = source
+    /// Recognize resource-only packs, including ZIP wrapper directories. A project
+    /// manifest always takes precedence over a nested materials/particle folder.
+    static func locateParticlePack(in root: URL, depth: Int = 0) -> URL? {
+        guard depth <= 4 else { return nil }
+        let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: root.path, isDirectory: &isDirectory), isDirectory.boolValue else { return nil }
+        let entries = (try? fm.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
+        ))?.filter { $0.lastPathComponent != "__MACOSX" } ?? []
+        guard !entries.contains(where: {
+            ["project.json", "scene.pkg", "index.html"].contains($0.lastPathComponent.lowercased())
+        }) else { return nil }
+        if root.lastPathComponent.lowercased() == "particle" || entries.contains(where: { $0.pathExtension.lowercased() == "tex" }) {
+            let files = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
+            while let file = files?.nextObject() as? URL {
+                if file.pathExtension.lowercased() == "tex",
+                   (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true { return root }
             }
         }
+        let directories = entries.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+        guard directories.count == 1, let child = directories.first else { return nil }
+        return locateParticlePack(in: child, depth: depth + 1)
+    }
 
+    /// Stage a complete copy before swapping. A failed copy preserves the installed pack.
+    @discardableResult
+    func installParticlePack(from sourceURL: URL) throws -> URL {
+        guard let source = Self.locateParticlePack(in: sourceURL.standardizedFileURL) else {
+            throw EngineAssetError.notADirectory(sourceURL.path)
+        }
         let destination = particleRootURL
-        if fileManager.fileExists(atPath: destination.path) {
-            try fileManager.removeItem(at: destination)
+        if source.resolvingSymlinksInPath() == destination.resolvingSymlinksInPath() { return destination }
+        let parent = destination.deletingLastPathComponent()
+        try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+        let staging = parent.appendingPathComponent(".particle-\(UUID().uuidString)")
+        let backup = parent.appendingPathComponent(".particle-backup-\(UUID().uuidString)")
+        defer { try? fileManager.removeItem(at: staging) }
+        try fileManager.copyItem(at: source, to: staging)
+        let hadPrevious = fileManager.fileExists(atPath: destination.path)
+        if hadPrevious { try fileManager.moveItem(at: destination, to: backup) }
+        do {
+            try fileManager.moveItem(at: staging, to: destination)
+        } catch {
+            if hadPrevious { try? fileManager.moveItem(at: backup, to: destination) }
+            throw error
         }
-        try fileManager.createDirectory(
-            at: destination.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try fileManager.copyItem(at: particleSource, to: destination)
-
-        // Quick sanity: rosepetals is the most common missing built-in.
-        let rose = destination
-            .appendingPathComponent("nature", isDirectory: true)
-            .appendingPathComponent("rosepetals.tex")
-        if !fileManager.fileExists(atPath: rose.path) {
-            NSLog(
-                "Wallflow engine pack installed but rosepetals.tex was not found at %@",
-                rose.path
-            )
-        }
+        if hadPrevious { try? fileManager.removeItem(at: backup) }
         return destination
     }
 

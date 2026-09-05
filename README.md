@@ -28,8 +28,8 @@ Wallpaper Engine web and scene compatibility.
 - Full native backing resolution for Canvas-Metal wallpapers
 - Two-buffer Metal swap chain instead of the default three-buffer allocation
 - Rendering suspension when visible app windows collectively hide a display's desktop
-- Immediate freeze when a maximized or full-screen window is opened from the Dock, matching Space transitions
-- Dock clicks freeze that display through the restore zoom, including Dock-owned animation windows
+- Ordinary windows opened from the Dock keep the wallpaper playing; actual coverage determines auto-pause
+- Dock transition surfaces and transparent windows are excluded from coverage, with batched display queries
 - Automatic suspension during screen lock, display/system sleep, and inactive login sessions
 - Incremental display reconciliation without restarting retained-screen renderers
 - Per-display Space handling: only the hidden display pauses and keeps its last frame; other displays keep playing
@@ -114,13 +114,16 @@ Implemented:
 - Packaged sound objects using AVFoundation-supported audio formats
 - Loop, random, and single sound playback with pause and global mute
 - Project preview fallback when a scene layer cannot be rendered
+- Basic 2D sprite particles, pointer emitters, random frames, size/color/count overrides and lifetime fades
+- One 30 FPS scene clock with pooled particle layers; pause preserves state and stops timers/input
+- Import `particle` folders or ZIPs as shared built-in texture assets
 
 Not implemented yet:
 
 - Wallpaper Engine shader translation and multi-pass effects
-- Particle systems, SceneScript, puppet meshes, and lights
+- Complete particle operators, multiple emitters, 3D particles, SceneScript, puppet meshes, and lights
 - Video textures and script-triggered sound controls
-- Wallpaper Engine built-in asset packs that are not present in `scene.pkg`
+- Built-in assets outside `scene.pkg`, apart from manually imported particle textures
 
 ## Run
 
@@ -130,7 +133,7 @@ cd wallflow
 swift run -c release
 ```
 
-Use the waveform icon in the menu bar to pause or quit Wallflow.
+Use the stacked-picture icon in the menu bar to pause or quit Wallflow.
 
 Use **Open Wallpaper...** from the menu bar to choose a Wallpaper Engine
 project. A web compatibility fixture is included at `Fixtures/web-wallpaper`.
@@ -208,6 +211,12 @@ To create a double-clickable app bundle:
 open dist/Wallflow.app
 ```
 
+Build the Apple Silicon release DMG and its SHA-256 checksum:
+
+```sh
+./scripts/package-release.sh
+```
+
 The generated app is ad-hoc signed for local use. Wallflow is a menu bar app,
 so it does not display a Dock icon.
 
@@ -230,23 +239,26 @@ while any desktop area remains exposed. Mouse input is observed globally without
 intercepting it, so the original application receives the click and an interactive
 wallpaper can react to the same click.
 
-During a full-screen or Space transition, Wallflow keeps the same desktop window,
-WebKit surface, and renderer alive above the system wallpaper and below desktop
-icons. The window joins every desktop Space, while visibility is evaluated **per
-display**: a full-screen Space on one monitor pauses only that monitor. Opening a
-maximized or full-screen window from the Dock freezes that display immediately,
-because the zoom plays on the current Space before occlusion or a Space change
-is reported. A Space change freezes every display on the frame that was on
-screen at that instant,
-because coverage still reports the outgoing layout while the animation runs: a
-display that is still visible resumes from that exact frame as soon as coverage
-confirms it, and a covered one never advances while nobody can see it. Wallflow
-does not rewrite the system desktop during the Space animation. When
-the desktop returns, the frozen frame is shown first; video then seeks from its
-checkpoint and the live surface is revealed without a jump. Incremental display
-reconciliation reuses retained-screen renderers when another display is connected
-or disconnected. Only left-clicks are bridged into wallpapers; right-clicks stay
-with the system desktop menu.
+During a full-screen or Space transition, Wallflow retains its desktop windows and
+renderers. Each display pauses when its window is invisible or stable coverage
+samples confirm that application windows cover the desktop. Resume also requires
+stable visibility. App activation, Dock clicks and Space-change notifications do
+not by themselves freeze visible displays. Dock animation surfaces are excluded.
+
+Scene pause preserves particle ages, positions and emission phase alongside image,
+video and audio state. Static/parallax scenes use pointer events. Pointer particle
+scenes stop their clock once the pointer leaves the display and all particles die.
+Coverage reads are batched off the main thread; manual pause, lock and sleep stop
+the watchdog. Desktop fallback publication is delayed and coalesced.
+
+Particle support remains a subset and does not guarantee pixel parity with Windows.
+Emission and fade semantics follow the [emitter documentation](https://docs.wallpaperengine.io/en/scene/particles/component/emitter.html)
+and [operator documentation](https://docs.wallpaperengine.io/en/scene/particles/component/operator.html).
+
+Use **Open Wallpaper...** to install a shared `particle.zip` or particle folder.
+Textures go to `~/Library/Application Support/Wallflow/EngineAssets/materials/particle`;
+the pack is not added as a wallpaper library item. Current wallpapers reload after
+installation, and a failed copy preserves the previous assets.
 
 ## Architecture direction
 
@@ -269,6 +281,8 @@ swift run Wallflow --canvas-metal-self-test /path/to/project.json
 swift run Wallflow --web-self-test
 swift run Wallflow --video-self-test /path/to/video.mp4
 swift run Wallflow --library-self-test
+swift run -c release Wallflow --self-test --verify-import /path/to/particle.zip
+swift run -c release Wallflow --scene-self-test /path/to/project.json
 ```
 
 The first command validates project loading, renderer selection, the wallpaper

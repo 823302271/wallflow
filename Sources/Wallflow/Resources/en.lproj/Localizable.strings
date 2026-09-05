@@ -39,7 +39,7 @@
 "library.engine_pack_installed" = "Engine particle pack: installed";
 "library.engine_pack_missing" = "Engine particle pack: missing (some effects use placeholders)";
 "library.engine_pack_title" = "Import Wallpaper Engine Particle Assets";
-"library.engine_pack_message" = "Choose the particle folder copied from Windows WE (with nature/rosepetals.tex, etc.). It will be installed into Wallflow's Application Support folder for all scene wallpapers.";
+"library.engine_pack_message" = "Choose the particle folder or ZIP copied from Windows WE (with nature/rosepetals.tex, etc.). It will be installed into Wallflow's Application Support folder for all scene wallpapers.";
 "library.current" = "Current wallpaper";
 "library.unavailable" = "Unavailable";
 "library.built_in_source" = "Included with Wallflow";
@@ -80,3 +80,6 @@
 "error.extracted_project_too_large" = "The extracted project is too large (%@). The limit is 1 GB.";
 "error.no_project_in_archive" = "The ZIP does not contain MP4/M4V/MOV, project.json, index.html, or scene.pkg.";
 "error.multiple_projects_in_archive" = "The ZIP contains multiple wallpaper projects at the same level.";
+
+"import.particle_assets_installed" = "Particle assets installed";
+"import.particle_assets_installed_message" = "This archive contains shared particle textures. Your current wallpapers have been reloaded to use them.";

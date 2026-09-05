@@ -52,7 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Same-Space covering has no occlusion signal; confirm before pausing.
     private static let sameSpacePauseProbeDelay: TimeInterval = 1.2
     private static let sameSpacePauseProbeSamples = 3
-    private var globalMouseMonitor: Any?
+    private var layoutEvaluationGeneration = 0
     /// Settle time before a paused still is pushed to the system desktop picture.
     /// Must stay far below how quickly a user can hop back: the picture is what the
     /// Space animation shows, so anything slower than the round trip means they see
@@ -98,10 +98,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         coverageWatchdog?.invalidate()
         coverageWatchdog = nil
-        if let globalMouseMonitor {
-            NSEvent.removeMonitor(globalMouseMonitor)
-            self.globalMouseMonitor = nil
-        }
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         DistributedNotificationCenter.default().removeObserver(self)
         NotificationCenter.default.removeObserver(self)
@@ -124,6 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             forKey: Self.pauseWhenDesktopHiddenKey
         )
         desktopHiddenPauseMenuItem?.state = pauseWhenDesktopHidden ? .on : .off
+        retuneCoverageWatchdog()
         evaluateForegroundCoverage()
         NSLog(
             "Wallflow pause-when-hidden %@",
@@ -262,36 +259,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func foregroundLayoutChanged(_ notification: Notification) {
-        // Dock restore and app activation leave the desktop the same way a Space
-        // hop does; occlusion just fires later. Use the same pause + settle path.
-        if shouldTreatActivationAsLeavingDesktop(notification) {
-            pauseDesktopUnderPointer()
-        }
+        // Activation says nothing about window size or the display it occupies.
         scheduleSpaceSettledCoverageEvaluations()
     }
 
     @objc private func foregroundApplicationHidden(_ notification: Notification) {
         scheduleSpaceSettledCoverageEvaluations()
-    }
-
-    private func handlePossibleDockClick() {
-        let quartzPoint = DesktopVisibility.quartzPoint(fromAppKit: NSEvent.mouseLocation)
-        guard DesktopVisibility.isDockClick(at: quartzPoint) else { return }
-        pauseDesktopUnderPointer()
-        scheduleSpaceSettledCoverageEvaluations()
-    }
-
-    private func shouldTreatActivationAsLeavingDesktop(
-        _ notification: Notification
-    ) -> Bool {
-        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
-            as? NSRunningApplication,
-              app.activationPolicy == .regular,
-              app.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
-            return false
-        }
-        let bundleID = app.bundleIdentifier ?? ""
-        return bundleID != "com.apple.finder" && bundleID != "com.apple.dock"
     }
 
     /// Same pause used when the wallpaper window is occluded.
@@ -300,20 +273,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pauseProbeState.cancel(for: controller.displayID)
         resumeProbeState.cancel(for: controller.displayID)
         applyDesktopHidden(true, to: controller)
-    }
-
-    private func pauseDesktopUnderPointer() {
-        let point = DesktopVisibility.quartzPoint(fromAppKit: NSEvent.mouseLocation)
-        guard let controller = wallpaperControllers.first(where: {
-            $0.displayBounds.contains(point)
-        }) else {
-            return
-        }
-        NSLog(
-            "Wallflow display %u leaving desktop — pausing immediately",
-            controller.displayID
-        )
-        pauseDesktopHidden(controller)
     }
 
     @objc private func activeSpaceChanged(_ notification: Notification) {
@@ -330,9 +289,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// still see either layout, so take a few instead of trusting the first one;
     /// whichever confirms first starts the matching probe.
     private func scheduleSpaceSettledCoverageEvaluations() {
+        layoutEvaluationGeneration += 1
+        let generation = layoutEvaluationGeneration
         for delay in Self.spaceSettleSampleDelays {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                self?.evaluateForegroundCoverage()
+                guard let self, generation == self.layoutEvaluationGeneration else { return }
+                self.evaluateForegroundCoverage()
             }
         }
     }
@@ -360,11 +322,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Visible again. Occlusion cannot tell whether app windows still cover the
         // desktop on this Space, so the coverage probe owns the resume decision.
-        evaluateForegroundCoverage(for: controller)
+        evaluateForegroundCoverage()
     }
 
     private func startCoverageWatchdog() {
-        guard coverageWatchdog == nil else { return }
+        guard coverageWatchdog == nil,
+              isCoverageAutoPauseEnabled,
+              !isManuallyPaused, !systemSuspensionState.isSuspended else { return }
         // Adaptive interval: when every display is already frozen, poll less often
         // so background CPU stays below live-desktop rendering.
         let timer = Timer(timeInterval: 1.5, repeats: true) { [weak self] _ in
@@ -377,7 +341,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func retuneCoverageWatchdog() {
-        guard let coverageWatchdog else { return }
+        guard isCoverageAutoPauseEnabled,
+              !isManuallyPaused, !systemSuspensionState.isSuspended else {
+            coverageWatchdog?.invalidate()
+            coverageWatchdog = nil
+            return
+        }
+        guard let coverageWatchdog else {
+            startCoverageWatchdog()
+            return
+        }
         let allHidden = !wallpaperControllers.isEmpty
             && wallpaperControllers.allSatisfy(\.isDesktopHidden)
         let desired: TimeInterval = allHidden ? 3.0 : 1.0
@@ -449,7 +422,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func configureStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = NSImage(
-            systemSymbolName: "waveform.path",
+            systemSymbolName: "photo.on.rectangle.angled",
             accessibilityDescription: "Wallflow"
         )
         statusItem = item
@@ -664,13 +637,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSWorkspace.didHideApplicationNotification,
             object: nil
         )
-        if globalMouseMonitor == nil {
-            globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(
-                matching: .leftMouseDown
-            ) { [weak self] _ in
-                self?.handlePossibleDockClick()
-            }
-        }
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(foregroundLayoutChanged(_:)),
+            name: NSWorkspace.didTerminateApplicationNotification,
+            object: nil
+        )
         let distributedCenter = DistributedNotificationCenter.default()
         distributedCenter.addObserver(
             self,
@@ -856,6 +828,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func applyRenderingState() {
         let shouldRender = !isManuallyPaused && !systemSuspensionState.isSuspended
+        retuneCoverageWatchdog()
+        if !shouldRender {
+            coverageEvaluationGeneration += 1
+            pauseProbeState.clear()
+            resumeProbeState.clear()
+        }
         wallpaperControllers.forEach { $0.setRenderingEnabled(shouldRender) }
         pauseMenuItem?.title = isManuallyPaused
             ? L10n.text(.resumeAnimation)
@@ -873,11 +851,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         automaticallyPauseCoveredDisplays && pauseWhenDesktopHidden
     }
 
-    /// Recompute desktop visibility. When `target` is set, only that display is updated.
-    private func evaluateForegroundCoverage(
-        for target: DesktopWindowController? = nil
-    ) {
-        let controllers = target.map { [$0] } ?? wallpaperControllers
+    /// Recompute all attached displays in one coverage pass.
+    private func evaluateForegroundCoverage() {
+        // Always sample the attached displays together: a one-display notification
+        // must not invalidate another display's pending result.
+        let controllers = wallpaperControllers
         guard isCoverageAutoPauseEnabled else {
             // Preference off: cancel probes and keep every display live.
             for controller in controllers {
@@ -885,6 +863,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
+        guard !isManuallyPaused, !systemSuspensionState.isSuspended else { return }
         coverageEvaluationGeneration += 1
         let generation = coverageEvaluationGeneration
         let boundsByDisplay = Dictionary(
@@ -938,6 +917,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let displayID = controller.displayID
+        if !controller.isWindowVisible {
+            pauseDesktopHidden(controller)
+            return
+        }
         if hidden {
             resumeProbeState.cancel(for: displayID)
             guard !controller.isDesktopHidden else { return }
@@ -1255,13 +1238,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         importService.prepare(sourceURL: sourceURL) { [weak self] result in
             guard let self else { return }
             switch result {
-            case .success(let preparedURL):
+            case .success(.wallpaper(let preparedURL)):
                 do {
                     try self.selectProject(at: preparedURL, persist: persist, target: target)
                 } catch {
                     self.updateProjectTitle()
                     self.showError(error)
                 }
+            case .success(.particleAssets):
+                self.didInstallParticleAssets()
             case .failure(let error):
                 self.updateProjectTitle()
                 self.showError(error)
@@ -1303,7 +1288,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             var changedActiveAssignment = didChangeActiveAssignment
             switch result {
-            case .success(let managedURL):
+            case .success(.wallpaper(let managedURL)):
                 do {
                     let project = try WallpaperProjectLoader.load(managedURL)
                     let managedSourceURL = project.manifestURL
@@ -1348,6 +1333,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         error.localizedDescription
                     )
                 }
+            case .success(.particleAssets):
+                changedActiveAssignment = true
             case .failure(let error):
                 NSLog(
                     "Wallflow could not migrate wallpaper %@: %@",
@@ -1557,42 +1544,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func importEngineParticlePack() {
         NSApplication.shared.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = L10n.text(.libraryEnginePackTitle)
-        alert.informativeText = L10n.text(.libraryEnginePackMessage)
-        alert.addButton(withTitle: L10n.text(.choose))
-        alert.addButton(withTitle: L10n.text(.cancel))
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
         let panel = NSOpenPanel()
-        panel.canChooseFiles = false
+        panel.canChooseFiles = true
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = L10n.text(.importAction)
         panel.message = L10n.text(.libraryEnginePackMessage)
-        // Prefer the user's Downloads/particle if present.
-        let downloadsParticle = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Downloads/particle", isDirectory: true)
-        if FileManager.default.fileExists(atPath: downloadsParticle.path) {
-            panel.directoryURL = downloadsParticle.deletingLastPathComponent()
-        }
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            let installed = try EngineAssetStore.shared.installParticlePack(from: url)
-            // Rebuild scene controllers so particles pick up the new textures.
-            rebuildWallpaperWindows()
-            refreshLibraryWindow()
-            let done = NSAlert()
-            done.alertStyle = .informational
-            done.messageText = L10n.text(.libraryEnginePackInstalled)
-            done.informativeText = installed.path
-            done.addButton(withTitle: "OK")
-            done.runModal()
-            NSLog("Wallflow installed engine particle pack at %@", installed.path)
-        } catch {
-            showError(error)
+        importWallpaper(from: url, persist: true, target: .all)
+    }
+
+    private func didInstallParticleAssets() {
+        // Only scenes consume these textures. Keep videos and web surfaces alive.
+        for controller in wallpaperControllers where project(for: controller.displayID).kind == .scene {
+            controller.projectIdentity = ""
         }
+        reconcileWallpaperWindows()
+        let alert = NSAlert()
+        alert.messageText = L10n.text(.particleAssetsInstalled)
+        alert.informativeText = L10n.text(.particleAssetsInstalledMessage)
+        alert.runModal()
     }
 
     private func activateLibraryEntry(
@@ -1640,7 +1611,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         importService.prepare(sourceURL: sourceURL) { [weak self] result in
             guard let self else { return }
             switch result {
-            case .success(let preparedURL):
+            case .success(.wallpaper(let preparedURL)):
                 do {
                     try self.selectProject(
                         at: preparedURL,
@@ -1653,6 +1624,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.updateProjectTitle()
                     self.showError(error)
                 }
+            case .success(.particleAssets):
+                self.didInstallParticleAssets()
             case .failure(let error):
                 self.updateProjectTitle()
                 self.showError(error)

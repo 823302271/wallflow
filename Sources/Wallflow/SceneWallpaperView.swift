@@ -15,8 +15,13 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
     private let previewLayer = CALayer()
     private var renderedLayers: [RenderedLayer] = []
     private var particleRuntimes: [SceneParticleRuntime] = []
-    private var mouseTimer: Timer?
-    private var particleTimer: Timer?
+    private var effectsTimer: Timer?
+    private var areParticlesActive = true
+    private var globalPointerMonitor: Any?
+    private var localPointerMonitor: Any?
+    private var pointerUpdatePending = false
+    private var pointerGeneration = 0
+    private(set) var debugEffectsTickCount = 0
     private var lastMouseLocation = CGPoint(x: -.greatestFiniteMagnitude, y: 0)
     private var lastParticleTick = CACurrentMediaTime()
     private var sceneDocument: SceneDocument?
@@ -54,8 +59,8 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
         layer?.addSublayer(previewLayer)
 
         loadScene()
-        startMouseTracking()
-        startParticleSimulation()
+        startPointerTracking()
+        startEffectsTimer()
     }
 
     @available(*, unavailable)
@@ -64,8 +69,9 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
     }
 
     deinit {
-        mouseTimer?.invalidate()
-        particleTimer?.invalidate()
+        effectsTimer?.invalidate()
+        if let globalPointerMonitor { NSEvent.removeMonitor(globalPointerMonitor) }
+        if let localPointerMonitor { NSEvent.removeMonitor(localPointerMonitor) }
     }
 
     override func layout() {
@@ -90,14 +96,13 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
         }
         isRenderingEnabled = enabled
         if enabled {
-            // Freeze-frame path only freezes scene layers / audio — particles keep
-            // their own active flag (setParticlesActive).
             completion?()
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.isRenderingEnabled else { return }
                 self.resumeLayerAnimations()
-                self.startMouseTracking()
-                self.startParticleSimulation()
+                self.particleRuntimes.forEach { $0.setEnabled(self.areParticlesActive) }
+                self.startPointerTracking()
+                self.startEffectsTimer()
                 self.audioController?.setRenderingEnabled(true)
             }
         } else {
@@ -106,9 +111,11 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
     }
 
     func pinToPauseSession(completion: (() -> Void)?) {
-        // Scene freeze for video-like checkpoint: pause image layers + audio only.
-        // Particles are independent and keep simulating unless setParticlesActive(false).
         isRenderingEnabled = false
+        stopPointerTracking()
+        effectsTimer?.invalidate()
+        effectsTimer = nil
+        particleRuntimes.forEach { $0.setEnabled(false) }
         pauseLayerAnimations()
         audioController?.setRenderingEnabled(false)
         completion?()
@@ -120,25 +127,12 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
     }
 
     func setParticlesActive(_ active: Bool) {
-        if active {
-            particleRuntimes.forEach { $0.setEnabled(true) }
-            startMouseTracking()
-            startParticleSimulation()
-        } else {
-            // Desktop not visible: stop particle CPU work, clear particles so
-            // resume starts clean (not a frozen mid-air trail under freeze still).
-            particleTimer?.invalidate()
-            particleTimer = nil
-            // Keep mouse timer if parallax needs it; stop only when no particles need it.
-            if sceneDocument?.general.cameraParallax != true {
-                mouseTimer?.invalidate()
-                mouseTimer = nil
-            }
-            particleRuntimes.forEach {
-                $0.setEnabled(false)
-                $0.clearParticles()
-            }
-        }
+        areParticlesActive = active
+        particleRuntimes.forEach { $0.setEnabled(active && isRenderingEnabled) }
+        // Pausing preserves the particle positions, ages and emission phase.
+        effectsTimer?.invalidate()
+        effectsTimer = nil
+        startEffectsTimer()
     }
 
     func setAudioMuted(_ muted: Bool) {
@@ -178,6 +172,9 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
         }
         userProperties = .object(all)
         applyParticleVisibilityFromUserProperties()
+        effectsTimer?.invalidate()
+        effectsTimer = nil
+        startEffectsTimer()
     }
 
     func updateDesktopFrame(_ frame: CGRect) {
@@ -348,41 +345,74 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
         ).cgColor
     }
 
-    private func startMouseTracking() {
-        guard mouseTimer == nil else { return }
-        let needsMouse = sceneDocument?.general.cameraParallax == true
-            || !(sceneDocument?.particleSystems.isEmpty ?? true)
-        guard needsMouse else { return }
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            self?.updateMouseDrivenEffects()
+    private func startPointerTracking() {
+        guard isRenderingEnabled,
+              sceneDocument?.general.cameraParallax == true
+                || sceneDocument?.particleSystems.contains(where: { $0.followMouse }) == true else { return }
+        guard globalPointerMonitor == nil, localPointerMonitor == nil else { return }
+        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        globalPointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] _ in
+            self?.pointerDidMove()
         }
-        timer.tolerance = 1.0 / 240.0
-        RunLoop.main.add(timer, forMode: .common)
-        mouseTimer = timer
+        localPointerMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            self?.pointerDidMove()
+            return event
+        }
+        updateMouseDrivenEffects()
     }
 
-    private func startParticleSimulation() {
-        guard particleTimer == nil, !particleRuntimes.isEmpty else { return }
+    private func stopPointerTracking() {
+        if let globalPointerMonitor { NSEvent.removeMonitor(globalPointerMonitor) }
+        if let localPointerMonitor { NSEvent.removeMonitor(localPointerMonitor) }
+        globalPointerMonitor = nil
+        localPointerMonitor = nil
+        pointerGeneration += 1
+        pointerUpdatePending = false
+    }
+
+    private func pointerDidMove() {
+        guard isRenderingEnabled, effectsTimer == nil, !pointerUpdatePending else { return }
+        // Static/parallax-only scenes have no repeating clock. Coalesce hardware
+        // pointer events and wake simulation only when a cursor emitter needs it.
+        pointerUpdatePending = true
+        let generation = pointerGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 30.0) { [weak self] in
+            guard let self, self.isRenderingEnabled, generation == self.pointerGeneration else { return }
+            self.pointerUpdatePending = false
+            self.updateMouseDrivenEffects()
+            self.startEffectsTimer()
+        }
+    }
+
+    private func startEffectsTimer() {
+        guard effectsTimer == nil, isRenderingEnabled else { return }
+        let needsParticles = areParticlesActive && particleRuntimes.contains { $0.needsSimulation }
+        guard needsParticles else { return }
         lastParticleTick = CACurrentMediaTime()
-        // 12 FPS is enough for soft petals; lower than scene freeze path.
-        let timer = Timer(timeInterval: 1.0 / 12.0, repeats: true) { [weak self] _ in
-            self?.tickParticles()
+        // One clock samples the pointer and advances all effects; no independent
+        // 60 Hz pointer polling or 12 Hz particle timer waking the main thread.
+        let interval: TimeInterval = 1.0 / 30.0
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            guard let self, self.isRenderingEnabled else { return }
+            self.debugEffectsTickCount += 1
+            self.updateMouseDrivenEffects()
+            let now = CACurrentMediaTime()
+            let delta = min(max(now - self.lastParticleTick, 0), 0.1)
+            self.lastParticleTick = now
+            if self.areParticlesActive {
+                self.particleRuntimes.forEach { $0.tick(delta: delta) }
+            }
+            if !self.particleRuntimes.contains(where: { $0.needsSimulation }) {
+                self.effectsTimer?.invalidate()
+                self.effectsTimer = nil
+            }
         }
-        timer.tolerance = 1.0 / 24.0
+        timer.tolerance = interval * 0.1
         RunLoop.main.add(timer, forMode: .common)
-        particleTimer = timer
+        effectsTimer = timer
     }
 
-    private func tickParticles() {
-        // Independent of scene freeze (isRenderingEnabled): only runtimes that
-        // are enabled tick. Desktop-hidden path calls setParticlesActive(false).
-        let now = CACurrentMediaTime()
-        let delta = min(max(now - lastParticleTick, 1.0 / 30.0), 0.15)
-        lastParticleTick = now
-        for runtime in particleRuntimes {
-            runtime.tick(delta: delta)
-        }
-    }
+    var debugEffectsTimerIsRunning: Bool { effectsTimer != nil }
 
     /// Test/debug: drive particle systems with a synthetic cursor sample.
     func debugDriveParticles(point: CGPoint, inDesktop: Bool, delta: TimeInterval) {
@@ -394,6 +424,7 @@ final class SceneWallpaperView: NSView, WallpaperRenderer {
             runtime.updateMouse(desktopPoint: point, inDesktop: inDesktop)
             runtime.tick(delta: delta)
         }
+        startEffectsTimer()
     }
 
     func debugParticleCount() -> Int {

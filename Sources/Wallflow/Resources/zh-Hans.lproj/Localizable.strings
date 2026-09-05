@@ -39,7 +39,7 @@
 "library.engine_pack_installed" = "引擎粒子资源：已安装";
 "library.engine_pack_missing" = "引擎粒子资源：未安装（部分花瓣/特效会用占位图）";
 "library.engine_pack_title" = "导入 Wallpaper Engine 粒子资源";
-"library.engine_pack_message" = "请选择从 Windows WE 拷贝的 particle 文件夹（含 nature/rosepetals.tex 等）。资源会安装到 Wallflow 应用支持目录，供所有场景壁纸共用。";
+"library.engine_pack_message" = "请选择从 Windows WE 拷贝的 particle 文件夹或 ZIP 压缩包（含 nature/rosepetals.tex 等）。资源会安装到 Wallflow 应用支持目录，供所有场景壁纸共用。";
 "library.current" = "当前壁纸";
 "library.unavailable" = "文件不可用";
 "library.built_in_source" = "Wallflow 内置";
@@ -80,3 +80,6 @@
 "error.extracted_project_too_large" = "解压后的项目过大（%@），上限为 1 GB。";
 "error.no_project_in_archive" = "ZIP 中没有找到 MP4/M4V/MOV、project.json、index.html 或 scene.pkg。";
 "error.multiple_projects_in_archive" = "ZIP 中包含多个同级壁纸项目，无法确定要导入哪一个。";
+
+"import.particle_assets_installed" = "粒子素材已安装";
+"import.particle_assets_installed_message" = "此压缩包包含共用的粒子纹理。当前壁纸已重新加载，将自动使用这些素材。";

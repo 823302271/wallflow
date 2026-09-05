@@ -8,18 +8,42 @@ final class DesktopCoverageSampler {
         qos: .utility
     )
 
+    private struct Request {
+        let bounds: [CGDirectDisplayID: CGRect]
+        let completion: (Set<CGDirectDisplayID>) -> Void
+    }
+    private var pending: [Request] = []
+    private var isSampling = false
+
     func sample(
         screenBoundsByDisplay: [CGDirectDisplayID: CGRect],
         completion: @escaping (Set<CGDirectDisplayID>) -> Void
     ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        pending.append(Request(bounds: screenBoundsByDisplay, completion: completion))
+        guard !isSampling else { return }
+        isSampling = true
+        // Collect same-turn probes across all displays into one WindowServer read.
+        DispatchQueue.main.async { [weak self] in self?.drain() }
+    }
+
+    private func drain() {
+        let requests = pending
+        pending.removeAll(keepingCapacity: true)
         queue.async {
-            let windowBounds = DesktopVisibility.visibleApplicationWindowBounds()
-            let hiddenDisplayIDs = Self.hiddenDisplayIDs(
-                screenBoundsByDisplay: screenBoundsByDisplay,
-                windowBounds: windowBounds
-            )
+            let windows = DesktopVisibility.visibleApplicationWindowBounds()
+            let results = requests.map {
+                Self.hiddenDisplayIDs(screenBoundsByDisplay: $0.bounds, windowBounds: windows)
+            }
             DispatchQueue.main.async {
-                completion(hiddenDisplayIDs)
+                for (request, result) in zip(requests, results) {
+                    request.completion(result)
+                }
+                if self.pending.isEmpty {
+                    self.isSampling = false
+                } else {
+                    self.drain()
+                }
             }
         }
     }

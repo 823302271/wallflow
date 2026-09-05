@@ -37,6 +37,195 @@ enum WallflowSelfTest {
         try testDXTTextures()
         try testSpriteTexture()
         try testSceneViewBuildsImageLayer()
+        try testCoverageIgnoresDockTransitions()
+        try testParticlePauseAndAuthoredSettings()
+        try testParticlePackImport()
+        try testSpriteRowsAndReflection()
+        if let index = CommandLine.arguments.firstIndex(of: "--verify-import"),
+           CommandLine.arguments.indices.contains(index + 1) {
+            try testExternalArchive(URL(fileURLWithPath: CommandLine.arguments[index + 1]))
+        }
+    }
+
+    private static func testCoverageIgnoresDockTransitions() throws {
+        let screen = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        func window(_ owner: String, _ bounds: CGRect, layer: Int = 0, alpha: Double = 1) -> [String: Any] {
+            [kCGWindowOwnerName as String: owner, kCGWindowOwnerPID as String: 123,
+             kCGWindowLayer as String: layer, kCGWindowAlpha as String: alpha,
+             kCGWindowBounds as String: bounds.dictionaryRepresentation]
+        }
+        let ordinaryWindow = CGRect(x: 100, y: 100, width: 650, height: 500)
+        let windows = DesktopVisibility.applicationWindowBounds(from: [
+            window("Dock", screen), window("Wallpaper", screen),
+            window("Control Center", screen, layer: 10),
+            window("Example App", screen, alpha: 0.5),
+            window("Example App", ordinaryWindow)
+        ], ownPID: 456)
+        try expect(windows == [ordinaryWindow], "Dock / transparent transitions counted as opaque application coverage")
+        try expect(!DesktopVisibility.isDisplayHidden(screen, by: windows), "Opening an ordinary app from Dock paused the desktop")
+        try expect(!DesktopVisibility.isDisplayHidden(screen, by: [CGRect(x: 0, y: 0, width: 990, height: 800)]),
+                   "A visible 10-point strip of desktop was treated as fully covered")
+        let finder = DesktopVisibility.applicationWindowBounds(from: [window("Finder", screen)], ownPID: 456)
+        try expect(DesktopVisibility.isDisplayHidden(screen, by: finder), "Maximized Finder content was ignored")
+        var probe = DisplayVisibilityProbeState()
+        let previous = probe.begin(for: 1)!
+        probe.clear()
+        let current = probe.begin(for: 1)!
+        try expect(current != previous && !probe.isCurrent(previous, for: 1), "A stale pre-sleep probe became current again")
+    }
+
+    private static func testParticlePauseAndAuthoredSettings() throws {
+        let definition = Data("""
+        {"starttime":0,"maxcount":666,"animationmode":"randomframe",
+         "controlpoint":[{"id":0,"flags":1}],
+         "material":"materials/petal.json",
+         "emitter":[{"name":"sphererandom","rate":20}],
+         "initializer":[{"name":"lifetimerandom","min":4,"max":4,"exponent":0},
+                        {"name":"sizerandom","min":40,"max":40},
+                        {"name":"colorrandom","min":"128 128 128","max":"128 128 128"}],
+         "operator":[{"name":"alphafade","fadeintime":0.1,"fadeouttime":0.1}]}
+        """.utf8)
+        let sceneJSON = Data("""
+        {"general":{"cameraparallax":true,"orthogonalprojection":{"width":5120,"height":2880}},
+         "objects":[{"id":1,"particle":"particles/petals.json","instanceoverride":{"size":1.1,"count":1.5}}]}
+        """.utf8)
+        let package = try ScenePackage(data: makePackage(version: "PKGV0021", entries: [
+            ("scene.json", sceneJSON), ("particles/petals.json", definition),
+            ("materials/petal.json", Data(#"{"passes":[{"textures":["petal"]}]}"#.utf8)),
+            ("materials/petal.tex", makeSpriteTexture())
+        ]))
+        let model = try SceneDocument(package: package).particleSystems[0]
+        let runtime = SceneParticleRuntime(model: model, package: package, rootURL: nil)
+        runtime.updateLayout(viewBounds: CGRect(x: 0, y: 0, width: 1280, height: 720),
+                             canvasSize: CGSize(width: 5120, height: 2880), sceneScale: 0.25)
+        runtime.updateMouse(desktopPoint: CGPoint(x: 640, y: 360), inDesktop: true)
+        for _ in 0..<30 { runtime.tick(delta: 1.0 / 30.0) }
+        try expect(runtime.debugParticleCount() == 30, "Authored rate × count override was reduced or stopped at an idle cursor")
+        let first = runtime.layer.sublayers!.first!
+        try expect(abs(first.bounds.width - 11) < 0.01, "Particle size was inflated by a 1080p canvas heuristic")
+        let image = first.contents as! CGImage
+        let pixel = NSBitmapImageRep(cgImage: image).colorAt(x: 0, y: 0)!
+        try expect(max(pixel.redComponent, pixel.greenComponent) < 0.6, "Authored particle color was not multiplied into the sprite")
+        let position = first.position
+        let opacity = first.opacity
+        runtime.setEnabled(false)
+        runtime.tick(delta: 30)
+        try expect(runtime.debugParticleCount() == 30 && first.position == position && first.opacity == opacity && !runtime.layer.isHidden,
+                   "Pause advanced or discarded the particle freeze frame")
+        runtime.setEnabled(true)
+        runtime.updateMouse(desktopPoint: CGPoint(x: 640, y: 360), inDesktop: true)
+        runtime.tick(delta: 1.0 / 30.0)
+        try expect(runtime.debugParticleCount() == 31 && runtime.layer.sublayers!.first === first,
+                   "Resume lost existing particles or rebuilt their layers")
+        let fade = SceneParticleSystem.AlphaFade(fadeIn: 0.1, fadeOut: 0.1)
+        try expect(abs(SceneParticleRuntime.fadeAlpha(normalizedAge: 0.55, fade: fade) - 0.5) < 0.0001,
+                   "Fade-out was interpreted as seconds instead of the normalized start time")
+        runtime.updateMouse(desktopPoint: nil, inDesktop: false)
+        for _ in 0..<150 { runtime.tick(delta: 1.0 / 30.0) }
+        try expect(runtime.debugParticleCount() == 0, "Particles survived beyond their authored lifetime")
+        runtime.updateMouse(desktopPoint: CGPoint(x: 640, y: 360), inDesktop: true)
+        runtime.tick(delta: 1.0 / 30.0)
+        try expect(runtime.layer.sublayers!.first === first, "Expired particle layers were not reused")
+
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try makePackage(version: "PKGV0021", entries: [
+            ("scene.json", sceneJSON), ("particles/petals.json", definition),
+            ("materials/petal.json", Data(#"{"passes":[{"textures":["petal"]}]}"#.utf8)),
+            ("materials/petal.tex", makeSpriteTexture())
+        ]).write(to: directory.appendingPathComponent("scene.pkg"))
+        let project = try WallpaperProjectLoader.load(directory)
+        let frame = CGRect(x: 0, y: 0, width: 1280, height: 720)
+        let view = SceneWallpaperView(frame: frame, desktopFrame: frame, project: project, playsAudio: false)
+        view.layoutSubtreeIfNeeded()
+        view.debugDriveParticles(point: CGPoint(x: 640, y: 360), inDesktop: true, delta: 0.1)
+        let count = view.debugParticleCount()
+        try expect(view.debugEffectsTimerIsRunning, "Live particle scene has no simulation clock")
+        view.setRenderingEnabled(false)
+        try expect(!view.debugEffectsTimerIsRunning && view.debugParticleCount() == count,
+                   "Manual/system pause kept scene timers alive or cleared particles")
+        view.setParticlesActive(false)
+        try expect(!view.debugEffectsTimerIsRunning && view.debugParticleCount() == count,
+                   "Desktop-hidden pause cleared the freeze-frame particles")
+        view.setParticlesActive(true)
+        try expect(!view.debugEffectsTimerIsRunning, "Particle activation bypassed the scene's manual pause")
+    }
+
+    private static func testParticlePackImport() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("source/particle/nature")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try makeSpriteTexture().write(to: source.appendingPathComponent("rosepetals.tex"))
+        let archive = directory.appendingPathComponent("particle.zip")
+        let zip = Process()
+        zip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        zip.arguments = ["-c", "-k", "--keepParent", source.deletingLastPathComponent().path, archive.path]
+        try zip.run()
+        zip.waitUntilExit()
+        try expect(zip.terminationStatus == 0, "Could not create particle pack test ZIP")
+        let store = EngineAssetStore(rootURL: directory.appendingPathComponent("assets"))
+        let imports = directory.appendingPathComponent("imports")
+        let service = WallpaperImportService(importedRootURL: imports, engineAssetStore: store)
+        guard case .particleAssets(let installed) = try service.extractArchive(archive) else {
+            throw WallflowSelfTestError.failed("Particle asset ZIP was mistaken for a wallpaper")
+        }
+        try expect(installed == store.particleRootURL && store.resolveTextureFile(hint: "particle/nature/rosepetals") != nil,
+                   "Imported texture is not resolvable by scenes")
+        try expect((try FileManager.default.contentsOfDirectory(atPath: imports.path)).isEmpty,
+                   "Asset import left an orphan wallpaper library installation")
+        try expect(store.resolveTextureFile(hint: "../../outside.tex") == nil, "Asset resolver allowed escaping the pack")
+        try store.installParticlePack(from: installed)
+        try expect(store.isParticlePackInstalled, "Reinstalling the installed directory deleted its textures")
+        let manifest = source.deletingLastPathComponent().appendingPathComponent("project.json")
+        try Data(#"{"type":"scene","file":"scene.pkg"}"#.utf8).write(to: manifest)
+        try expect(EngineAssetStore.locateParticlePack(in: source.deletingLastPathComponent()) == nil,
+                   "A wallpaper project containing textures was mistaken for an asset pack")
+    }
+
+    private static func testSpriteRowsAndReflection() throws {
+        var data = Data()
+        appendCString("TEXV0005", to: &data)
+        appendCString("TEXI0001", to: &data)
+        for n in [0, 4, 2, 2, 1, 1, 0] { appendInt32(n, to: &data) }
+        appendCString("TEXB0001", to: &data)
+        for n in [1, 1, 2, 2, 16] { appendInt32(n, to: &data) }
+        // Top row red/green; bottom row blue/white.
+        data.append(contentsOf: [255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255])
+        appendCString("TEXS0003", to: &data)
+        for n in [3, 1, 1] { appendInt32(n, to: &data) }
+        for basis: [Float] in [[0,0,1,0,0,1], [0,1,1,0,0,1], [2,0,-2,0,0,1]] {
+            appendInt32(0, to: &data)
+            appendFloat32(0.1, to: &data)
+            for value in basis { appendFloat32(value, to: &data) }
+        }
+        let frames = try WallpaperTextureDecoder.decode(data).animationFrames
+        try expect(frames.count == 3, "Valid TEXS rows/reflections were dropped")
+        let top = NSBitmapImageRep(cgImage: frames[0].image).colorAt(x: 0, y: 0)!
+        let bottom = NSBitmapImageRep(cgImage: frames[1].image).colorAt(x: 0, y: 0)!
+        let mirror = NSBitmapImageRep(cgImage: frames[2].image)
+        try expect(top.redComponent > 0.9 && bottom.blueComponent > 0.9, "TEXS rows were vertically inverted")
+        try expect(mirror.colorAt(x: 0, y: 0)!.greenComponent > 0.9 && mirror.colorAt(x: 1, y: 0)!.redComponent > 0.9,
+                   "A mirrored UV basis was rotated instead of reflected")
+    }
+
+    private static func testExternalArchive(_ archive: URL) throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = EngineAssetStore(rootURL: directory.appendingPathComponent("assets"))
+        let service = WallpaperImportService(importedRootURL: directory.appendingPathComponent("imports"), engineAssetStore: store)
+        switch try service.extractArchive(archive) {
+        case .particleAssets(let url):
+            guard let texture = store.resolveTextureFile(hint: "particle/nature/rosepetals") else {
+                throw WallflowSelfTestError.failed("Imported pack has no rosepetals texture")
+            }
+            let decoded = try WallpaperTextureDecoder.decode(Data(contentsOf: texture))
+            try expect(!decoded.animationFrames.isEmpty, "Imported petals did not decode")
+            print("Verified asset ZIP: \(archive.lastPathComponent), \(decoded.animationFrames.count) petal frames, installed in isolated storage: \(url.path)")
+        case .wallpaper(let url):
+            let project = try WallpaperProjectLoader.load(url)
+            print("Verified wallpaper ZIP: \(archive.lastPathComponent), \(project.displayTitle)")
+        }
     }
 
     private static func testLocalizationResources() throws {

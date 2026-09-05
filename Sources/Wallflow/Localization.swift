@@ -55,6 +55,8 @@ enum AppLanguage: String, CaseIterable {
 
 enum L10n {
     enum Key: String {
+        case particleAssetsInstalled = "import.particle_assets_installed"
+        case particleAssetsInstalledMessage = "import.particle_assets_installed_message"
         case openWallpaper = "menu.open_wallpaper"
         case openWallpaperURL = "menu.open_wallpaper_url"
         case wallpaperLibrary = "menu.wallpaper_library"

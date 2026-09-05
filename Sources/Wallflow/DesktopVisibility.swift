@@ -17,64 +17,30 @@ enum DesktopVisibility {
             return []
         }
 
-        let ownPID = ProcessInfo.processInfo.processIdentifier
-        // Layer 0 is normal app content. Full-screen and some utility windows can sit
-        // slightly above 0 but still fully cover the desktop; ignore menu bar / dock
-        // (typically 20+) and screensaver layers.
-        let maxCoveringLayer = 15
-        return windowInfo.compactMap { info in
+        return applicationWindowBounds(from: windowInfo)
+    }
+
+    /// Desktop and transition surfaces are not application coverage. In particular
+    /// Dock owns large animation windows while restoring an ordinary app window.
+    static func applicationWindowBounds(
+        from windowInfo: [[String: Any]],
+        ownPID: Int32 = ProcessInfo.processInfo.processIdentifier
+    ) -> [CGRect] {
+        windowInfo.compactMap { info in
             let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
             let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue
             let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
+            let owner = info[kCGWindowOwnerName as String] as? String ?? ""
             guard ownerPID != ownPID,
-                  let layer,
-                  layer >= 0,
-                  layer <= maxCoveringLayer,
-                  alpha > 0.01,
-                  let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
-                  let bounds = CGRect(
-                      dictionaryRepresentation: boundsDictionary as CFDictionary
-                  ),
-                  bounds.width > 1,
-                  bounds.height > 1 else {
-                return nil
-            }
+                  let layer, (0...15).contains(layer),
+                  alpha >= 0.99,
+                  !isWallpaperInputIgnoredOwner(owner),
+                  let dictionary = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: dictionary as CFDictionary),
+                  !bounds.isInfinite, !bounds.isNull,
+                  bounds.width > 1, bounds.height > 1 else { return nil }
             return bounds
         }
-    }
-
-    /// Owner of the frontmost on-screen window at a Quartz point.
-    static func windowOwner(at quartzPoint: CGPoint) -> String? {
-        let options: CGWindowListOption = [
-            .optionOnScreenOnly,
-            .excludeDesktopElements
-        ]
-        guard let windowInfo = CGWindowListCopyWindowInfo(
-            options,
-            kCGNullWindowID
-        ) as? [[String: Any]] else {
-            return nil
-        }
-        let ownPID = ProcessInfo.processInfo.processIdentifier
-        for info in windowInfo {
-            let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
-            let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
-            guard ownerPID != ownPID,
-                  alpha > 0.05,
-                  let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
-                  let bounds = CGRect(
-                      dictionaryRepresentation: boundsDictionary as CFDictionary
-                  ),
-                  bounds.contains(quartzPoint) else {
-                continue
-            }
-            return info[kCGWindowOwnerName as String] as? String
-        }
-        return nil
-    }
-
-    static func isDockClick(at quartzPoint: CGPoint) -> Bool {
-        windowOwner(at: quartzPoint) == "Dock"
     }
 
     /// Quartz bounds of the usable desktop on a display (menu bar / dock excluded when present).
@@ -107,7 +73,7 @@ enum DesktopVisibility {
     static func isDisplayHidden(
         _ screenBounds: CGRect,
         by windowBounds: [CGRect],
-        coverageThreshold: CGFloat = 0.985
+        coverageThreshold: CGFloat = 0.999
     ) -> Bool {
         let screenArea = screenBounds.width * screenBounds.height
         guard screenArea > 0 else { return false }

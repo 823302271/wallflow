@@ -51,23 +51,30 @@ enum WallpaperImportError: LocalizedError {
     }
 }
 
+enum PreparedWallpaperImport {
+    case wallpaper(URL)
+    case particleAssets(URL)
+}
+
 final class WallpaperImportService {
     private let workerQueue = DispatchQueue(
         label: "dev.wallflow.wallpaper-import",
         qos: .userInitiated
     )
     private let importedRootURL: URL
+    private let engineAssetStore: EngineAssetStore
     private let maximumDownloadSize: Int64 = 512 * 1024 * 1024
     private let maximumExtractedSize: Int64 = 1024 * 1024 * 1024
     private let maximumFileCount = 100_000
 
-    init(importedRootURL: URL? = nil) {
+    init(importedRootURL: URL? = nil, engineAssetStore: EngineAssetStore = .shared) {
         self.importedRootURL = importedRootURL ?? Self.defaultImportedRootURL()
+        self.engineAssetStore = engineAssetStore
     }
 
     func prepare(
         sourceURL: URL,
-        completion: @escaping (Result<URL, Error>) -> Void
+        completion: @escaping (Result<PreparedWallpaperImport, Error>) -> Void
     ) {
         if sourceURL.isFileURL {
             workerQueue.async { [weak self] in
@@ -76,7 +83,11 @@ final class WallpaperImportService {
                     if sourceURL.pathExtension.lowercased() == "zip" {
                         return try self.extractArchive(sourceURL)
                     }
-                    return try self.installLocalProject(sourceURL)
+                    if let pack = EngineAssetStore.locateParticlePack(in: sourceURL) {
+                        try self.validateExtractedProject(sourceURL)
+                        return .particleAssets(try self.engineAssetStore.installParticlePack(from: pack))
+                    }
+                    return .wallpaper(try self.installLocalProject(sourceURL))
                 }
                 self.finish(completion, with: result)
             }
@@ -102,13 +113,13 @@ final class WallpaperImportService {
         } else if ["json", "pkg"].contains(extensionName) {
             completion(.failure(WallpaperImportError.incompleteRemoteProject(extensionName)))
         } else {
-            completion(.success(sourceURL))
+            completion(.success(.wallpaper(sourceURL)))
         }
     }
 
     private func downloadAndExtract(
         _ sourceURL: URL,
-        completion: @escaping (Result<URL, Error>) -> Void
+        completion: @escaping (Result<PreparedWallpaperImport, Error>) -> Void
     ) {
         let request = URLRequest(
             url: sourceURL,
@@ -141,7 +152,7 @@ final class WallpaperImportService {
         }.resume()
     }
 
-    private func extractArchive(_ archiveURL: URL) throws -> URL {
+    func extractArchive(_ archiveURL: URL) throws -> PreparedWallpaperImport {
         let archiveSize = try archiveURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         guard Int64(archiveSize) <= maximumDownloadSize else {
             throw WallpaperImportError.fileTooLarge(Int64(archiveSize))
@@ -179,9 +190,17 @@ final class WallpaperImportService {
             failure: WallpaperImportError.archiveExtractionFailed
         )
         try validateExtractedProject(destination)
-        let projectURL = try locateProject(in: destination)
-        keepDestination = true
-        return projectURL
+        do {
+            let projectURL = try locateProject(in: destination)
+            _ = try WallpaperProjectLoader.load(projectURL)
+            keepDestination = true
+            return .wallpaper(projectURL)
+        } catch WallpaperImportError.noProjectInArchive {
+            guard let pack = EngineAssetStore.locateParticlePack(in: destination) else {
+                throw WallpaperImportError.noProjectInArchive
+            }
+            return .particleAssets(try engineAssetStore.installParticlePack(from: pack))
+        }
     }
 
     func installLocalProject(_ sourceURL: URL) throws -> URL {
@@ -413,8 +432,8 @@ final class WallpaperImportService {
     }
 
     private func finish(
-        _ completion: @escaping (Result<URL, Error>) -> Void,
-        with result: Result<URL, Error>
+        _ completion: @escaping (Result<PreparedWallpaperImport, Error>) -> Void,
+        with result: Result<PreparedWallpaperImport, Error>
     ) {
         DispatchQueue.main.async {
             completion(result)

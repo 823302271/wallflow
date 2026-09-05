@@ -208,8 +208,8 @@ enum WallpaperTextureDecoder {
             throw WallpaperTextureError.invalidValue("sprite frame count")
         }
         if spriteVersion >= 3 {
-            _ = try cursor.readDimension("sprite atlas width")
-            _ = try cursor.readDimension("sprite atlas height")
+            _ = try cursor.readDimension("sprite frame width")
+            _ = try cursor.readDimension("sprite frame height")
         }
 
         var frames: [WallpaperAnimationFrame] = []
@@ -255,63 +255,44 @@ enum WallpaperTextureDecoder {
         heightX: Double,
         heightY: Double
     ) throws -> CGImage {
-        let signedWidth = widthX != 0 ? widthX : heightX
-        let signedHeight = heightY != 0 ? heightY : widthY
-        let cropX = min(x, x + signedWidth)
-        let cropYFromTop = min(y, y + signedHeight)
-        let cropWidth = abs(signedWidth)
-        let cropHeight = abs(signedHeight)
-        guard cropWidth >= 1, cropHeight >= 1 else {
+        // TEXS stores an origin and two UV basis vectors, in atlas pixels.
+        // Preserve rotations/reflections and fractional coordinates; CGImage's
+        // crop coordinates start at the top, unlike Core Image's Y-up space.
+        let width = hypot(widthX, widthY)
+        let height = hypot(heightX, heightY)
+        let coordinates = [x, y, widthX, widthY, heightX, heightY, width, height]
+        guard coordinates.allSatisfy(\.isFinite), width >= 1, height >= 1,
+              width <= 16384, height <= 16384 else {
             throw WallpaperTextureError.invalidValue("sprite frame bounds")
         }
-
-        // Reject frames whose authoring rect lies outside the atlas. Clamping them
-        // would re-crop frame 0 (e.g. rosepetals frame y=128 on a 128-tall atlas)
-        // and make randomframe look stuck on one petal.
-        let atlasW = Double(source.width)
-        let atlasH = Double(source.height)
-        guard cropX < atlasW,
-              cropYFromTop < atlasH,
-              cropX + cropWidth > 0.5,
-              cropYFromTop + cropHeight > 0.5 else {
-            throw WallpaperTextureError.invalidValue("sprite frame outside atlas")
-        }
-
-        let cropRect = CGRect(
-            x: max(0, cropX),
-            y: max(0, atlasH - cropYFromTop - cropHeight),
-            width: min(cropWidth, atlasW - max(0, cropX)),
-            height: min(
-                cropHeight,
-                atlasH - max(0, atlasH - cropYFromTop - cropHeight)
-            )
-        ).integral
-        // Require most of the authored rect to survive clamping (not a sliver).
-        guard cropRect.width >= cropWidth * 0.75,
-              cropRect.height >= cropHeight * 0.75,
-              let cropped = source.cropping(to: cropRect) else {
-            throw WallpaperTextureError.imageDecodeFailed
-        }
-
-        let heightSign = signedHeight < 0 ? -1.0 : 1.0
-        let widthSign = signedWidth < 0 ? -1.0 : 1.0
-        let rotation = -(atan2(heightSign, widthSign) - .pi / 4)
-        guard abs(rotation) > 0.001 else { return cropped }
-
-        let transformed = CIImage(cgImage: cropped)
-            .transformed(by: CGAffineTransform(rotationAngle: CGFloat(rotation)))
-        let normalized = transformed.transformed(
-            by: CGAffineTransform(
-                translationX: -transformed.extent.minX,
-                y: -transformed.extent.minY
-            )
+        let corners = [CGPoint(x: x, y: y), CGPoint(x: x + widthX, y: y + widthY),
+                       CGPoint(x: x + heightX, y: y + heightY),
+                       CGPoint(x: x + widthX + heightX, y: y + widthY + heightY)]
+        guard corners.allSatisfy({
+            $0.x >= -0.01 && $0.y >= -0.01
+                && $0.x <= Double(source.width) + 0.01
+                && $0.y <= Double(source.height) + 0.01
+        }) else { throw WallpaperTextureError.invalidValue("sprite frame outside atlas") }
+        let outputWidth = ceil(width)
+        let outputHeight = ceil(height)
+        let destinationToSource = CGAffineTransform(
+            a: widthX / outputWidth, b: -widthY / outputWidth,
+            c: -heightX / outputHeight, d: heightY / outputHeight,
+            tx: x + heightX, ty: Double(source.height) - y - heightY
         )
-        let context = CIContext(options: [.cacheIntermediates: false])
-        guard let rotated = context.createCGImage(normalized, from: normalized.extent) else {
-            throw WallpaperTextureError.imageDecodeFailed
+        let determinant = destinationToSource.a * destinationToSource.d
+            - destinationToSource.b * destinationToSource.c
+        guard abs(determinant) > 0.00001 else {
+            throw WallpaperTextureError.invalidValue("sprite frame transform")
         }
-        return rotated
+        let image = CIImage(cgImage: source).transformed(by: destinationToSource.inverted())
+        guard let frame = spriteContext.createCGImage(
+            image, from: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight)
+        ) else { throw WallpaperTextureError.imageDecodeFailed }
+        return frame
     }
+
+    private static let spriteContext = CIContext(options: [.cacheIntermediates: false])
 
     private static func cropImage(_ image: CGImage, width: Int, height: Int) throws -> CGImage {
         if width == image.width, height == image.height { return image }

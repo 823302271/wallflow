@@ -712,20 +712,13 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
           buttons: buttons,
           view: window
         };
-        // Prefer the painted element, but always also notify window/document so
-        // wallpapers that listen on window (e.g. koi pond click-to-feed) receive it.
+        // Bubble once from the hit element through document/window. Re-dispatching
+        // on ancestors duplicates input and multiplies interactive animation work.
         const target = document.elementFromPoint(x, y) || document.body || document.documentElement || document;
         try { target.dispatchEvent(new MouseEvent(type, options)); } catch (_) {}
-        if (target !== document) {
-          try { document.dispatchEvent(new MouseEvent(type, options)); } catch (_) {}
-        }
-        try { window.dispatchEvent(new MouseEvent(type, options)); } catch (_) {}
         // Left-click only. Right-click / contextmenu stay with macOS (desktop icons).
         if (type === 'mouseup' && button === 0) {
           try { target.dispatchEvent(new MouseEvent('click', options)); } catch (_) {}
-          if (target !== window) {
-            try { window.dispatchEvent(new MouseEvent('click', options)); } catch (_) {}
-          }
         }
         if (typeof PointerEvent !== 'undefined') {
           const pointerType = type === 'mousedown' ? 'pointerdown'
@@ -738,7 +731,6 @@ final class WebWallpaperView: NSView, WallpaperRenderer, WKNavigationDelegate {
               isPrimary: true
             }, options);
             try { target.dispatchEvent(new PointerEvent(pointerType, pointerOptions)); } catch (_) {}
-            try { window.dispatchEvent(new PointerEvent(pointerType, pointerOptions)); } catch (_) {}
           }
         }
       };
